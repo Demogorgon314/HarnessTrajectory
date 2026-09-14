@@ -80,6 +80,11 @@ function classifyUserText(text: string): UserMessageClass {
           : 'notice'
     return { kind: 'context', label: name, form }
   }
+  // Project instructions ride a plain Markdown preamble, not a tag (52 of 82
+  // local rollouts open a turn with one).
+  if (/^#\s*AGENTS\.md\b/.test(trimmed)) {
+    return { kind: 'context', label: 'agents-md', form: 'instructions' }
+  }
   if (/^The following is the Codex agent history/.test(trimmed)) {
     return { kind: 'context', label: 'history', form: 'relay' }
   }

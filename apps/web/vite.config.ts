@@ -1,10 +1,13 @@
+import tailwindcss from '@tailwindcss/vite'
 import react from '@vitejs/plugin-react'
 import { defineConfig } from 'vite'
 
 const SERVER_PORT = Number(process.env['HARNESS_TRAJECTORY_PORT'] ?? 5170)
 
 export default defineConfig({
-  plugins: [react()],
+  // The Context dashboard's sheets carry Tailwind utilities in their class
+  // lists (`@harness-trajectory/context/styles.css` → styles/tailwind.css).
+  plugins: [react(), tailwindcss()],
   server: {
     port: 5173,
     proxy: {

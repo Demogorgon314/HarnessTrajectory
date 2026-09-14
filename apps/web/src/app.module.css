@@ -563,9 +563,16 @@
 }
 
 .paneHeader {
+  position: relative;
   padding: 10px 16px 8px;
   border-bottom: 1px solid var(--dsw-alias-border-l1);
   background: var(--dsw-alias-bg-layer-1);
+}
+
+/* With tabs the header's own bottom padding goes to the strip, so the active
+   tab's 2px bar lands flush on the header rule (the dsh anatomy). */
+.paneHeader:has(.tabs) {
+  padding-bottom: 0;
 }
 
 .paneTitleRow {
@@ -681,6 +688,63 @@
   flex: 1;
   min-height: 0;
   display: flex;
+}
+
+/* The Context dashboard owns its own scroller (`.lc-root`: height 100%,
+   overflow-y auto), so its pane body is a plain block box. */
+.paneBody[data-tab='context'] {
+  display: block;
+  overflow: hidden;
+}
+
+/* -- the pane's tab strip --------------------------------------------------
+   Ported verbatim from deepseek-harness's conversation header (figma
+   Tab_Group 34:11441): a 35px strip, gap 36, pad-left 8, tabs bottom-aligned,
+   positioned above the header's own paint so the active bar covers the rule. */
+.tabs {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  gap: 36px;
+  margin-top: 10px;
+  padding-left: 8px;
+}
+
+/* figma .Tab 34:11442: 13/16 text (figma wt510, rendered 500). The 2px bar
+   reaches 1px past the tab's box to end flush with the header's bottom edge,
+   sitting over the rule. */
+.tab {
+  position: relative;
+  padding: 0 0 9px;
+  border: none;
+  background: transparent;
+  font-size: 13px;
+  line-height: 16px;
+  font-weight: 500;
+  color: var(--dsw-alias-label-tertiary);
+  cursor: pointer;
+}
+
+.tab::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  bottom: -1px;
+  left: 0;
+  height: 2px;
+  border-radius: 2px;
+  background: transparent;
+}
+
+/* Selected tab is blue, not ink: brand-primary resolves to neutral black in
+   this token sheet, so the selected state rides the business blue — the
+   nearest semantic token that stays blue in both themes. */
+.tabActive {
+  color: var(--dsw-alias-state-business-primary);
+}
+
+.tabActive::after {
+  background: var(--dsw-alias-state-business-primary);
 }
 
 /* -- subagent lineage and catalog ------------------------------------------ */

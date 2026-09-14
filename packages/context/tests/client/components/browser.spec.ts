@@ -1,0 +1,2019 @@
+// ContextBrowser (src/client/components/browser.tsx) rendered with real
+// React in jsdom: picker, category accordion, header content (schema
+// narrowing matrix), conversation join (block cascade, tail-status matrix),
+// targeted content fetch, hover linkage, and the focus bridges.
+
+import { act, createElement as h, useState } from 'react'
+import assert from '../helpers/assert.ts'
+import { describe, test } from 'vitest'
+import { makeContextBrowser, type ContextBrowserProps } from '../../../src/client/components/browser'
+import { makeStackedBar } from '../../../src/client/components/stackedBar'
+import { DICT_EN } from '../../../src/client/i18n'
+import { UNKNOWN_TOOL_SOURCE, type ContextHeaders, type ContextTimeline, type HeaderEpochContent, type RequestRecord, type SurfaceNode } from '../../../src/shared/types'
+import { headersOf, type ConversationNodeLike, type ImageLoader } from '../../../src/client/services'
+import { createContextSettings } from '../../../src/client/settings'
+import { click, flush, hover, makeKit, mount, query, queryAll, text, unhover, type Mounted } from '../helpers/kit'
+
+const kit = makeKit()
+const settings = createContextSettings()
+const Browser = makeContextBrowser(kit, makeStackedBar(kit), settings)
+
+// Category row order is CATS: system, tools, user, inject, assistant, tool.
+const ROW = { system: 0, tools: 1, user: 2, inject: 3, skill: 4, assistant: 5, tool: 6 } as const
+
+
+/**
+ * `Partial<T>` with every field also accepting an explicit `undefined`: this
+ * repo compiles with `exactOptionalPropertyTypes`, and the vendored fixtures
+ * below pass `{ turn: undefined }` to mean "absent".
+ */
+type Loose<T> = { [K in keyof T]?: T[K] | undefined }
+
+function tl(over: Partial<ContextTimeline>): ContextTimeline {
+  return {
+    ok: true,
+    current: { system: 0, tools: 0, user: 0, inject: 0, skill: 0, assistant: 0, tool: 0, total: 0 },
+    requests: [], events: [], nodes: [], droppedNodes: 0, archive: [],
+    ...over,
+  }
+}
+
+function req(over: Loose<RequestRecord>): RequestRecord {
+  return {
+    time: 1_000, seq: 1, turn: 1, step: 0,
+    system: 0, tools: 0, user: 0, inject: 0, assistant: 0, tool: 0, total: 0,
+    ...over,
+  } as RequestRecord
+}
+
+function node(over: Partial<SurfaceNode> & { seq: number }): SurfaceNode {
+  return { cat: 'user', tokens: 5, ...over }
+}
+
+function catRow(m: Mounted, cat: keyof typeof ROW): HTMLElement {
+  return queryAll(m.container, '.lc-br-cat-row')[ROW[cat]]!
+}
+
+function elemRows(m: Mounted): HTMLElement[] {
+  return queryAll(m.container, '.lc-br-elem-row')
+}
+
+/** Type into the tool-schema search box like a real user (native setter + input event). */
+async function typeToolSearch(m: Mounted, value: string): Promise<void> {
+  await act(async () => {
+    const input = query<HTMLInputElement>(m.container, '.lc-br-tool-search')
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+    setter?.call(input, value)
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+  })
+}
+
+async function pickStep(m: Mounted, value: string): Promise<void> {
+  const sel = query<HTMLSelectElement>(m.container, 'select.lc-br-pick')
+  await act(async () => {
+    sel.value = value
+    sel.dispatchEvent(new Event('change', { bubbles: true }))
+  })
+}
+
+function props(over: Partial<ContextBrowserProps>): ContextBrowserProps {
+  return { data: tl({}), headers: null, ...over }
+}
+
+/**
+ * Pair metadata-only `contextHeaders` with a fetchHeader serving per-epoch
+ * CONTENT — the lazy-load contract the browser consumes: the projection
+ * carries boundaries and token prices, the content arrives on demand.
+ */
+function withEpochContent(
+  headers: ContextHeaders,
+  contents: Record<number, HeaderEpochContent>,
+): { headers: ContextHeaders; fetchHeader: (seq: number) => Promise<HeaderEpochContent | null> } {
+  return { headers, fetchHeader: seq => Promise.resolve(contents[seq] ?? null) }
+}
+
+describe('ContextBrowser live surface', () => {
+  test('title, picker, live meta, category rows; empty categories stay shut', async () => {
+    const data = tl({
+      current: { system: 100, tools: 200, user: 50, inject: 0, skill: 0, assistant: 0, tool: 0, total: 350 },
+      requests: [
+        req({ seq: 10, turn: 1, step: 0 }),
+        req({ seq: 20, turn: 1, step: 1, prompt: 800 }),
+        req({ seq: 7, time: 500, turn: undefined, step: undefined }),
+      ],
+      nodes: [node({ seq: 1, text: 'hello' })],
+    })
+    const m = await mount(h(Browser, props({ data })))
+    assert.ok(text(query(m.container, '.lc-card-title-text')).includes('Context Browser'))
+    assert.ok(text(query(m.container, '.lc-br-hint')).includes('vs previous turn'))
+    const sel = query<HTMLSelectElement>(m.container, 'select.lc-br-pick')
+    assert.equal(sel.value, 'live')
+    const options = queryAll(sel, 'option').map(o => text(o))
+    assert.equal(options.length, 4, 'live + one option per request')
+    assert.equal(options[0], 'Live (Next Request)')
+    assert.ok(options.some(o => o.includes('Turn 0 · Step 0')), 'requests without turn/step degrade to zeroes')
+    const meta = text(query(m.container, '.lc-br-meta'))
+    assert.ok(meta.includes('Live · Next Request'))
+    assert.ok(meta.includes('Estimated ≈ 350'))
+    assert.ok(meta.includes('Actual 800'), 'live pairs the estimate with the freshest actual')
+    assert.equal(queryAll(m.container, '.lc-br-cat-row').length, 7)
+    assert.ok(text(catRow(m, 'user')).includes('1 Items'))
+    assert.ok(queryAll(m.container, '.lc-br-cat')[ROW.inject]!.className.includes('lc-br-cat-empty'), 'empty category is marked')
+    // Picking the stamp-less request: meta degrades to zeroes, no baseline exists.
+    await pickStep(m, '7')
+    const meta2 = text(query(m.container, '.lc-br-meta'))
+    assert.ok(meta2.includes('Turn 0 · Step 0'))
+    assert.ok(!meta2.includes('Actual'), 'this freshest request reported no usage')
+    assert.equal(queryAll(m.container, '.lc-br-delta').length, 0, 'no previous turn to compare against')
+    await pickStep(m, 'live')
+    await click(catRow(m, 'inject'))
+    assert.equal(queryAll(m.container, '.lc-br-body').length, 0)
+    assert.ok(queryAll(m.container, '.lc-br-pct').some(el => text(el).endsWith('%')))
+    await m.unmount()
+  })
+
+  test('zero-total surface renders no percentages; no requests means no delta pills', async () => {
+    const m = await mount(h(Browser, props({ data: tl({}) })))
+    assert.ok(queryAll(m.container, '.lc-br-pct').every(el => text(el) === ''))
+    assert.equal(queryAll(m.container, '.lc-br-delta').length, 0)
+    assert.equal(queryAll(m.container, '.lc-br-tdelta').length, 0)
+    const meta = text(query(m.container, '.lc-br-meta'))
+    assert.ok(meta.includes('Estimated ≈ 0'))
+    assert.ok(!meta.includes('Actual'), 'no requests, no actual figure')
+    await m.unmount()
+  })
+
+  test('dropped live nodes raise the missing-window note, live and on later steps only', async () => {
+    const data = tl({
+      current: { system: 0, tools: 0, user: 10, inject: 0, skill: 0, assistant: 0, tool: 0, total: 10 },
+      requests: [req({ seq: 3, turn: 1, step: 0 }), req({ seq: 10, turn: 1, step: 1 })],
+      nodes: [node({ seq: 6, text: 'served' })],
+      droppedNodes: 2,
+      surfaceFloor: 5,
+      archiveFloor: 8,
+    })
+    const m = await mount(h(Browser, props({ data })))
+    assert.ok(text(m.container).includes('2 earlier messages are also part of the context'), 'live flags the dropped tail')
+    // Step before the floor: the dropped slice is not attributable → no note.
+    await pickStep(m, '3')
+    assert.ok(!text(m.container).includes('earlier messages are also part'))
+    assert.ok(text(m.container).includes('approximate'), 'seq below the archive floor is approximate')
+    // Step after the floor: the dropped slice is inside the context.
+    await pickStep(m, '10')
+    assert.ok(text(m.container).includes('2 earlier messages are also part of the context'))
+    assert.ok(!text(m.container).includes('approximate'), 'seq at/after the archive floor is exact')
+    await m.unmount()
+  })
+
+  test('step picking switches the assembled view; back-to-live restores the surface', async () => {
+    const data = tl({
+      current: { system: 0, tools: 0, user: 30, inject: 0, skill: 0, assistant: 10, tool: 0, total: 40 },
+      requests: [req({ seq: 10, turn: 1, step: 0, user: 25 }), req({ seq: 20, turn: 1, step: 1, user: 30, assistant: 10, prompt: 800 })],
+      nodes: [node({ seq: 1, text: 'first question' }), node({ seq: 11, cat: 'assistant', tokens: 10, text: 'first answer' })],
+      archive: [node({ seq: 0, tokens: 5, text: 'archived hello', gone: 15 })],
+    })
+    const m = await mount(h(Browser, props({ data })))
+    await pickStep(m, '10')
+    const meta = text(query(m.container, '.lc-br-meta'))
+    assert.ok(meta.includes('Turn 1 · Step 0'))
+    assert.ok(!meta.includes('Actual'), 'this step reported no usage')
+    // The step's surface: archived node (gone 15 > 10) + seq 1; seq 11 is the response.
+    await click(catRow(m, 'user'))
+    assert.equal(elemRows(m).length, 2, 'archived + live nodes reconstructed')
+    assert.ok(text(m.container).includes('archived hello'))
+    await pickStep(m, '20')
+    const meta2 = text(query(m.container, '.lc-br-meta'))
+    assert.ok(meta2.includes('Turn 1 · Step 1'))
+    assert.ok(meta2.includes('Actual 800'))
+    assert.equal(queryAll(m.container, '.lc-br-body').length, 0, 'picking a step collapses the accordion')
+    await pickStep(m, 'live')
+    await click(catRow(m, 'user'))
+    assert.equal(elemRows(m).length, 1, 'live excludes removed nodes')
+    assert.ok(!text(m.container).includes('archived hello'))
+    await m.unmount()
+  })
+
+  test('delta pills read against the previous turn’s last step; live reads the last request', async () => {
+    const data = tl({
+      current: { system: 1, tools: 2, user: 99, inject: 0, skill: 0, assistant: 0, tool: 0, total: 102 },
+      requests: [
+        req({ seq: 1, turn: 1, step: 0, system: 1, tools: 2, user: 10, total: 13 }),
+        req({ seq: 2, turn: 1, step: 1, system: 1, tools: 2, user: 20, total: 23 }),
+        req({ seq: 3, turn: 2, step: 0, system: 1, tools: 2, user: 30, total: 33 }),
+        req({ seq: 4, turn: 2, step: 1, system: 1, tools: 2, user: 40, total: 43 }),
+        req({ seq: 5, turn: 3, step: 0, system: 1, tools: 2, user: 50, total: 53 }),
+      ],
+      nodes: [1, 2, 3, 4, 5].map(seq => node({ seq, tokens: seq })),
+    })
+    const m = await mount(h(Browser, props({ data })))
+    await pickStep(m, '4')
+    const countPills = queryAll(m.container, '.lc-br-delta')
+    assert.equal(countPills.length, 1, 'only the user count changed')
+    assert.equal(text(countPills[0]!), '+2')
+    assert.ok(countPills[0]!.className.includes('lc-br-delta-up'))
+    const tokenPills = queryAll(m.container, '.lc-br-tdelta')
+    assert.equal(tokenPills.length, 1)
+    assert.equal(text(tokenPills[0]!), '+20')
+    // First turn: no previous-turn baseline → no pills at all.
+    await pickStep(m, '1')
+    assert.equal(queryAll(m.container, '.lc-br-delta').length, 0)
+    assert.equal(queryAll(m.container, '.lc-br-tdelta').length, 0)
+    // Live: baseline is the most recent request.
+    await pickStep(m, 'live')
+    assert.equal(text(query(m.container, '.lc-br-delta')), '+1')
+    assert.equal(text(query(m.container, '.lc-br-tdelta')), '+49')
+    await m.unmount()
+  })
+
+  test('shrinking categories render downward pills', async () => {
+    const data = tl({
+      current: { system: 0, tools: 0, user: 15, inject: 0, skill: 0, assistant: 0, tool: 0, total: 15 },
+      requests: [
+        req({ seq: 2, turn: 1, step: 1, user: 25, total: 25 }),
+        req({ seq: 3, turn: 2, step: 0, user: 15, total: 15 }),
+      ],
+      nodes: [node({ seq: 1, tokens: 10, text: 'kept' })],
+      archive: [node({ seq: 0, tokens: 15, text: 'pruned away', gone: 3 })],
+    })
+    const m = await mount(h(Browser, props({ data })))
+    await pickStep(m, '3')
+    const countPill = query(m.container, '.lc-br-delta')
+    assert.equal(text(countPill), '-1', 'the archived node left the step’s surface')
+    assert.ok(countPill.className.includes('lc-br-delta-down'))
+    const tokenPill = query(m.container, '.lc-br-tdelta')
+    assert.equal(text(tokenPill), '-10')
+    assert.ok(tokenPill.className.includes('lc-br-tdelta-down'))
+    await m.unmount()
+  })
+
+  test('hover linkage: category rows report hovers and mirror the shared key while live', async () => {
+    const data = tl({
+      current: { system: 0, tools: 0, user: 10, inject: 0, skill: 0, assistant: 0, tool: 0, total: 10 },
+      requests: [req({ seq: 10, turn: 1, step: 0, user: 10, total: 10 })],
+      nodes: [node({ seq: 1, text: 'hi' })],
+    })
+    const hovers: (string | null)[] = []
+    const el = h(Browser, props({ data, hoverKey: null, onHoverKey: (k) => { hovers.push(k) } }))
+    const m = await mount(el)
+    await hover(catRow(m, 'user'))
+    await unhover(catRow(m, 'user'))
+    assert.deepEqual(hovers, ['user', null])
+    // Mirrored hover lights the row; the 'free' key has no category row.
+    await m.update(h(Browser, props({ data, hoverKey: 'user', onHoverKey: (k) => { hovers.push(k) } })))
+    assert.ok(catRow(m, 'user').className.includes('lc-br-cat-on'))
+    await m.update(h(Browser, props({ data, hoverKey: 'free', onHoverKey: (k) => { hovers.push(k) } })))
+    assert.ok(!catRow(m, 'user').className.includes('lc-br-cat-on'))
+    // A picked step has a different composition: the linkage drops.
+    await pickStep(m, '10')
+    const before = hovers.length
+    await hover(catRow(m, 'user'))
+    assert.equal(hovers.length, before, 'no hover reporting while a step is shown')
+    assert.ok(!catRow(m, 'user').className.includes('lc-br-cat-on'))
+    await m.unmount()
+
+    // No hoverKey wiring at all: hovering is a no-op.
+    const m2 = await mount(h(Browser, props({ data })))
+    await hover(catRow(m2, 'user'))
+    await m2.unmount()
+  })
+
+  test('previewSeq transiently shows a step; unknown preview/pin seqs fall back to live', async () => {
+    const data = tl({
+      current: { system: 0, tools: 0, user: 10, inject: 0, skill: 0, assistant: 0, tool: 0, total: 10 },
+      requests: [req({ seq: 10, turn: 1, step: 0, user: 10, total: 10, prompt: 700 })],
+      nodes: [node({ seq: 1, text: 'hi' })],
+    })
+    const m = await mount(h(Browser, props({ data, previewSeq: 10 })))
+    const meta = text(query(m.container, '.lc-br-meta'))
+    assert.ok(meta.includes('Turn 1 · Step 0'))
+    assert.ok(meta.includes('Actual 700'))
+    // Unknown preview seq: no request matches → live surface, estimate paired with the freshest actual.
+    await m.update(h(Browser, props({ data, previewSeq: 999 })))
+    const liveMeta = text(query(m.container, '.lc-br-meta'))
+    assert.ok(liveMeta.includes('Live · Next Request'))
+    assert.ok(liveMeta.includes('Actual 700'))
+    // A pinned step trimmed out of retention falls back to live too.
+    await m.update(h(Browser, props({ data, previewSeq: null, pinSeq: 999 })))
+    assert.ok(text(query(m.container, '.lc-br-meta')).includes('Live · Next Request'))
+    assert.equal(query<HTMLSelectElement>(m.container, 'select.lc-br-pick').value, 'live')
+    await m.unmount()
+  })
+})
+
+describe('ContextBrowser header epochs', () => {
+  // The projection carries METADATA only; the epoch content arrives via fetchHeader.
+  const HEADERS: ContextHeaders = {
+    headers: [
+      { seq: 15, time: 1500, systemTokens: 8, tools: [{ name: 'old', tokens: 1 }] },
+      { seq: 35, time: 3500, systemTokens: 12, tools: [{ name: 'fresh', tokens: 9 }] },
+    ],
+  }
+  const CONTENTS: Record<number, HeaderEpochContent> = {
+    15: { system: 'SYS A', tools: [{ name: 'old', schema: {} }] },
+    35: { system: 'SYS B\nsecond line', tools: [{ name: 'fresh', description: 'fresh tool', schema: {} }] },
+  }
+  const lazy = withEpochContent(HEADERS, CONTENTS)
+
+  test('system category opens its prompt row directly; rich switch toggles raw/markdown', async () => {
+    const data = tl({ current: { system: 30, tools: 9, user: 0, inject: 0, skill: 0, assistant: 0, tool: 0, total: 39 } })
+    const m = await mount(h(Browser, props({ data, ...lazy })))
+    await click(catRow(m, 'system'))
+    await flush()
+    const body = query(m.container, '.lc-br-body')
+    assert.ok(text(body).includes('SYS B'), 'the newest epoch’s prompt shows on the live surface')
+    assert.ok(text(body).includes('2 lines'), 'line count rides the section head')
+    // The open header holds the hover tint, every category alike.
+    assert.ok(catRow(m, 'system').className.includes('lc-br-cat-open'))
+    // The single system row is already expanded.
+    assert.equal(queryAll(m.container, '.lc-br-content').length, 1)
+    assert.ok(queryAll(m.container, '.lc-ts-desc-md').length >= 1, 'markdown view by default')
+    const rawBtn = queryAll(m.container, '.lc-rich-seg-btn')[0]
+    assert.equal(text(rawBtn!), 'Raw')
+    await click(rawBtn!)
+    const lines = queryAll(m.container, '.lc-ts-line').map(line => line.textContent)
+    assert.deepEqual(lines, ['SYS B', 'second line'])
+    await click(queryAll(m.container, '.lc-rich-seg-btn')[1]!)
+    assert.ok(queryAll(m.container, '.lc-ts-desc-md').length >= 1, 'markdown restored')
+    await click(catRow(m, 'system'))
+    assert.equal(queryAll(m.container, '.lc-br-body').length, 0)
+    assert.ok(!catRow(m, 'system').className.includes('lc-br-cat-open'))
+    await m.unmount()
+  })
+
+  test('a past step reads the epoch in force at its seq', async () => {
+    const data = tl({
+      current: { system: 30, tools: 9, user: 0, inject: 0, skill: 0, assistant: 0, tool: 0, total: 39 },
+      requests: [req({ seq: 20, turn: 1, step: 0 }), req({ seq: 40, turn: 1, step: 1 })],
+    })
+    const m = await mount(h(Browser, props({ data, ...lazy })))
+    await pickStep(m, '20')
+    await click(catRow(m, 'system'))
+    await flush()
+    assert.ok(text(query(m.container, '.lc-br-body')).includes('SYS A'), 'epoch before the request applies')
+    await m.unmount()
+  })
+
+  test('an epoch fetches once and the content stays cached across steps', async () => {
+    const data = tl({
+      current: { system: 30, tools: 9, user: 0, inject: 0, skill: 0, assistant: 0, tool: 0, total: 39 },
+      requests: [req({ seq: 20, turn: 1, step: 0 }), req({ seq: 40, turn: 1, step: 1 })],
+    })
+    let calls = 0
+    const counting = { ...lazy, fetchHeader: (seq: number) => { calls += 1; return lazy.fetchHeader(seq) } }
+    const m = await mount(h(Browser, props({ data, ...counting })))
+    await click(catRow(m, 'system'))
+    await flush()
+    assert.ok(text(query(m.container, '.lc-br-body')).includes('SYS B'))
+    assert.equal(calls, 1)
+    // The other epoch costs its own fetch.
+    await pickStep(m, '20')
+    await click(catRow(m, 'system'))
+    await flush()
+    assert.ok(text(query(m.container, '.lc-br-body')).includes('SYS A'))
+    assert.equal(calls, 2)
+    // Re-opening the first epoch's section hits the cache, not the fetcher.
+    await pickStep(m, 'live')
+    await click(catRow(m, 'system'))
+    await flush()
+    assert.ok(text(query(m.container, '.lc-br-body')).includes('SYS B'))
+    assert.equal(calls, 2)
+    await m.unmount()
+  })
+
+  test('a failed epoch fetch arms the retry button; retrying succeeds', async () => {
+    const data = tl({ current: { system: 30, tools: 9, user: 0, inject: 0, skill: 0, assistant: 0, tool: 0, total: 39 } })
+    const pendings: Array<{ resolve: (v: HeaderEpochContent | null) => void; reject: (e: unknown) => void }> = []
+    const deferred: () => Promise<HeaderEpochContent | null> = () =>
+      new Promise((resolve, reject) => { pendings.push({ resolve, reject }) })
+    const m = await mount(h(Browser, props({ data, headers: HEADERS, fetchHeader: deferred })))
+    await click(catRow(m, 'system'))
+    await flush()
+    assert.ok(text(query(m.container, '.lc-br-body')).includes('Loading'), 'the fetch is in flight')
+    await act(async () => { pendings[0]!.reject(new Error('down')) })
+    await flush()
+    assert.ok(text(query(m.container, '.lc-br-body')).includes('Load failed'), 'a rejected read arms the retry')
+    await click(query(m.container, '.lc-br-retry'))
+    await flush()
+    assert.ok(text(query(m.container, '.lc-br-body')).includes('Loading'), 'the retry refetches')
+    await act(async () => { pendings[1]!.resolve(CONTENTS[35]!) })
+    await flush()
+    assert.ok(text(query(m.container, '.lc-br-body')).includes('SYS B'), 'the retried read renders')
+    await m.unmount()
+  })
+
+  test('a stale epoch fetch resolves and rejects ignored once another epoch takes over', async () => {
+    const data = tl({
+      current: { system: 30, tools: 9, user: 0, inject: 0, skill: 0, assistant: 0, tool: 0, total: 39 },
+      requests: [req({ seq: 20, turn: 1, step: 0 }), req({ seq: 40, turn: 1, step: 1 })],
+    })
+    const pendings: Array<{ resolve: (v: HeaderEpochContent | null) => void; reject: (e: unknown) => void }> = []
+    const deferred = (): Promise<HeaderEpochContent | null> =>
+      new Promise((resolve, reject) => { pendings.push({ resolve, reject }) })
+    const m = await mount(h(Browser, props({ data, headers: HEADERS, fetchHeader: deferred })))
+    // Epoch 35's fetch is in flight; picking step 20 re-arms for epoch 15.
+    await click(catRow(m, 'system'))
+    await flush()
+    await pickStep(m, '20')
+    await click(catRow(m, 'system'))
+    await flush()
+    assert.equal(pendings.length, 2)
+    // The stale epoch REJECTS first — ignored: no retry button, still loading epoch 15.
+    await act(async () => { pendings[0]!.reject(new Error('stale')) })
+    await flush()
+    assert.ok(!text(m.container).includes('Load failed'))
+    assert.ok(text(query(m.container, '.lc-br-body')).includes('Loading'))
+    // The live epoch settles and renders.
+    await act(async () => { pendings[1]!.resolve(CONTENTS[15]!) })
+    await flush()
+    assert.ok(text(query(m.container, '.lc-br-body')).includes('SYS A'))
+    // Back to live: epoch 35's fetch is in flight; the cached epoch 15 renders
+    // without a fetch — then the stale resolve lands, ignored.
+    await pickStep(m, 'live')
+    await click(catRow(m, 'system'))
+    await flush()
+    assert.equal(pendings.length, 3)
+    await pickStep(m, '20')
+    await click(catRow(m, 'system'))
+    await flush()
+    assert.equal(pendings.length, 3, 'epoch 15 is cached')
+    assert.ok(text(query(m.container, '.lc-br-body')).includes('SYS A'))
+    await act(async () => { pendings[2]!.resolve(CONTENTS[35]!) })
+    await flush()
+    assert.ok(!text(m.container).includes('SYS B'), 'the stale content is ignored')
+    await m.unmount()
+  })
+
+  test('an epoch missing from the durable log degrades to the not-in-log note', async () => {
+    const data = tl({ current: { system: 30, tools: 9, user: 0, inject: 0, skill: 0, assistant: 0, tool: 0, total: 39 } })
+    const m = await mount(h(Browser, props({
+      data, headers: HEADERS, fetchHeader: () => Promise.resolve(null),
+    })))
+    await click(catRow(m, 'system'))
+    await flush()
+    assert.ok(text(query(m.container, '.lc-br-body')).includes('not in the session log'))
+    await click(catRow(m, 'tools'))
+    await flush()
+    assert.ok(text(queryAll(m.container, '.lc-br-body')[0]!).includes('not in the session log'))
+    await m.unmount()
+  })
+
+  test('a host without the history face degrades to the metadata-only note', async () => {
+    const data = tl({ current: { system: 30, tools: 9, user: 0, inject: 0, skill: 0, assistant: 0, tool: 0, total: 39 } })
+    const m = await mount(h(Browser, props({ data, headers: HEADERS })))
+    await click(catRow(m, 'system'))
+    assert.ok(text(query(m.container, '.lc-br-body')).includes('token estimates only'))
+    await click(catRow(m, 'tools'))
+    assert.equal(elemRows(m).length, 1, 'metadata rows still render')
+    // The lone metadata row auto-opens with the category; its body explains the degradation.
+    assert.ok(text(query(m.container, '.lc-br-content')).includes('token estimates only'))
+    await m.unmount()
+  })
+
+  test('absent headers projection degrades to the tokens-only note', async () => {
+    const data = tl({ current: { system: 30, tools: 9, user: 0, inject: 0, skill: 0, assistant: 0, tool: 0, total: 39 } })
+    const m = await mount(h(Browser, props({ data, headers: null })))
+    await click(catRow(m, 'system'))
+    assert.ok(text(query(m.container, '.lc-br-body')).includes('older plugin build'))
+    await click(catRow(m, 'tools'))
+    assert.ok(text(queryAll(m.container, '.lc-br-body')[0]!).includes('older plugin build'))
+    await m.unmount()
+  })
+
+  test('an epoch outside retention degrades to the no-epoch note', async () => {
+    const data = tl({
+      current: { system: 30, tools: 9, user: 0, inject: 0, skill: 0, assistant: 0, tool: 0, total: 39 },
+      requests: [req({ seq: 10, turn: 1, step: 0 })],
+    })
+    const m = await mount(h(Browser, props({ data, ...lazy })))
+    await pickStep(m, '10')
+    await click(catRow(m, 'system'))
+    assert.ok(text(query(m.container, '.lc-br-body')).includes('outside retention'))
+    await click(catRow(m, 'tools'))
+    assert.ok(text(queryAll(m.container, '.lc-br-body')[0]!).includes('outside retention'))
+    await m.unmount()
+  })
+
+  test('an epoch without a system prompt keeps the system category shut', async () => {
+    const headers: ContextHeaders = { headers: [{ seq: 1, time: 1, tools: [{ name: 'x', tokens: 1 }] }] }
+    const data = tl({ current: { system: 0, tools: 1, user: 0, inject: 0, skill: 0, assistant: 0, tool: 0, total: 1 } })
+    const m = await mount(h(Browser, props({ data, ...withEpochContent(headers, { 1: { tools: [] } }) })))
+    assert.ok(text(catRow(m, 'system')).includes('0 Items'))
+    await click(catRow(m, 'system'))
+    assert.equal(queryAll(m.container, '.lc-br-body').length, 0, 'no prompt, no body')
+    await m.unmount()
+  })
+
+  // PORT NOTE — dsh-context's `headersOf` also normalized the pre-#37 wire
+  // generation (an epoch carrying the system TEXT but no `systemTokens`) by
+  // pricing the text with the shared estimator. That generation cannot occur
+  // here — the local fold always prices the epoch — so the branch and its
+  // spec are gone; a text-only epoch simply reads as an unpriced one.
+
+  test('a fetched epoch without a system prompt explains its absence', async () => {
+    const headers: ContextHeaders = { headers: [{ seq: 3, time: 3, systemTokens: 0, tools: [] }] }
+    const data = tl({ current: { system: 0, tools: 0, user: 0, inject: 0, skill: 0, assistant: 0, tool: 0, total: 0 } })
+    const m = await mount(h(Browser, props({
+      data, headers, fetchHeader: () => Promise.resolve({ tools: [] }),
+    })))
+    await click(catRow(m, 'system'))
+    await flush()
+    assert.ok(text(query(m.container, '.lc-br-body')).includes('carried no system prompt'))
+    await m.unmount()
+  })
+
+  test('a V3 system prompt rides the timeline systems list, fetched from its own event seq', async () => {
+    // The V3 generation: the header epoch carries NO system price (the prompt
+    // is a `system/message` surface node), so the section resolves the prompt
+    // from `data.systems` and reads its text off that node's seq.
+    const headers: ContextHeaders = { headers: [{ seq: 15, time: 1500, tools: [{ name: 'x', tokens: 1 }] }] }
+    const data = tl({
+      current: { system: 30, tools: 1, user: 0, inject: 0, skill: 0, assistant: 0, tool: 0, total: 31 },
+      systems: [{ seq: 7, time: 700, tokens: 30 }],
+    })
+    const asked: number[] = []
+    const fetchHeader = (seq: number): Promise<HeaderEpochContent> => {
+      asked.push(seq)
+      return Promise.resolve(seq === 7 ? { system: 'V3 PROMPT', tools: [] } : { tools: [] })
+    }
+    const m = await mount(h(Browser, props({ data, headers, fetchHeader })))
+    assert.ok(text(catRow(m, 'system')).includes(kit.t('browser.items', { n: 1 })))
+    await click(catRow(m, 'system'))
+    await flush()
+    assert.deepEqual(asked, [7], 'the prompt is fetched from the system node, not the header epoch')
+    assert.ok(text(query(m.container, '.lc-br-body')).includes('V3 PROMPT'))
+    await m.unmount()
+  })
+
+  test('a resolved prompt whose event carries no text explains its absence', async () => {
+    // The node exists (so the category opens) but the fetched event maps to
+    // no prompt text — a foreign or truncated envelope.
+    const data = tl({
+      current: { system: 30, tools: 0, user: 0, inject: 0, skill: 0, assistant: 0, tool: 0, total: 30 },
+      systems: [{ seq: 7, time: 700, tokens: 30 }],
+    })
+    const m = await mount(h(Browser, props({ data, fetchHeader: () => Promise.resolve({ tools: [] }) })))
+    await click(catRow(m, 'system'))
+    await flush()
+    assert.ok(text(query(m.container, '.lc-br-body')).includes('carried no system prompt'))
+    await m.unmount()
+  })
+
+  test('a step before the system node shows no prompt (the list is step-scoped)', async () => {
+    const headers: ContextHeaders = { headers: [{ seq: 3, time: 300, tools: [] }] }
+    const data = tl({
+      current: { system: 30, tools: 0, user: 0, inject: 0, skill: 0, assistant: 0, tool: 0, total: 30 },
+      requests: [req({ seq: 5, turn: 1, step: 0, system: 0, tools: 0, user: 5, total: 5 })],
+      systems: [{ seq: 7, time: 700, tokens: 30 }],
+    })
+    const m = await mount(h(Browser, props({ data, headers })))
+    await pickStep(m, '5')
+    assert.ok(text(catRow(m, 'system')).includes('0 Items'))
+    await click(catRow(m, 'system'))
+    assert.equal(queryAll(m.container, '.lc-br-body').length, 0, 'no prompt yet at this step')
+    await m.unmount()
+  })
+})
+
+describe('ContextBrowser tool schemas', () => {
+  // Metadata rows (name/token/plugin) pair with fetched CONTENT carrying the
+  // descriptions and schemas — the lazy epoch contract.
+  const headers: ContextHeaders = {
+    headers: [{
+      seq: 1, time: 1, systemTokens: 3,
+      tools: [
+        // Producer order is NOT meaningful: rows re-rank by token price.
+        { name: 'omega', tokens: 5, plugin: 'mcp:github' },
+        { name: 'rho', tokens: 6 },
+        { name: 'theta', tokens: 8 },
+        { name: 'zeta', tokens: 10 },
+        { name: 'epsilon', tokens: 20 },
+        { name: 'delta', tokens: 30 },
+        { name: 'gamma', tokens: 40 },
+        { name: 'beta', tokens: 50 },
+        { name: 'mega', tokens: 100 },
+      ],
+    }],
+  }
+  const content: HeaderEpochContent = {
+    system: 'SYS',
+    tools: [
+      { name: 'omega', schema: {} },
+      { name: 'rho', schema: 'nope' },
+      { name: 'theta', schema: { type: 'object', properties: null } },
+      { name: 'zeta', schema: { type: 'object' } },
+      { name: 'epsilon', schema: { type: 'object', properties: { z: { type: 'integer' } } } },
+      { name: 'delta', schema: { parameters: 'junk', input_schema: { properties: { y: { type: 'integer' } } } } },
+      { name: 'gamma', schema: { inputSchema: { properties: 'nope' } } },
+      { name: 'beta', schema: { input_schema: { properties: { x: { type: 'string' } } } } },
+      {
+        name: 'mega', description: 'does everything',
+        schema: {
+          name: 'mega',
+          parameters: {
+            type: 'object',
+            properties: {
+              a: { type: 'string', description: 'the a param' },
+              b: { type: 'object', properties: { x: {}, y: {} } },
+              c: { type: 'array', items: { type: 'number' } },
+              d: { type: 'array' },
+              d2: { type: 'array', items: null },
+              e: { type: 'string', enum: ['x', 'y'] },
+              e2: { type: 'string', enum: [] },
+              f: { enum: [1, 2] },
+              g: { anyOf: [{ type: 'string' }, { type: 'number' }] },
+              h: { oneOf: [{ type: 'boolean' }] },
+              i: { anyOf: [null, { type: 'string' }] },
+              j: { anyOf: [] },
+              k: { anyOf: [42, null] },
+              l: { type: 'object', properties: {} },
+              m: { type: 'object', properties: null },
+              n: { type: 'object', properties: 42 },
+              o: 'not-an-object',
+              p: { description: 42 },
+              q: { description: '' },
+            },
+            required: ['a', 42],
+          },
+        },
+      },
+    ],
+  }
+  const data = tl({ current: { system: 10, tools: 248, user: 0, inject: 0, skill: 0, assistant: 0, tool: 0, total: 258 } })
+  const lazyProps = () => props({ data, headers, fetchHeader: () => Promise.resolve(content) })
+
+  test('rows rank by token price; the schema narrowing matrix renders', async () => {
+    settings.set('defaultToolSort', 'size')
+    const m = await mount(h(Browser, lazyProps()))
+    await click(catRow(m, 'tools'))
+    await flush()
+    const rows = elemRows(m)
+    assert.equal(rows.length, 9)
+    assert.deepEqual(rows.map(r => text(query(r, '.lc-br-preview'))),
+      ['mega', 'beta', 'gamma', 'delta', 'epsilon', 'zeta', 'theta', 'rho', 'omega'])
+
+    // mega: the full parameter matrix.
+    await click(rows[0]!)
+    const body = query(m.container, '.lc-br-content')
+    assert.ok(text(body).includes('does everything'), 'description section renders')
+    const paramRows = queryAll(body, '.lc-ts-param-row')
+    assert.equal(paramRows.length, 18, 'one row per object-valued property')
+    const byName = (n: string) => paramRows.find(r => text(query(r, '.lc-ts-param-name')) === n)
+    const typeOf = (n: string) => text(query(byName(n) as HTMLElement, '.lc-ts-param-type'))
+    assert.equal(typeOf('a'), 'string')
+    assert.equal(typeOf('b'), 'object{2}')
+    assert.equal(typeOf('c'), 'array<number>')
+    assert.equal(typeOf('d'), 'array')
+    assert.equal(typeOf('d2'), 'array')
+    assert.equal(typeOf('e'), 'string (enum)')
+    assert.equal(typeOf('e2'), 'string')
+    assert.equal(typeOf('f'), '(enum)')
+    assert.equal(typeOf('g'), 'string | number')
+    assert.equal(typeOf('h'), 'boolean')
+    assert.equal(typeOf('i'), 'string')
+    assert.equal(typeOf('j'), 'unknown')
+    assert.equal(typeOf('k'), 'unknown')
+    assert.equal(typeOf('l'), 'object')
+    assert.equal(typeOf('m'), 'object')
+    assert.equal(typeOf('n'), 'object')
+    assert.equal(typeOf('p'), 'unknown')
+    assert.equal(text(query(byName('a') as HTMLElement, '.lc-ts-param-req')), '✓')
+    assert.equal(text(query(byName('b') as HTMLElement, '.lc-ts-param-req-off')), '·')
+    assert.ok(text(byName('a') as HTMLElement).includes('the a param'))
+    assert.equal(queryAll(byName('p') as HTMLElement, '.lc-ts-param-desc').length, 0, 'non-string description hidden')
+    assert.equal(queryAll(byName('q') as HTMLElement, '.lc-ts-param-desc').length, 0, 'empty description hidden')
+    assert.ok(text(body).includes('Parameters'))
+
+    const toggle = query(body, '.lc-ts-json-toggle')
+    assert.ok(text(toggle).includes('View Raw JSON'))
+    await click(toggle)
+    assert.ok(text(query(body, '.lc-ts-desc-body')).includes('"parameters"'))
+    assert.ok(text(query(body, '.lc-ts-json-toggle')).includes('Collapse'))
+    await click(query(body, '.lc-ts-json-toggle'))
+    assert.equal(queryAll(body, 'pre').length, 0)
+    await click(elemRows(m)[0]!)
+    assert.equal(queryAll(m.container, '.lc-br-content').length, 0)
+    await m.unmount()
+    settings.set('defaultToolSort', 'count')
+  })
+
+  test('a text filter and the size/name sort narrow and re-rank the rows', async () => {
+    settings.set('defaultToolSort', 'size')
+    const m = await mount(h(Browser, lazyProps()))
+    await click(catRow(m, 'tools'))
+    await flush()
+    const input = query<HTMLInputElement>(m.container, '.lc-br-tool-search')
+    assert.equal(input.placeholder, 'Filter by name, description, or parameters…')
+    const sortBtns = queryAll(m.container, '.lc-br-toolctl .lc-gran-btn')
+    assert.equal(sortBtns.length, 3)
+    assert.ok(sortBtns[0]!.className.includes('lc-gran-on'), 'size is the default sort')
+    const names = () => elemRows(m).map(r => text(query(r, '.lc-br-preview')))
+
+    await typeToolSearch(m, 'gamma')
+    assert.deepEqual(names(), ['gamma'])
+    // The producer description matches: mega's 'does everything'.
+    await typeToolSearch(m, 'everything')
+    assert.deepEqual(names(), ['mega'])
+    // The parameter JSON matches: 'the a param' lives in mega's schema.
+    await typeToolSearch(m, 'the a param')
+    assert.deepEqual(names(), ['mega'])
+    // The plugin chip matches: omega carries mcp:github.
+    await typeToolSearch(m, 'github')
+    assert.deepEqual(names(), ['omega'])
+    // No match degrades to a note; clearing restores every row.
+    await typeToolSearch(m, 'zzz')
+    assert.equal(elemRows(m).length, 0)
+    assert.ok(text(m.container).includes('No tools match the current filter'))
+    await typeToolSearch(m, '')
+    assert.equal(elemRows(m).length, 9)
+
+    // Name sort re-ranks alphabetically; size restores the token-price ranking.
+    await click(sortBtns[2]!)
+    assert.ok(sortBtns[2]!.className.includes('lc-gran-on'))
+    assert.deepEqual(names(), ['beta', 'delta', 'epsilon', 'gamma', 'mega', 'omega', 'rho', 'theta', 'zeta'])
+    // Count sort with no tool-result nodes on the surface: all tallies tie at
+    // zero and break by name.
+    await click(sortBtns[1]!)
+    assert.ok(sortBtns[1]!.className.includes('lc-gran-on'))
+    assert.deepEqual(names(), ['beta', 'delta', 'epsilon', 'gamma', 'mega', 'omega', 'rho', 'theta', 'zeta'])
+    await click(sortBtns[0]!)
+    assert.deepEqual(names(), ['mega', 'beta', 'gamma', 'delta', 'epsilon', 'zeta', 'theta', 'rho', 'omega'])
+    await m.unmount()
+    settings.set('defaultToolSort', 'count')
+  })
+
+  test('count sort ranks by call hits on the shown surface; collapsed rows carry the tally', async () => {
+    // Sizes anti-correlate with hits so the count ranking is visibly its own
+    // order; delta ties gamma's tally and wins the name tie-break.
+    settings.set('defaultToolSort', 'size')
+    const hitHeaders: ContextHeaders = { headers: [{ seq: 1, time: 1, systemTokens: 3, tools: [
+      { name: 'alpha', tokens: 100 },
+      { name: 'beta', tokens: 10 },
+      { name: 'gamma', tokens: 30 },
+      { name: 'delta', tokens: 20 },
+    ] }] }
+    const data = tl({
+      current: { system: 10, tools: 160, user: 0, inject: 0, skill: 0, assistant: 10, tool: 80, total: 260 },
+      requests: [req({ seq: 4, turn: 1, step: 0 })],
+      nodes: [
+        node({ seq: 2, cat: 'assistant', tokens: 10 }),
+        node({ seq: 3, cat: 'tool', tool: 'beta', tokens: 20 }),
+        node({ seq: 5, cat: 'tool', tool: 'beta', tokens: 20 }),
+        node({ seq: 6, cat: 'tool', tool: 'gamma', tokens: 20 }),
+        node({ seq: 7, cat: 'tool', tool: 'delta', tokens: 20 }),
+        // An unpaired result (no name stamped by the fold) hits nothing.
+        node({ seq: 8, cat: 'tool', tokens: 20 }),
+      ],
+    })
+    const m = await mount(h(Browser, props({ data, headers: hitHeaders, fetchHeader: () => Promise.resolve({ tools: [] }) })))
+    await click(catRow(m, 'tools'))
+    await flush()
+    const names = () => elemRows(m).map(r => text(query(r, '.lc-br-preview')))
+    const hits = () => elemRows(m).map(r => text(query(r, '.lc-br-hits')))
+    // Size default; every collapsed row carries its tally (0 = never called).
+    assert.deepEqual(names(), ['alpha', 'gamma', 'delta', 'beta'])
+    assert.deepEqual(hits(), ['×0', '×1', '×1', '×2'])
+    assert.equal(query(m.container, '.lc-br-hits').title, 'Times this tool was called and answered within the shown step’s context')
+    // Count sort: hits desc, ties break by name (delta over gamma).
+    const sortBtns = queryAll(m.container, '.lc-br-toolctl .lc-gran-btn')
+    await click(sortBtns[1]!)
+    assert.deepEqual(names(), ['beta', 'delta', 'gamma', 'alpha'])
+    assert.deepEqual(hits(), ['×2', '×1', '×1', '×0'])
+    // Picking a past step re-tallies over THAT step's assembled surface:
+    // only seq < 4 assembles, so beta drops to its one early call; the
+    // zero-hit tools order by name.
+    await pickStep(m, '4')
+    await click(catRow(m, 'tools'))
+    await flush()
+    assert.deepEqual(names(), ['beta', 'alpha', 'delta', 'gamma'])
+    assert.deepEqual(hits(), ['×1', '×0', '×0', '×0'])
+    await m.unmount()
+    settings.set('defaultToolSort', 'count')
+  })
+
+  test('the mount-time default tool sort comes from the plugin settings', async () => {
+    const pair: ContextHeaders = { headers: [{ seq: 1, time: 1, systemTokens: 3, tools: [
+      { name: 'zzz', tokens: 1 },
+      { name: 'aaa', tokens: 100 },
+    ] }] }
+    const data = tl({
+      current: { system: 10, tools: 101, user: 0, inject: 0, skill: 0, assistant: 0, tool: 10, total: 121 },
+      nodes: [node({ seq: 2, cat: 'tool', tool: 'zzz', tokens: 10 })],
+    })
+    const names = (m: Mounted) => elemRows(m).map(r => text(query(r, '.lc-br-preview')))
+    const sortBtns = (container: ParentNode) => queryAll(container, '.lc-br-toolctl .lc-gran-btn')
+    const mountWith = async (sort: string) => {
+      settings.set('defaultToolSort', sort)
+      const m = await mount(h(Browser, props({ data, headers: pair, fetchHeader: () => Promise.resolve({ tools: [] }) })))
+      await click(catRow(m, 'tools'))
+      return m
+    }
+
+    // The schema default: most call hits first (zzz ×1 over aaa ×0).
+    let m = await mountWith('count')
+    assert.ok(sortBtns(m.container)[1]!.className.includes('lc-gran-on'))
+    assert.deepEqual(names(m), ['zzz', 'aaa'])
+    await m.unmount()
+
+    m = await mountWith('size')
+    assert.ok(sortBtns(m.container)[0]!.className.includes('lc-gran-on'))
+    assert.deepEqual(names(m), ['aaa', 'zzz'])
+    await m.unmount()
+
+    m = await mountWith('name')
+    assert.ok(sortBtns(m.container)[2]!.className.includes('lc-gran-on'))
+    assert.deepEqual(names(m), ['aaa', 'zzz'])
+    await m.unmount()
+
+    // In-toolbar toggling never writes the preference back.
+    m = await mountWith('count')
+    await click(sortBtns(m.container)[0]!)
+    assert.equal(settings.store.getSnapshot().toolSort, 'count')
+    await m.unmount()
+    settings.set('defaultToolSort', 'count')
+  })
+
+  test('before the epoch content loads, the filter scans names and plugins only', async () => {
+    const m = await mount(h(Browser, props({ data, headers, fetchHeader: () => new Promise(() => {}) })))
+    await click(catRow(m, 'tools'))
+    const names = () => elemRows(m).map(r => text(query(r, '.lc-br-preview')))
+    // The plugin chip is metadata: it matches pre-fetch.
+    await typeToolSearch(m, 'github')
+    assert.deepEqual(names(), ['omega'])
+    // Content-borne text cannot match before the fetch resolves.
+    await typeToolSearch(m, 'everything')
+    assert.equal(names().length, 0)
+    assert.ok(text(m.container).includes('No tools match the current filter'))
+    await m.unmount()
+  })
+
+  test('a hostile schema degrades the text filter, not the rows', async () => {
+    const cyclic: Record<string, unknown> = { type: 'object' }
+    cyclic['self'] = cyclic
+    const hostileContent: HeaderEpochContent = {
+      system: 'SYS',
+      tools: [
+        { name: 'loop', schema: cyclic },
+        { name: 'nully', schema: null },
+        { name: 'plain', schema: {} },
+      ],
+    }
+    const hostile: ContextHeaders = { headers: [{ seq: 1, time: 1, systemTokens: 3, tools: [
+      { name: 'loop', tokens: 3 },
+      { name: 'nully', tokens: 1 },
+      { name: 'plain', tokens: 2 },
+    ] }] }
+    const m = await mount(h(Browser, props({ data, headers: hostile, fetchHeader: () => Promise.resolve(hostileContent) })))
+    await click(catRow(m, 'tools'))
+    await flush()
+    assert.equal(elemRows(m).length, 3)
+    // The name still matches; the unstringifiable schema contributes no text.
+    await typeToolSearch(m, 'loop')
+    assert.deepEqual(elemRows(m).map(r => text(query(r, '.lc-br-preview'))), ['loop'])
+    // Searching schema-only text finds nothing here and shows the note.
+    await typeToolSearch(m, 'properties')
+    assert.equal(elemRows(m).length, 0)
+    assert.ok(text(m.container).includes('No tools match the current filter'))
+    await m.unmount()
+  })
+
+  test('schema nesting variants and the empty/degenerate arms', async () => {
+    const m = await mount(h(Browser, lazyProps()))
+    await click(catRow(m, 'tools'))
+    await flush()
+    const rows = elemRows(m)
+    const open = async (name: string) => {
+      const row = rows.find(r => text(query(r, '.lc-br-preview')) === name) as HTMLElement
+      await click(row)
+      return query(m.container, '.lc-br-content')
+    }
+    const close = async (name: string) => {
+      await click(rows.find(r => text(query(r, '.lc-br-preview')) === name) as HTMLElement)
+    }
+    // beta: input_schema nesting, no description.
+    let body = await open('beta')
+    assert.equal(queryAll(body, '.lc-ts-param-row').length, 1)
+    assert.ok(!text(body).includes('Description'), 'no description section without one')
+    await close('beta')
+
+    // gamma: inputSchema nesting with non-object properties → params empty.
+    body = await open('gamma')
+    assert.ok(text(body).includes('(no parameters)'))
+    await close('gamma')
+
+    // delta: a non-object `parameters` falls through to input_schema.
+    body = await open('delta')
+    assert.equal(queryAll(body, '.lc-ts-param-row').length, 1)
+    await close('delta')
+
+    // epsilon: bare-root object schema is itself the parameter object.
+    body = await open('epsilon')
+    assert.equal(queryAll(body, '.lc-ts-param-row').length, 1)
+    assert.ok(text(body).includes('integer'))
+    await close('epsilon')
+
+    // zeta: object type without properties → no params section at all.
+    body = await open('zeta')
+    assert.equal(queryAll(body, '.lc-ts-param-row').length, 0)
+    assert.ok(!text(body).includes('(no parameters)'))
+    assert.ok(queryAll(body, '.lc-ts-json-toggle').length === 1, 'raw JSON still available')
+    await close('zeta')
+
+    // theta: null properties counts as a (bare) params object with no rows.
+    body = await open('theta')
+    assert.ok(text(body).includes('(no parameters)'))
+    await close('theta')
+
+    // rho: non-object schema → no params, JSON toggle shows the literal.
+    body = await open('rho')
+    assert.equal(queryAll(body, '.lc-ts-param-row').length, 0)
+    await click(query(body, '.lc-ts-json-toggle'))
+    assert.ok(text(query(body, 'pre')).includes('"nope"'))
+    await close('rho')
+
+    // omega: the fetched raw entry carries no description and a bare schema —
+    // only the JSON toggle renders behind the row.
+    body = await open('omega')
+    assert.equal(queryAll(body, '.lc-ts-param-row').length, 0)
+    assert.ok(!text(body).includes('does everything'))
+    assert.ok(queryAll(body, '.lc-ts-json-toggle').length === 1)
+    await m.unmount()
+  })
+
+  test('a metadata row missing from the fetched content degrades to the not-in-log note', async () => {
+    const partial: HeaderEpochContent = { system: 'SYS', tools: [{ name: 'other', schema: {} }] }
+    const m = await mount(h(Browser, props({ data, headers, fetchHeader: () => Promise.resolve(partial) })))
+    await click(catRow(m, 'tools'))
+    await flush()
+    await click(elemRows(m).find(r => text(query(r, '.lc-br-preview')) === 'mega') as HTMLElement)
+    assert.ok(text(query(m.container, '.lc-br-content')).includes('not in the session log'))
+    await m.unmount()
+  })
+
+  test('tool rows tag the registering plugin when attribution exists', async () => {
+    settings.set('defaultToolSort', 'size')
+    const attributed: ContextHeaders = {
+      headers: [{ seq: 1, time: 1, systemTokens: 3, tools: [
+        { name: 'write', tokens: 5, plugin: '@deepseek-ai/dsh-tool-fs' },
+        { name: 'mcp__github__get_issue', tokens: 3, plugin: 'mcp:github' },
+        { name: 'agent_teams_add_member', tokens: 2 }, // no attribution → no chip
+        // Boot-predating tools arrive with the unknown sentinel → localized tag.
+        { name: 'claim_files', tokens: 2, plugin: UNKNOWN_TOOL_SOURCE },
+      ] }],
+    }
+    const data = tl({ current: { system: 0, tools: 10, user: 0, inject: 0, skill: 0, assistant: 0, tool: 0, total: 10 } })
+    const m = await mount(h(Browser, props({ data, headers: attributed })))
+    await click(catRow(m, 'tools'))
+    const rows = elemRows(m)
+    assert.equal(rows.length, 4)
+    const chips = queryAll(m.container, '.lc-br-tool-plugin')
+    assert.equal(chips.length, 3, 'only attributed tools chip')
+    assert.ok(text(chips[0]!).includes('@deepseek-ai/dsh-tool-fs'))
+    assert.ok(text(chips[1]!).includes('mcp:github'))
+    assert.ok((chips[0] as HTMLElement).title.includes('The registering plugin of this tool'), 'the chip carries the i18n tooltip')
+    assert.ok(!text(rows[2]!).includes('@'), 'unattributed tools stay untagged')
+    // The unknown-source sentinel renders the localized tag with the
+    // boot-timing explanation, never the raw sentinel string.
+    assert.equal(chips[2]!.textContent, 'Unknown plugin')
+    assert.ok((chips[2] as HTMLElement).title.includes('registered before the context plugin loaded'), 'unknown chips explain the boot gap')
+    // Layout: the tool name leads the row, the plugin chip trails it directly
+    // — one frame only, so `lc-br-tag` must not nest another `lc-br-tag`.
+    assert.equal(text(query(rows[0]!, '.lc-br-preview')), 'write', 'tool name leads')
+    const chip = chips[0] as HTMLElement
+    assert.equal(chip.previousElementSibling, query(rows[0]!, '.lc-br-preview'), 'plugin chip sits right after the tool name')
+    assert.ok(chip.parentElement!.classList.contains('lc-br-elem-row'), 'plugin chip is a single frame, a direct row child')
+    assert.equal(queryAll(chip, '.lc-br-tag').length, 0, 'no nested tag wrapper')
+    await m.unmount()
+    settings.set('defaultToolSort', 'count')
+  })
+
+  test('a single-tool category opens its schema row with the category; multi stays collapsed', async () => {
+    const lone: ContextHeaders = {
+      headers: [{ seq: 1, time: 1, systemTokens: 3, tools: [
+        { name: 'only', tokens: 5 },
+      ] }],
+    }
+    const loneContent: HeaderEpochContent = {
+      system: 'SYS',
+      tools: [{ name: 'only', schema: { type: 'object', properties: { x: { type: 'string' } } } }],
+    }
+    const data = tl({ current: { system: 10, tools: 5, user: 0, inject: 0, skill: 0, assistant: 0, tool: 0, total: 15 } })
+    const m = await mount(h(Browser, props({ data, headers: lone, fetchHeader: () => Promise.resolve(loneContent) })))
+    await click(catRow(m, 'tools'))
+    await flush()
+    assert.equal(elemRows(m).length, 1)
+    const content = queryAll(m.container, '.lc-br-content')
+    assert.equal(content.length, 1, 'the lone tool schema is already expanded')
+    assert.equal(queryAll(content[0]!, '.lc-ts-param-row').length, 1, 'the schema body renders directly')
+    await click(catRow(m, 'tools'))
+    assert.equal(queryAll(m.container, '.lc-br-content').length, 0, 'toggling shut closes the row too')
+    await m.unmount()
+
+    const pair: ContextHeaders = {
+      headers: [{ seq: 1, time: 1, systemTokens: 3, tools: [{ name: 'a', tokens: 2 }, { name: 'b', tokens: 1 }] }],
+    }
+    const m2 = await mount(h(Browser, props({ data, headers: pair })))
+    await click(catRow(m2, 'tools'))
+    assert.equal(elemRows(m2).length, 2)
+    assert.equal(queryAll(m2.container, '.lc-br-content').length, 0, 'multi-tool categories open collapsed')
+    await m2.unmount()
+  })
+})
+
+describe('ContextBrowser message categories', () => {
+  // One rich live surface exercising every NodeContent/BlocksBody branch.
+  const convNodes: ConversationNodeLike[] = [
+    // user with two images then text (image group flush mid-loop + trailing)
+    { kind: 'user', seq: 1, content: [
+      { type: 'image', attachment: { attachmentId: 'a1', name: 'one.png', bytes: 2048, width: 100, height: 50 } },
+      { type: 'image', attachment: { attachmentId: 'a2' } },
+      { type: 'text', text: 'with images' },
+    ] },
+    // user with text then one image
+    { kind: 'user', seq: 2, content: [
+      { type: 'text', text: 'one pic' },
+      { kind: 'image', attachment: { attachmentId: 'a3' } },
+    ] },
+    // user without a content array → hint fallback
+    { kind: 'user', seq: 5 },
+    // assistant full block cascade
+    { kind: 'assistant', seq: 68, blocks: [
+      { kind: 'text', text: 'final answer' },
+      { type: 'reasoning', text: 'thinking hard' },
+      { kind: 'tool-call', name: 'bash', argsRaw: '{"command":"ls","timeout":30,"opts":{"a":1}}' },
+      { kind: 'tool-call', name: 'broken', argsRaw: 'not json' },
+      { type: 'tool-call', arguments: '{"file_path":"x.ts"}' },
+      { kind: 'tool-call', name: 'noargs' },
+      { type: 'tool-result', content: [
+        { type: 'text', text: 'inner result' },
+        { type: 'image', attachment: { attachmentId: 'b1' } },
+      ] },
+      { type: 'tool-result', content: 'not-an-array' },
+      { kind: 'image', attachment: { attachmentId: 'b2', name: 'pic.png', bytes: 4096, width: 640, height: 480 } },
+      { type: 'mystery', foo: 1 },
+      { type: 'text', text: 42 },
+      'plain string block',
+      { foo: 'bar' },
+    ] },
+    // assistant without blocks but with content (legacy shape)
+    { kind: 'assistant', seq: 67, content: [{ type: 'text', text: 'legacy body' }] },
+    // assistant summary sources
+    { kind: 'assistant', seq: 62, blocks: [{ kind: 'tool-call', name: 'write', argsRaw: '{"file_path":"a.ts"}' }] },
+    { kind: 'assistant', seq: 63, blocks: [{ kind: 'tool-call', name: 'read', argsRaw: '{}' }] },
+    { kind: 'assistant', seq: 64, blocks: [{ kind: 'tool-call', name: 'edit', argsRaw: '{"path":"b.ts"}' }] },
+    // compaction nodes
+    { kind: 'compaction', seq: 70, summary: 'SUMMARY BODY' },
+    { kind: 'compaction', seq: 71, summary: null },
+    { kind: 'compaction', seq: 72, summary: '' },
+    // inject join
+    { kind: 'user', seq: 54, content: [{ type: 'text', text: 'relay body full' }] },
+  ]
+
+  const data = tl({
+    current: { system: 0, tools: 0, user: 40, inject: 20, skill: 0, assistant: 60, tool: 30, total: 150 },
+    nodes: [
+      node({ seq: 1, tokens: 10, text: 'with images', time: 100 }),
+      node({ seq: 2, tokens: 9, text: 'one pic', time: 200 }),
+      node({ seq: 3, tokens: 5, text: 'fallback text', time: 300 }),
+      node({ seq: 4, tokens: 4, text: '', time: 400 }),
+      node({ seq: 5, tokens: 4, text: 'no content array', time: 500 }),
+      node({ seq: 50, cat: 'inject', tokens: 5, form: 'snapshot', text: 'state' }),
+      node({ seq: 51, cat: 'inject', tokens: 5, form: 'notice', text: 'heads up' }),
+      node({ seq: 55, cat: 'inject', tokens: 5, form: 'notice', text: '' }),
+      node({ seq: 56, cat: 'inject', tokens: 5, text: 'no form' }),
+      node({ seq: 54, cat: 'inject', tokens: 5, form: 'relay', text: 'relay body' }),
+      node({ seq: 61, cat: 'assistant', tokens: 8, calls: ['bash', 'write'], text: 'done all' }),
+      node({ seq: 62, cat: 'assistant', tokens: 8, calls: ['write'] }),
+      node({ seq: 63, cat: 'assistant', tokens: 8, calls: ['read'] }),
+      node({ seq: 64, cat: 'assistant', tokens: 8 }),
+      node({ seq: 65, cat: 'assistant', tokens: 8 }),
+      node({ seq: 66, cat: 'assistant', tokens: 8, calls: [], text: 'plain text' }),
+      node({ seq: 67, cat: 'assistant', tokens: 8, text: 'legacy' }),
+      node({ seq: 68, cat: 'assistant', tokens: 20, text: 'full cascade' }),
+      node({ seq: 70, tokens: 6, text: 'summary node' }),
+      node({ seq: 71, tokens: 6, text: '' }),
+      node({ seq: 72, tokens: 6, text: 'empty summary' }),
+    ],
+  })
+
+  const loadImage: ImageLoader = async (att) => {
+    if (att.attachmentId === 'a3' || att.attachmentId === 'b1') throw new Error('denied')
+    return 'blob:' + att.attachmentId
+  }
+
+  const mountBrowser = async (over: Partial<ContextBrowserProps> = {}) =>
+    mount(h(Browser, props({ data, convNodes, loadImage, ...over })))
+
+  test('user rows: image chips on collapsed rows, join content, fallbacks', async () => {
+    const m = await mountBrowser()
+    await click(catRow(m, 'user'))
+    const rows = elemRows(m)
+    assert.equal(rows.length, 8, 'user + compaction nodes, newest first')
+    assert.equal(text(query(rows[0]!, '.lc-br-preview')), 'empty summary')
+    // Image chips ride the collapsed row (seq 1 ×2, seq 2 ×1).
+    const rowOf = (preview: string) => rows.find(r => text(r).includes(preview)) as HTMLElement
+    assert.ok(text(rowOf('with images')).includes('Image ×2'))
+    assert.ok(text(rowOf('one pic')).includes('Image'))
+    assert.ok(!text(rowOf('one pic')).includes('×'))
+    // Open seq 1: the chip makes way for the grid; loader resolves two cards.
+    await click(rowOf('with images'))
+    await flush()
+    let content = query(m.container, '.lc-br-content')
+    assert.ok(!text(elemRows(m).find(r => text(r).includes('with images')) as HTMLElement).includes('Image ×2'),
+      'expanded row drops the chip')
+    assert.ok(text(content).includes('Images'))
+    const imgs = queryAll<HTMLImageElement>(content, '.lc-att-thumb img')
+    assert.equal(imgs.length, 2, 'both loads resolved')
+    assert.ok(imgs[0]!.src.includes('blob:a1'))
+    assert.ok(text(content).includes('one.png'))
+    assert.ok(text(content).includes('100×50'))
+    await click(elemRows(m).find(r => text(r).includes('with images')) as HTMLElement)
+
+    // Open seq 2: single image, load REJECTS → error placeholder.
+    await click(rowOf('one pic'))
+    await flush()
+    content = query(m.container, '.lc-br-content')
+    assert.equal(queryAll(content, '.lc-att-err').length, 1)
+    assert.ok(text(query(content, '.lc-att-err')).includes('⚠'))
+    await click(elemRows(m).find(r => text(r).includes('one pic')) as HTMLElement)
+
+    // Join missed with preview text: content section + the window note.
+    await click(rowOf('fallback text'))
+    content = query(m.container, '.lc-br-content')
+    assert.ok(text(content).includes('fallback text'))
+    assert.ok(text(content).includes('outside the loaded message window'))
+    await click(elemRows(m).find(r => text(r).includes('fallback text')) as HTMLElement)
+
+    // Join missed without text (seq 4, rows newest-first: 72,71,70,5,4,…): the note alone.
+    assert.ok(text(rows[4]!).includes('(non-text message)'))
+    await click(rows[4]!)
+    content = query(m.container, '.lc-br-content')
+    assert.ok(text(content).includes('outside the loaded message window'))
+    assert.ok(!text(content).includes('Content'))
+    await m.unmount()
+  })
+
+  test('user node whose conversation entry carries no content array shows the note', async () => {
+    const m = await mountBrowser()
+    await click(catRow(m, 'user'))
+    await click(elemRows(m).find(r => text(r).includes('no content array')) as HTMLElement)
+    const content = query(m.container, '.lc-br-content')
+    assert.ok(text(content).includes('outside the loaded message window'))
+    await m.unmount()
+  })
+
+  test('a single-node category opens its node with the category', async () => {
+    const solo = tl({
+      current: { system: 0, tools: 0, user: 10, inject: 0, skill: 0, assistant: 0, tool: 0, total: 10 },
+      nodes: [node({ seq: 1, tokens: 10, text: 'only message', time: 100 })],
+    })
+    const m = await mount(h(Browser, props({
+      data: solo,
+      convNodes: [{ kind: 'user', seq: 1, content: [{ type: 'text', text: 'only message' }] }],
+    })))
+    await click(catRow(m, 'user'))
+    assert.equal(elemRows(m).length, 1)
+    assert.equal(queryAll(m.container, '.lc-br-content').length, 1, 'the lone node is already expanded')
+    assert.ok(text(query(m.container, '.lc-br-content')).includes('only message'))
+    await m.unmount()
+  })
+
+  test('message rows filter by tag and preview text; another category opens unfiltered', async () => {
+    const m = await mountBrowser()
+    await click(catRow(m, 'user'))
+    const input = query<HTMLInputElement>(m.container, '.lc-br-tool-search')
+    assert.equal(input.placeholder, 'Filter by message text…')
+    const previews = () => elemRows(m).map(r => text(query(r, '.lc-br-preview')))
+    await typeToolSearch(m, 'summary')
+    assert.deepEqual(previews(), ['empty summary', 'summary node'])
+    // No match keeps the toolbar mounted so the filter can be cleared.
+    await typeToolSearch(m, 'zzz')
+    assert.equal(elemRows(m).length, 0)
+    assert.ok(text(m.container).includes('No rows match the current filter'))
+    assert.equal(queryAll(m.container, '.lc-br-tool-search').length, 1)
+    await typeToolSearch(m, '')
+    assert.equal(elemRows(m).length, 8)
+
+    // The call-breadcrumb tag matches too (an assistant row's 'bash › write').
+    await click(catRow(m, 'assistant'))
+    assert.equal(query<HTMLInputElement>(m.container, '.lc-br-tool-search').value, '', 'another category opens unfiltered')
+    await typeToolSearch(m, 'bash')
+    assert.deepEqual(previews(), ['done all'])
+    await m.unmount()
+  })
+
+  test('user images render a placeholder when no loader is wired', async () => {
+    const m = await mountBrowser({ loadImage: undefined })
+    await click(catRow(m, 'user'))
+    await click(elemRows(m).find(r => text(r).includes('one pic')) as HTMLElement)
+    assert.equal(queryAll(m.container, '.lc-att-ph').length, 1)
+    await m.unmount()
+  })
+
+  test('assistant rows: preview cascade and the full block vocabulary', async () => {
+    const m = await mountBrowser()
+    await click(catRow(m, 'assistant'))
+    const rows = elemRows(m)
+    const rowOf = (preview: string) => rows.find(r => text(r).includes(preview)) as HTMLElement
+    assert.ok(text(rowOf('done all')).includes('bash › write'), 'call breadcrumb tag')
+    assert.ok(text(rowOf('a.ts')).includes('write'), 'block summary previews a textless turn')
+    const tags = rows.map(r => {
+      const tag = r.querySelector<HTMLElement>('.lc-br-tag')
+      const preview = text(query(r, '.lc-br-preview'))
+      return `${tag === null ? '∅' : text(tag)}|${preview}`
+    })
+    assert.ok(tags.includes('read|(empty reply)'), 'no self-summarizing call → empty marker')
+    assert.ok(tags.includes('∅|b.ts'), 'textless turn previews the joined call summary')
+    assert.ok(tags.includes('∅|(empty reply)'), 'no join, no calls → empty marker')
+    assert.ok(tags.includes('∅|Calls '), 'empty call list previews as a bare Calls label (nodeText)')
+
+    await click(rowOf('full cascade'))
+    const content = query(m.container, '.lc-br-content')
+    const heads = queryAll(content, '.lc-ts-card-head').map(el => text(el))
+    assert.ok(heads.some(s => s.includes('Response')))
+    assert.ok(heads.some(s => s.includes('Reasoning')))
+    assert.ok(heads.some(s => s.includes('→ bash')))
+    assert.ok(heads.some(s => s.includes('→ broken')))
+    assert.ok(heads.some(s => s.includes('→ ?')), 'nameless call card')
+    assert.ok(heads.some(s => s.includes('→ noargs')))
+    assert.ok(heads.some(s => s.includes('Result')), 'nested tool-result text section')
+    assert.ok(heads.filter(s => s.includes('Other content')).length === 5, 'unknown blocks render raw JSON')
+    assert.ok(heads.some(s => s.includes('Images')))
+    // Call arg rows: string, number and object values.
+    const argVals = queryAll(content, '.lc-ts-arg-row').map(el => text(el))
+    assert.ok(argVals.some(s => s.includes('command') && s.includes('ls')))
+    assert.ok(argVals.some(s => s.includes('timeout') && s.includes('30')))
+    assert.ok(argVals.some(s => s.includes('opts') && s.includes('{"a":1}')))
+    // Unparseable args show raw; absent args show nothing.
+    assert.ok(text(content).includes('not json'))
+    assert.ok(text(content).includes('inner result'))
+    await flush()
+    // b1 rejects (error), b2 resolves.
+    assert.equal(queryAll(content, '.lc-att-err').length, 1)
+    assert.equal(queryAll(content, '.lc-att-thumb img').length, 1)
+    await m.unmount()
+  })
+
+  test('assistant with a legacy content array renders the generic content section', async () => {
+    const m = await mountBrowser()
+    await click(catRow(m, 'assistant'))
+    await click(elemRows(m).find(r => text(r).includes('legacy')) as HTMLElement)
+    const content = query(m.container, '.lc-br-content')
+    assert.ok(text(content).includes('Content'))
+    assert.ok(text(content).includes('legacy body'))
+    await m.unmount()
+  })
+
+  test('assistant without a join shows only the window note', async () => {
+    const m = await mountBrowser()
+    await click(catRow(m, 'assistant'))
+    const row = elemRows(m).find(r => text(r).includes('(empty reply)') && !text(r).includes('read')) as HTMLElement
+    await click(row)
+    const content = query(m.container, '.lc-br-content')
+    assert.ok(text(content).includes('outside the loaded message window'))
+    await m.unmount()
+  })
+
+  test('compaction nodes: summary text, null and empty summaries', async () => {
+    const m = await mountBrowser()
+    await click(catRow(m, 'user'))
+    const rows = elemRows(m)
+    // Newest first: 72 (empty summary), 71 (null summary), 70 (summary node).
+    await click(rows[2]!)
+    let content = query(m.container, '.lc-br-content')
+    assert.ok(text(content).includes('Summary'))
+    assert.ok(text(content).includes('SUMMARY BODY'))
+    // Null summary → empty body.
+    await click(rows[1]!)
+    content = query(m.container, '.lc-br-content')
+    assert.equal(text(content), '')
+    // Empty-string summary → empty body.
+    await click(rows[0]!)
+    content = query(m.container, '.lc-br-content')
+    assert.equal(text(content), '')
+    await m.unmount()
+  })
+
+  test('inject rows: form tags, snapshot prefix, skill injects', async () => {
+    const m = await mountBrowser()
+    await click(catRow(m, 'inject'))
+    const rows = elemRows(m)
+    const tags = rows.map(r => {
+      const tag = r.querySelector<HTMLElement>('.lc-br-tag')
+      return `${tag === null ? '∅' : text(tag)}|${text(query(r, '.lc-br-preview'))}`
+    })
+    assert.ok(tags.includes('State Snapshot|Snapshot: state'))
+    assert.ok(tags.includes('Notice|heads up'))
+    assert.ok(tags.includes('Notice|Notice'), 'empty-string text keeps the form label')
+    assert.ok(tags.includes('Context Injection|no form'), 'formless inject defaults to the context label')
+    assert.ok(tags.includes('Agent Relay|relay body'))
+    // Expanded inject joins the conversation content.
+    await click(rows.find(r => text(r).includes('relay body')) as HTMLElement)
+    const content = query(m.container, '.lc-br-content')
+    assert.ok(text(content).includes('relay body full'))
+    await m.unmount()
+  })
+
+  test('inject rows label the fold-stamped source identity; the folded text stays filterable', async () => {
+    const data = tl({
+      current: { system: 0, tools: 0, user: 0, inject: 45, skill: 0, assistant: 0, tool: 0, total: 45 },
+      nodes: [
+        // Stamped rows: the identity the events card names replaces the raw
+        // content preview (which stays one expand away).
+        node({ seq: 50, cat: 'inject', tokens: 9, form: 'snapshot', name: '@deepseek-ai/dsh-system-prompt', text: 'policy sections' }),
+        node({ seq: 51, cat: 'inject', tokens: 9, form: 'instructions', name: 'AGENTS.md', text: '<system-reminder> instructions' }),
+        // Unstamped (rows folded before the stamp existed): content stands.
+        node({ seq: 52, cat: 'inject', tokens: 9, form: 'snapshot', text: 'state' }),
+        // Hostile drift: a non-string / empty stamp degrades to the content.
+        node({ seq: 53, cat: 'inject', tokens: 9, name: 42 as never, text: 'drift body' }),
+        node({ seq: 54, cat: 'inject', tokens: 9, name: '', text: 'empty body' }),
+      ],
+    })
+    const m = await mount(h(Browser, props({ data })))
+    await click(catRow(m, 'inject'))
+    const tags = elemRows(m).map(r => {
+      const tag = r.querySelector<HTMLElement>('.lc-br-tag')
+      return `${tag === null ? '∅' : text(tag)}|${text(query(r, '.lc-br-preview'))}`
+    })
+    assert.ok(tags.includes('State Snapshot|@deepseek-ai/dsh-system-prompt'))
+    assert.ok(tags.includes('Instructions|AGENTS.md'))
+    assert.ok(tags.includes('State Snapshot|Snapshot: state'))
+    assert.ok(tags.includes('Context Injection|drift body'))
+    assert.ok(tags.includes('Context Injection|empty body'))
+    // The folded content left the preview but stays in the filter's lens.
+    await typeToolSearch(m, 'policy sections')
+    assert.deepEqual(elemRows(m).map(r => text(query(r, '.lc-br-preview'))), ['@deepseek-ai/dsh-system-prompt'])
+    await typeToolSearch(m, 'AGENTS.md')
+    assert.equal(elemRows(m).length, 1)
+    await m.unmount()
+  })
+
+  test('skill rows: loads/invocations name themselves, the catalog tags its form', async () => {
+    const convNodes: ConversationNodeLike[] = [
+      { kind: 'tool-result', seq: 72, call: { name: 'skill', argsRaw: '{"description":"grill the plan"}' }, content: [{ type: 'text', text: 'skill body' }] },
+    ]
+    const data = tl({
+      current: { system: 0, tools: 0, user: 0, inject: 0, skill: 40, assistant: 0, tool: 0, total: 40 },
+      nodes: [
+        // An invocation message previews its own text; the catalog digest tags
+        // its form; the `skill`-tool load (no node text) previews the call.
+        node({ seq: 70, cat: 'skill', tokens: 9, skill: 'code-review', text: 'skill body' }),
+        node({ seq: 71, cat: 'skill', tokens: 9, form: 'catalog' }),
+        node({ seq: 72, cat: 'skill', tokens: 9, tool: 'skill', skill: 'grilling' }),
+        // Hostile drift: a skill node with neither a name nor a form.
+        node({ seq: 73, cat: 'skill', tokens: 4 }),
+        // A stamped catalog digest previews its source identity, not the digest text.
+        node({ seq: 74, cat: 'skill', tokens: 9, form: 'catalog', name: 'skill-catalog', text: 'digest body' }),
+      ],
+    })
+    const m = await mount(h(Browser, props({ data, convNodes })))
+    assert.ok(text(catRow(m, 'skill')).includes('Skill Injections'))
+    assert.ok(text(catRow(m, 'skill')).includes('5 Items'))
+    await click(catRow(m, 'skill'))
+    const rows = elemRows(m)
+    assert.equal(rows.length, 5)
+    const tags = rows.map(r => {
+      const tag = r.querySelector<HTMLElement>('.lc-br-tag')
+      return `${tag === null ? '∅' : text(tag)}|${text(query(r, '.lc-br-preview'))}`
+    })
+    assert.ok(tags.includes('Skill · code-review|skill body'), 'the invocation names itself and previews its text')
+    assert.ok(tags.includes('Catalog Update|Catalog Update'), 'the textless catalog digest tags its form')
+    assert.ok(tags.includes('Skill · grilling|grill the plan'), 'the load previews its call summary')
+    assert.ok(tags.includes('Context Injection|Context Injection'), 'a nameless, formless skill row degrades to the context label')
+    assert.ok(tags.includes('Catalog Update|skill-catalog'), 'a stamped catalog digest previews its source identity')
+    await m.unmount()
+  })
+})
+
+describe('ContextBrowser tool results', () => {
+  // The tail-status matrix: dsh settles failing commands as completed calls,
+  // so trailing markers are the failure signal.
+  const cases: { seq: number; tail: string; err: boolean; label: string }[] = [
+    { seq: 80, tail: 'boom\n[exit code: 3]', err: true, label: 'Failed · exit 3' },
+    { seq: 81, tail: '[killed by signal: SIGKILL]', err: true, label: 'Failed' },
+    { seq: 82, tail: '[shell killed by signal: SIGTERM]', err: true, label: 'Failed' },
+    { seq: 83, tail: '[shell exited: code 2]', err: true, label: 'Failed · exit 2' },
+    { seq: 84, tail: '[shell exited: code 0]', err: false, label: 'OK' },
+    { seq: 85, tail: '[shell exited]', err: false, label: 'OK' },
+    { seq: 86, tail: 'oops [exit code: 7]\n[shell killed by signal: SIGTERM]', err: true, label: 'Failed · exit 7' },
+    { seq: 87, tail: '[status: killed]', err: true, label: 'Failed' },
+    { seq: 88, tail: '[status: failed, boom]', err: true, label: 'Failed' },
+    { seq: 89, tail: 'all good', err: false, label: 'OK' },
+    { seq: 90, tail: 'a quoted [exit code: 9] marker mid-text\nmore output', err: false, label: 'OK' },
+  ]
+  const convNodes: ConversationNodeLike[] = cases.map(c => ({
+    kind: 'tool-result', seq: c.seq,
+    call: { name: 'bash', argsRaw: '{"description":"run it"}' },
+    content: [{ type: 'image', attachment: { attachmentId: 'x' + String(c.seq) } }, null, { type: 'text', text: c.tail }],
+  }))
+  convNodes.push(
+    // Fold-stamped failure without any marker.
+    { kind: 'tool-result', seq: 91, call: { name: 'read', argsRaw: '{}' }, content: [{ type: 'text', text: 'denied' }], isError: true },
+    // No call record → no call card.
+    { kind: 'tool-result', seq: 92, call: null, content: [{ type: 'text', text: 'orphan' }] },
+    // Content that is not an array → no body sections.
+    { kind: 'tool-result', seq: 93, call: { name: 'bash', argsRaw: '' }, content: 'raw-text' as never },
+  )
+  const nodes: SurfaceNode[] = [
+    ...cases.map(c => node({ seq: c.seq, cat: 'tool', tokens: 9, tool: 'bash' })),
+    node({ seq: 91, cat: 'tool', tokens: 9, tool: 'read' }),
+    node({ seq: 92, cat: 'tool', tokens: 9, tool: 'bash' }),
+    node({ seq: 93, cat: 'tool', tokens: 9, tool: 'bash' }),
+    // Fold-stamped err flag, no join.
+    node({ seq: 94, cat: 'tool', tokens: 9, tool: 'write', err: true }),
+    // No join at all → placeholder preview; missing tool name → '?'.
+    node({ seq: 95, cat: 'tool', tokens: 9, tool: 'bash' }),
+    node({ seq: 96, cat: 'tool', tokens: 9 }),
+    // A joined, clean result: the OK-state expansion target below.
+    node({ seq: 97, cat: 'tool', tokens: 9, tool: 'bash' }),
+  ]
+  convNodes.push({ kind: 'tool-result', seq: 97, call: { name: 'bash', argsRaw: '{}' }, content: [{ type: 'text', text: 'skill body' }] })
+
+  const data = tl({
+    current: { system: 0, tools: 0, user: 0, inject: 0, skill: 0, assistant: 0, tool: 162, total: 162 },
+    nodes,
+  })
+
+  test('tail-status matrix drives the error dot; tags and previews render on collapsed rows', async () => {
+    const m = await mount(h(Browser, props({ data, convNodes })))
+    await click(catRow(m, 'tool'))
+    const rows = elemRows(m)
+    assert.equal(rows.length, nodes.length)
+    // Dot presence per case (collapsed rows): every marker failure + the two
+    // fold-stamped failures (isError, err flag) — nothing else.
+    const dots = queryAll(m.container, '.lc-br-err-dot')
+    assert.equal(dots.length, 9, 'one red dot per failing result')
+    // Newest-first order: rows[0] is seq 97 (joined clean result), then 96, 95, ...
+    assert.ok(text(rows[0]!).includes('bash'))
+    assert.ok(text(rows[1]!).includes('?'), 'missing tool name tags as ?')
+    assert.ok(text(rows[1]!).includes('Tool Result'), 'no join → placeholder preview')
+    assert.ok(text(rows[2]!).includes('Tool Result'))
+    assert.ok(text(rows[3]!).includes('write'))
+    const byIdx = Object.fromEntries([97, 96, 95, 94, 93, 92, 91, 90, 89, 88, 87, 86, 85, 84, 83, 82, 81, 80].map((s, i) => [s, i]))
+    for (const c of cases) {
+      const hasDot = rows[byIdx[c.seq]!]!.querySelector('.lc-br-err-dot') !== null
+      assert.equal(hasDot, c.err, `seq ${c.seq}: dot ${c.err ? 'shown' : 'hidden'} for tail ${JSON.stringify(c.tail)}`)
+    }
+    assert.ok(rows[byIdx[91]!]!.querySelector('.lc-br-err-dot') !== null, 'isError stamps the dot')
+    assert.ok(rows[byIdx[94]!]!.querySelector('.lc-br-err-dot') !== null, 'the fold err flag stamps the dot')
+    assert.ok(rows[byIdx[93]!]!.querySelector('.lc-br-err-dot') === null, 'non-array content has no markers')
+    await click(rows[0]!)
+    const content = query(m.container, '.lc-br-content')
+    assert.ok(text(content).includes('OK'))
+    assert.ok(text(content).includes('skill body'))
+    await m.unmount()
+  })
+
+  test('clean results render the OK state; orphan results render no call card', async () => {
+    const m = await mount(h(Browser, props({ data, convNodes })))
+    await click(catRow(m, 'tool'))
+    const rows = elemRows(m)
+    // Newest first: index map by seq (97, 96, 95, 94, 93, 92, 91, 90..80).
+    const byIdx = Object.fromEntries([97, 96, 95, 94, 93, 92, 91, 90, 89, 88, 87, 86, 85, 84, 83, 82, 81, 80].map((s, i) => [s, i]))
+    const expand = async (seq: number) => {
+      await click(rows[byIdx[seq]!]!)
+      return query(m.container, '.lc-br-content')
+    }
+    let content = await expand(89)
+    assert.ok(text(content).includes('OK'))
+    assert.ok(!queryAll(content, '.lc-br-err-dot').length)
+    await click(elemRows(m)[byIdx[89]!]!)
+    // Exit-code failure with the pill.
+    content = await expand(80)
+    assert.ok(text(content).includes('Failed · exit 3'))
+    await click(elemRows(m)[byIdx[80]!]!)
+    // Killed by signal: failure without an exit code.
+    content = await expand(81)
+    assert.ok(text(content).includes('Failed'))
+    assert.ok(!text(content).includes('exit'))
+    await click(elemRows(m)[byIdx[81]!]!)
+    // Shell killed after a failing command: the command's code wins.
+    content = await expand(86)
+    assert.ok(text(content).includes('Failed · exit 7'))
+    await click(elemRows(m)[byIdx[86]!]!)
+    // Orphan result: no call card, but the result body renders.
+    content = await expand(92)
+    assert.ok(!text(content).includes('→'), 'no call card without a call record')
+    assert.ok(text(content).includes('orphan'))
+    await click(elemRows(m)[byIdx[92]!]!)
+    // Non-array content: call card only.
+    content = await expand(93)
+    assert.ok(text(content).includes('OK'))
+    assert.ok(!text(content).includes('raw-text'))
+    await m.unmount()
+  })
+})
+
+describe('ContextBrowser targeted content fetch', () => {
+  const data = tl({
+    current: { system: 0, tools: 0, user: 10, inject: 0, skill: 0, assistant: 0, tool: 0, total: 10 },
+    nodes: [node({ seq: 5, tokens: 5, text: 'pageable' }), node({ seq: 6, tokens: 5, text: 'also pageable' })],
+  })
+
+  const openFirstRow = async (m: Mounted) => {
+    await click(catRow(m, 'user'))
+    await click(elemRows(m)[1]!) // seq 5 (newest first: 6, 5)
+  }
+
+  test('a missed join fetches the seq once, and the fetched body renders', async () => {
+    let calls = 0
+    let release: (() => void) | null = null
+    const fetchContent = async (seq: number) => {
+      calls += 1
+      return new Promise<void>((resolve) => { release = resolve })
+        .then(() => ({ kind: 'user', seq, content: [{ type: 'text', text: 'FULL BODY' }] }) as ConversationNodeLike)
+    }
+    const m = await mount(h(Browser, props({ data, convNodes: [], fetchContent })))
+    await openFirstRow(m)
+    assert.equal(calls, 1, 'one targeted read')
+    assert.ok(text(query(m.container, '.lc-br-content')).includes('Loading full content from older session history'), 'in-flight note')
+    await act(async () => { release?.() })
+    await flush()
+    assert.ok(text(query(m.container, '.lc-br-content')).includes('FULL BODY'))
+    // Close and reopen the same row: the fetched node is merged state — no re-read.
+    await click(elemRows(m)[1]!)
+    await click(elemRows(m)[1]!)
+    assert.ok(text(query(m.container, '.lc-br-content')).includes('FULL BODY'))
+    assert.equal(calls, 1, 'no second fetch for a merged seq')
+    await m.unmount()
+  })
+
+  test('a page without the seq reports it as absent from the session log', async () => {
+    let calls = 0
+    const fetchContent = async () => {
+      calls += 1
+      return null
+    }
+    const m = await mount(h(Browser, props({ data, convNodes: [], fetchContent })))
+    await openFirstRow(m)
+    await flush()
+    assert.equal(calls, 1)
+    assert.ok(text(query(m.container, '.lc-br-content')).includes('not in the session log anymore'))
+    await m.unmount()
+  })
+
+  test('a failed read arms the retry button; retrying succeeds', async () => {
+    let calls = 0
+    const fetchContent = async (seq: number) => {
+      calls += 1
+      if (calls === 1) throw new Error('transport down')
+      return { kind: 'user', seq, content: [{ type: 'text', text: 'RETRY BODY' }] } as ConversationNodeLike
+    }
+    const m = await mount(h(Browser, props({ data, convNodes: [], fetchContent })))
+    await openFirstRow(m)
+    await flush()
+    const failed = query(m.container, '.lc-br-content')
+    assert.ok(text(failed).includes('Load failed'))
+    await click(query(failed, '.lc-br-retry'))
+    await flush()
+    assert.ok(text(query(m.container, '.lc-br-content')).includes('RETRY BODY'))
+    assert.equal(calls, 2)
+    await m.unmount()
+  })
+
+  test('without a fetcher (older host) an un-joined row keeps the static note', async () => {
+    const m = await mount(h(Browser, props({ data, convNodes: [] })))
+    await openFirstRow(m)
+    await flush()
+    assert.ok(text(query(m.container, '.lc-br-content')).includes('outside the loaded message window'))
+    await m.unmount()
+  })
+
+  test('a late fetch for an abandoned row never lands; the next row fetches its own seq', async () => {
+    const deferreds: { resolve: (node: ConversationNodeLike | null) => void; reject: (reason: Error) => void }[] = []
+    const fetchedFor: number[] = []
+    const fetchContent = (seq: number): Promise<ConversationNodeLike | null> => {
+      fetchedFor.push(seq)
+      if (seq === 5) return new Promise((resolve, reject) => { deferreds.push({ resolve, reject }) })
+      return Promise.resolve({ kind: 'user', seq, content: [{ type: 'text', text: 'BODY ' + String(seq) }] } as ConversationNodeLike)
+    }
+    let snap: { nodes?: readonly ConversationNodeLike[] } = { nodes: [] }
+    const el = () => h(Browser, props({ data, convNodes: snap.nodes, fetchContent }))
+    const m = await mount(el())
+    await openFirstRow(m) // seq 5 hangs in flight
+    assert.equal(deferreds.length, 1)
+    await click(elemRows(m)[0]!) // switch to seq 6 while seq 5 is pending
+    await flush()
+    assert.ok(text(query(m.container, '.lc-br-content')).includes('BODY 6'))
+    // The abandoned promise settles after the row was left — both outcomes are ignored.
+    await act(async () => {
+      deferreds[0]?.resolve({ kind: 'user', seq: 5, content: [{ type: 'text', text: 'STALE BODY' }] })
+    })
+    assert.ok(!text(m.container).includes('STALE BODY'), 'stale result ignored')
+    await click(elemRows(m)[1]!) // seq 5 again: another deferred hangs
+    await click(elemRows(m)[0]!)
+    await flush()
+    await act(async () => {
+      deferreds[1]?.reject(new Error('gone'))
+    })
+    await flush()
+    assert.ok(text(query(m.container, '.lc-br-content')).includes('BODY 6'), 'stale rejection ignored')
+    // Reopening seq 5 renders once its own fetch settles.
+    await click(elemRows(m)[1]!)
+    await act(async () => {
+      deferreds[2]?.resolve({ kind: 'user', seq: 5, content: [{ type: 'text', text: 'BODY 5' }] })
+    })
+    await flush()
+    assert.ok(text(query(m.container, '.lc-br-content')).includes('BODY 5'))
+    assert.deepEqual(fetchedFor, [5, 6, 5, 5], 'one call per miss (seq 6 stays cached)')
+    // The conversation window catching up later wins over fetched state.
+    snap = { nodes: [{ kind: 'user', seq: 5, content: [{ type: 'text', text: 'WINDOW BODY' }] }] }
+    await m.update(el())
+    assert.ok(text(query(m.container, '.lc-br-content')).includes('WINDOW BODY'))
+    assert.ok(!text(m.container).includes('BODY 5'), 'the join takes precedence over the fetch cache')
+    await m.unmount()
+  })
+})
+
+describe('ContextBrowser focus bridges', () => {
+  const headers: ContextHeaders = {
+    headers: [{
+      seq: 1, time: 1, systemTokens: 3,
+      tools: [
+        { name: 'beta', tokens: 50 },
+        { name: 'alpha', tokens: 10 },
+      ],
+    }],
+  }
+  const data = tl({
+    current: { system: 10, tools: 60, user: 10, inject: 0, skill: 0, assistant: 0, tool: 0, total: 80 },
+    requests: [req({ seq: 10, turn: 1, step: 0, total: 80 }), req({ seq: 20, turn: 1, step: 1, total: 80 })],
+    nodes: [node({ seq: 1, tokens: 5, text: 'focusable' }), node({ seq: 11, cat: 'assistant', tokens: 5, text: 'answer' })],
+  })
+  const convNodes: ConversationNodeLike[] = [{ kind: 'user', seq: 1, content: [{ type: 'text', text: 'focusable' }] }]
+
+  test('nodeFocus selects the step, opens the node, scrolls it into view, and clears', async () => {
+    const scrolls: unknown[] = []
+    const orig = Element.prototype.scrollIntoView
+    Element.prototype.scrollIntoView = function (this: Element, arg?: unknown) { scrolls.push(arg) } as never
+    try {
+      let handled = 0
+      const m = await mount(h(Browser, props({ data, headers, convNodes })))
+      await m.update(h(Browser, props({
+        data, headers, convNodes,
+        nodeFocus: { step: 'live', seq: 1, cat: 'user' },
+        onNodeFocusHandled: () => { handled += 1 },
+      })))
+      assert.equal(handled, 1)
+      const onRows = queryAll(m.container, '.lc-br-elem-on')
+      assert.equal(onRows.length, 1)
+      assert.ok(text(onRows[0]!).includes('focusable'))
+      assert.deepEqual(scrolls, [{ block: 'nearest' }], 'the open row scrolled into view')
+      // A step focus switches the assembled view.
+      await m.update(h(Browser, props({
+        data, headers, convNodes,
+        nodeFocus: { step: 20, seq: 1, cat: 'user' },
+        onNodeFocusHandled: () => { handled += 1 },
+      })))
+      assert.ok(text(query(m.container, '.lc-br-meta')).includes('Turn 1 · Step 1'))
+      assert.equal(handled, 2)
+      // A node outside the assembled surface leaves nothing to scroll to.
+      await m.update(h(Browser, props({
+        data, headers, convNodes,
+        nodeFocus: { step: 'live', seq: 999, cat: 'user' },
+      })))
+      assert.equal(queryAll(m.container, '.lc-br-elem-on').length, 0)
+      await m.unmount()
+    } finally {
+      Element.prototype.scrollIntoView = orig
+    }
+  })
+
+  test('pinSeq selects the pinned step and unpinning returns to live (accordion resets)', async () => {
+    const m = await mount(h(Browser, props({ data, headers })))
+    await click(catRow(m, 'user'))
+    assert.equal(queryAll(m.container, '.lc-br-body').length, 1)
+    await m.update(h(Browser, props({ data, headers, pinSeq: 10 })))
+    assert.ok(text(query(m.container, '.lc-br-meta')).includes('Turn 1 · Step 0'))
+    assert.equal(queryAll(m.container, '.lc-br-body').length, 0, 'pinning resets the accordion')
+    assert.equal(query<HTMLSelectElement>(m.container, 'select.lc-br-pick').value, '10')
+    await m.update(h(Browser, props({ data, headers, pinSeq: null })))
+    assert.ok(text(query(m.container, '.lc-br-meta')).includes('Live · Next Request'))
+    await m.unmount()
+  })
+})
+
+describe('ContextBrowser — the split generation detail states', () => {
+  test('a pending detail read names the state on the note strip', async () => {
+    const m = await mount(h(Browser, { data: tl({}), headers: null, detailState: 'loading' }))
+    assert.ok(text(m.container).includes(DICT_EN['detail.loading']!))
+    // The picker still offers the live surface (the sections read zero until the detail lands).
+    assert.equal(queryAll(m.container, '.lc-br-pick option').length, 1)
+    await m.unmount()
+  })
+
+  test('a failed detail read arms the retry button on the strip', async () => {
+    let retries = 0
+    const m = await mount(h(Browser, {
+      data: tl({}),
+      headers: null,
+      detailState: 'failed',
+      onDetailRetry: () => { retries++ },
+    }))
+    await click(query(m.container, '.lc-br-retry'))
+    assert.equal(retries, 1)
+    await m.unmount()
+  })
+
+  test('a landed (or inline) detail renders no strip', async () => {
+    for (const state of ['ready', 'legacy'] as const) {
+      const m = await mount(h(Browser, { data: tl({}), headers: null, detailState: state }))
+      assert.ok(!text(m.container).includes(DICT_EN['detail.loading']!))
+      assert.ok(!text(m.container).includes(DICT_EN['detail.loadFailed']!))
+      await m.unmount()
+    }
+    // And the prop-less caller (older hosts) renders nothing either.
+    const m = await mount(h(Browser, { data: tl({}), headers: null }))
+    assert.ok(queryAll(m.container, '.lc-br-retry').length === 0)
+    await m.unmount()
+  })
+})
+
+describe('ContextBrowser open-category reporting', () => {
+  test('toggling categories and step picks report the open category outward', async () => {
+    const data = tl({
+      requests: [req({ seq: 10, turn: 1, step: 0 }), req({ seq: 20, turn: 2, step: 0 })],
+      nodes: [
+        node({ seq: 1, cat: 'user', text: 'hi' }),
+        node({ seq: 2, cat: 'user', text: 'again' }),
+        node({ seq: 3, cat: 'tool', tokens: 30, tool: 'bash', text: 'out' }),
+      ],
+    })
+    const opens: (string | null)[] = []
+    const onOpenCat = (c: string | null): void => { opens.push(c) }
+    const m = await mount(h(Browser, props({ data, onOpenCat })))
+    assert.deepEqual(opens, [null], 'the mount-time pin pass reports the closed accordion')
+    await click(catRow(m, 'user'))
+    assert.deepEqual(opens, [null, 'user'])
+    await click(catRow(m, 'user'))
+    assert.deepEqual(opens, [null, 'user', null])
+    await click(catRow(m, 'tool'))
+    assert.deepEqual(opens, [null, 'user', null, 'tool'])
+    await pickStep(m, '20')
+    assert.deepEqual(opens, [null, 'user', null, 'tool', null], 'a step pick closes the open category')
+    await m.unmount()
+  })
+
+  test('a pin change and a brief reveal report their reset / target category', async () => {
+    const data = tl({ requests: [req({ seq: 10, turn: 1, step: 0 })], nodes: [node({ seq: 1, cat: 'user', text: 'hi' })] })
+    const opens: (string | null)[] = []
+    const onOpenCat = (c: string | null): void => { opens.push(c) }
+    const m = await mount(h(Browser, props({ data, onOpenCat })))
+    await m.update(h(Browser, props({ data, onOpenCat, pinSeq: 10 })))
+    assert.deepEqual(opens, [null, null], 'pinning resets the accordion')
+    await m.update(h(Browser, props({
+      data, onOpenCat, pinSeq: 10,
+      nodeFocus: { step: 'live', seq: 1, cat: 'tool' },
+      onNodeFocusHandled: () => {},
+    })))
+    assert.deepEqual(opens, [null, null, 'tool'], 'the reveal opens the node category')
+    await m.unmount()
+  })
+})
+
+describe('ContextBrowser DNA mode and the open-category bar pin', () => {
+  const dnaHeaders: ContextHeaders = {
+    headers: [{
+      seq: 1, time: 1000, systemTokens: 100,
+      tools: [{ name: 'bash', tokens: 50 }, { name: 'write', tokens: 25 }],
+    }],
+  }
+  const dnaData = tl({
+    current: { system: 100, tools: 75, user: 20, inject: 10, skill: 0, assistant: 40, tool: 30, total: 275 },
+    requests: [req({ seq: 20, turn: 1, step: 0, system: 100, tools: 75, user: 20, inject: 0, assistant: 40, tool: 30, total: 265 })],
+    nodes: [
+      node({ seq: 2, tokens: 20, time: 2000, text: 'hi' }),
+      node({ seq: 3, cat: 'tool', tokens: 30, time: 3000, tool: 'bash' }),
+      node({ seq: 4, cat: 'assistant', tokens: 40 }),
+      node({ seq: 5, cat: 'inject', tokens: 10, form: 'notice' }),
+    ],
+  })
+
+  function dnaButton(m: Mounted): HTMLElement {
+    return query(m.container, '.lc-br-dna-ctl .lc-gran-btn')
+  }
+
+  function bands(m: Mounted): HTMLElement[] {
+    return queryAll(m.container, '.lc-stacked-seg')
+  }
+
+  test('the toggle redraws the composition bar as one band per item, in prompt order', async () => {
+    const m = await mount(h(Browser, props({ data: dnaData, headers: dnaHeaders })))
+    // Category mode: one segment per category in CATS order, pick cursor off, tooltip slot unmounted.
+    assert.equal(bands(m).length, 6)
+    const normal = bands(m).map(seg => seg.style.width)
+    assert.deepEqual(normal, [100, 75, 20, 10, 40, 30].map(v => `${v / 275 * 100}%`))
+    assert.ok(!bands(m)[0]!.className.includes('lc-stacked-seg-pick'))
+    assert.ok(!query(m.container, '.lc-br-bar').className.includes('lc-br-bar-dna'))
+    assert.equal(queryAll(m.container, '.lc-bar-tip').length, 0)
+
+    const btn = dnaButton(m)
+    assert.equal(text(btn), 'DNA Mode')
+    assert.equal(query(m.container, '.lc-br-dna-ctl').getAttribute('title'), kit.t('browser.dnaTip'))
+    await click(btn)
+    // Prompt order: the system prompt, the two tool schemas in producer order, then the message flow by seq —
+    // NOT the fold's category order and NOT the header event's bookkeeping seq (see dna.ts).
+    const segs = bands(m)
+    assert.equal(segs.length, 7)
+    assert.deepEqual(segs.map(seg => seg.style.width), [100, 50, 25, 20, 30, 40, 10].map(v => `${v / 275 * 100}%`))
+    assert.ok(segs.every(seg => seg.className.includes('lc-stacked-seg-pick')))
+    assert.ok(query(m.container, '.lc-br-bar').className.includes('lc-br-bar-dna'))
+    assert.equal(queryAll(m.container, '.lc-bar-tip').length, 1, 'the per-item tooltip slot mounts')
+    assert.ok(btn.className.includes('lc-gran-on'))
+
+    await click(btn)
+    assert.equal(bands(m).length, 6, 'toggling off restores the category composition')
+    assert.ok(!btn.className.includes('lc-gran-on'))
+    await m.unmount()
+  })
+
+  test('band hover floats the per-item tooltip locally; a mirrored category key lights that category\'s bands', async () => {
+    const hovers: (string | null)[] = []
+    const wired = (hoverKey: string | null) => h(Browser, props({ data: dnaData, headers: dnaHeaders, hoverKey, onHoverKey: (k) => { hovers.push(k) } }))
+    const m = await mount(wired(null))
+    await click(dnaButton(m))
+
+    // A band hover is LOCAL: the tooltip names the item (category label + join time); nothing reports upward.
+    await hover(bands(m)[3]!)
+    const tip = query(m.container, '.lc-bar-tip')
+    assert.ok(tip.className.includes('lc-bar-tip-on'))
+    assert.equal(text(tip), `User Messages · ${kit.fmtTime(2000)} ≈20 (7%) of used context`)
+    assert.deepEqual(hovers, [], 'DNA hovers stay on the bar — the overview keeps showing the live category composition')
+    assert.ok(bands(m)[3]!.className.includes('lc-stacked-seg-on'))
+    assert.ok(query(m.container, '.lc-stacked').className.includes('lc-stacked-dim'))
+    // A node without a logged time shows the bare label.
+    await hover(bands(m)[5]!)
+    assert.equal(text(tip), 'Assistant Messages ≈40 (15%) of used context')
+    await unhover(query(m.container, '.lc-stacked'))
+    assert.ok(!tip.className.includes('lc-bar-tip-on'))
+
+    // The incoming category mirror still works: the open category's bands light as a group (no tooltip for a mirrored hover).
+    await m.update(wired('tool'))
+    assert.deepEqual(bands(m).map(seg => seg.className.includes('lc-stacked-seg-on')), [false, false, false, false, true, false, false])
+    assert.ok(!query(m.container, '.lc-bar-tip').className.includes('lc-bar-tip-on'))
+    await m.update(wired('free'))
+    assert.ok(bands(m).every(seg => !seg.className.includes('lc-stacked-seg-on')), "the overview's free key lights nothing here")
+    await m.unmount()
+  })
+
+  test('band labels: skill tag, nameless tool result, formless injection; a header-less surface shows message bands only', async () => {
+    const data = tl({
+      current: { system: 0, tools: 0, user: 0, inject: 40, skill: 0, assistant: 0, tool: 20, total: 60 },
+      nodes: [
+        node({ seq: 1, cat: 'inject', tokens: 10, skill: 'code' }),
+        node({ seq: 2, cat: 'tool', tokens: 20 }),
+        node({ seq: 3, cat: 'inject', tokens: 30 }),
+      ],
+    })
+    const m = await mount(h(Browser, props({ data, headers: null })))
+    await click(dnaButton(m))
+    assert.equal(bands(m).length, 3)
+    const tip = query(m.container, '.lc-bar-tip')
+    await hover(bands(m)[0]!)
+    assert.equal(text(tip), 'Skill · code ≈10 (17%) of used context')
+    await hover(bands(m)[1]!)
+    assert.equal(text(tip), '? ≈20 (33%) of used context')
+    await hover(bands(m)[2]!)
+    assert.equal(text(tip), 'Context Injection ≈30 (50%) of used context')
+    await m.unmount()
+  })
+
+  test('clicking a band opens its category + element row below and scrolls it into view; a stale row filter is cleared', async () => {
+    const scrolls: unknown[] = []
+    const orig = Element.prototype.scrollIntoView
+    Element.prototype.scrollIntoView = function (this: Element, arg?: unknown) { scrolls.push(arg) } as never
+    try {
+      const m = await mount(h(Browser, props({ data: dnaData, headers: dnaHeaders })))
+      await click(dnaButton(m))
+      // Band n3 (index 4) opens the tool-results category on that exact row.
+      await click(bands(m)[4]!)
+      assert.equal(queryAll(m.container, '.lc-br-body').length, 1)
+      const onRows = queryAll(m.container, '.lc-br-elem-on')
+      assert.equal(onRows.length, 1)
+      assert.ok(text(onRows[0]!).includes('bash'))
+      assert.deepEqual(scrolls, [{ block: 'nearest' }])
+
+      // A stale row filter cannot hide the clicked band's row.
+      await click(catRow(m, 'user'))
+      await typeToolSearch(m, 'zzz')
+      assert.ok(text(query(m.container, '.lc-br-body')).includes('No rows match'))
+      await click(bands(m)[3]!)
+      assert.equal(query<HTMLInputElement>(m.container, '.lc-br-tool-search').value, '')
+      assert.equal(queryAll(m.container, '.lc-br-elem-on').length, 1)
+      assert.ok(text(query(m.container, '.lc-br-body')).includes('hi'))
+
+      // The system band opens the system section (metadata-only note without a header fetcher).
+      await click(bands(m)[0]!)
+      assert.ok(text(query(m.container, '.lc-br-body')).includes('token estimates only'))
+      await m.unmount()
+    } finally {
+      Element.prototype.scrollIntoView = orig
+    }
+  })
+
+  test('a tiny item stays a hoverable filament (the minBand floor) while the tooltip reports the true share', async () => {
+    const data = tl({
+      current: { system: 0, tools: 0, user: 2, inject: 0, skill: 0, assistant: 998, tool: 0, total: 1000 },
+      nodes: [node({ seq: 1, tokens: 2, text: 'ok' }), node({ seq: 2, cat: 'assistant', tokens: 998 })],
+    })
+    const m = await mount(h(Browser, props({ data, headers: null })))
+    await click(dnaButton(m))
+    const segs = bands(m)
+    assert.equal(segs.length, 2)
+    // 2/1000 ≈ 0.2% would render sub-pixel: the band pins to the 0.35% floor, the big band rescales.
+    assert.equal(segs[0]!.style.width, '0.35%')
+    assert.ok(Math.abs(parseFloat(segs[1]!.style.width) - 99.65) < 0.001)
+    await hover(segs[0]!)
+    assert.equal(text(query(m.container, '.lc-bar-tip')), 'User Messages ≈2 (0%) of used context')
+    // Category mode keeps exact widths (no floor outside DNA mode).
+    await click(dnaButton(m))
+    assert.deepEqual(bands(m).map(seg => seg.style.width), ['0.2%', '99.8%'])
+    await m.unmount()
+  })
+
+  test('category mode: the open category stays lit; a pointer hover overrides the pin and the pin resumes on leave', async () => {
+    // A parent really holding the shared hover key, so hovers round-trip like the overview link.
+    const Harness = (p2: Omit<ContextBrowserProps, 'hoverKey' | 'onHoverKey'>) => {
+      const [hoverKey, setHoverKey] = useState<string | null>(null)
+      return h(Browser, props({ ...p2, hoverKey, onHoverKey: setHoverKey }))
+    }
+    const m = await mount(h(Harness, { data: dnaData, headers: dnaHeaders }))
+    const stack = query(m.container, '.lc-stacked')
+    assert.ok(!stack.className.includes('lc-stacked-dim'), 'nothing pinned while no category is open')
+    // Opening a category pins its segment lit (category order: system, tools, user, inject, assistant, tool).
+    await click(catRow(m, 'assistant'))
+    assert.deepEqual(bands(m).map(seg => seg.className.includes('lc-stacked-seg-on')), [false, false, false, false, true, false])
+    assert.ok(stack.className.includes('lc-stacked-dim'))
+    assert.equal(queryAll(m.container, '.lc-bar-tip').length, 0, 'category mode mounts no tooltip slot — the pin floats nothing')
+    // A pointer hover overrides the pin; leaving resumes it.
+    await hover(bands(m)[0]!)
+    assert.deepEqual(bands(m).map(seg => seg.className.includes('lc-stacked-seg-on')), [true, false, false, false, false, false])
+    await unhover(stack)
+    assert.deepEqual(bands(m).map(seg => seg.className.includes('lc-stacked-seg-on')), [false, false, false, false, true, false])
+    // Closing the category clears the pin.
+    await click(catRow(m, 'assistant'))
+    assert.ok(!stack.className.includes('lc-stacked-dim'))
+    assert.ok(bands(m).every(seg => !seg.className.includes('lc-stacked-seg-on')))
+    await m.unmount()
+  })
+
+  test('DNA mode: the open category lights all its bands as a group (no tooltip); a band hover overrides, the pin resumes', async () => {
+    // No shared-hover wiring (the /context modal path): the pin works standalone.
+    const m = await mount(h(Browser, props({ data: dnaData, headers: dnaHeaders })))
+    await click(dnaButton(m))
+    await click(catRow(m, 'tools'))
+    const stack = query(m.container, '.lc-stacked')
+    // Band order: sys, bash, write, n2, n3, n4, n5 — the tools group is bands 1-2.
+    assert.deepEqual(bands(m).map(seg => seg.className.includes('lc-stacked-seg-on')), [false, true, true, false, false, false, false])
+    assert.ok(stack.className.includes('lc-stacked-dim'))
+    assert.ok(!query(m.container, '.lc-bar-tip').className.includes('lc-bar-tip-on'), 'the group pin exact-matches no band — no tooltip')
+    await hover(bands(m)[4]!)
+    assert.ok(query(m.container, '.lc-bar-tip').className.includes('lc-bar-tip-on'))
+    assert.deepEqual(bands(m).map(seg => seg.className.includes('lc-stacked-seg-on')), [false, false, false, false, true, false, false])
+    await unhover(stack)
+    assert.deepEqual(bands(m).map(seg => seg.className.includes('lc-stacked-seg-on')), [false, true, true, false, false, false, false])
+    await click(catRow(m, 'tools'))
+    assert.ok(bands(m).every(seg => !seg.className.includes('lc-stacked-seg-on')))
+    assert.ok(!stack.className.includes('lc-stacked-dim'))
+    await m.unmount()
+  })
+
+  test('a push dropping the hovered band does not dim the bar with nothing lit; the pin resumes underneath', async () => {
+    const m = await mount(h(Browser, props({ data: dnaData, headers: dnaHeaders })))
+    await click(dnaButton(m))
+    await hover(bands(m)[3]!)
+    assert.ok(bands(m)[3]!.className.includes('lc-stacked-seg-on'))
+    assert.ok(query(m.container, '.lc-stacked').className.includes('lc-stacked-dim'))
+    // The hovered node is compacted out of the live surface while the pointer rests on its band — a removed element
+    // fires no mouseleave, so the stale key must be dropped instead of dimming the whole bar with nothing lit.
+    const pushed = tl({
+      current: { ...dnaData.current, user: 0, total: 255 },
+      requests: dnaData.requests,
+      nodes: dnaData.nodes.filter(n => n.seq !== 2),
+    })
+    await m.update(h(Browser, props({ data: pushed, headers: dnaHeaders })))
+    assert.ok(!query(m.container, '.lc-stacked').className.includes('lc-stacked-dim'))
+    assert.ok(bands(m).every(seg => !seg.className.includes('lc-stacked-seg-on')))
+    assert.ok(!query(m.container, '.lc-bar-tip').className.includes('lc-bar-tip-on'), 'the dead key floats no tooltip either')
+    // Band order is now sys, bash, write, n3, n4, n5: the open-category pin still lights its group under the stale hover.
+    await click(catRow(m, 'assistant'))
+    assert.deepEqual(bands(m).map(seg => seg.className.includes('lc-stacked-seg-on')), [false, false, false, false, true, false])
+    // And a fresh hover on a rendered band still wins over the pin.
+    await hover(bands(m)[3]!)
+    assert.deepEqual(bands(m).map(seg => seg.className.includes('lc-stacked-seg-on')), [false, false, false, true, false, false])
+    await m.unmount()
+  })
+
+  test('the pin drops while the previewed step holds nothing for the open category', async () => {
+    const wired = (previewSeq: number | null) => h(Browser, props({ data: dnaData, headers: dnaHeaders, previewSeq, onHoverKey: () => {} }))
+    const m = await mount(wired(null))
+    await click(catRow(m, 'inject'))
+    assert.ok(bands(m)[3]!.className.includes('lc-stacked-seg-on'), 'inject pins lit on the live surface')
+    // The retained step carries no injections: the pin drops instead of dimming a bar with nothing lit.
+    await m.update(wired(20))
+    assert.ok(bands(m).every(seg => !seg.className.includes('lc-stacked-seg-on')))
+    assert.ok(!query(m.container, '.lc-stacked').className.includes('lc-stacked-dim'))
+    await m.update(wired(null))
+    assert.ok(bands(m)[3]!.className.includes('lc-stacked-seg-on'), 'back on the live surface the pin returns')
+    await m.unmount()
+  })
+})

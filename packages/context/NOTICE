@@ -1,0 +1,10 @@
+harness-trajectory — packages/context
+
+This package contains code derived from dsh-context
+(https://github.com/bowenliang123/dsh-context), Copyright (c) bowenliang123,
+licensed under the Apache License, Version 2.0 (see LICENSE in this directory).
+
+Modifications for harness-trajectory: the dsh runtime bindings were removed and
+replaced with transcript-file synthesizers for Claude Code and Codex; the
+client is mounted by the harness-trajectory web app instead of the dsh shell.
+The rest of the repository is licensed under the MIT License (see ../../LICENSE).

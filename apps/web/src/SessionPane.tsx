@@ -5,22 +5,28 @@ import type {
 import {
   Menu, TrajectoryView, Tooltip, useSnapshotSelector, type MenuEntry, type SnapshotStore, type TrajectoryTranslate,
 } from '@harness-trajectory/ui'
-import type { Route } from './App.tsx'
+import type { Route, SessionTab } from './App.tsx'
+import { ContextPane } from './ContextPane.tsx'
 import { HarnessMark, harnessMeta } from './harnesses.tsx'
 import { relativeTime } from './SessionList.tsx'
 import { SessionRuntime } from './session-runtime.ts'
 import css from './app.module.css'
 
 export interface SessionPaneProps {
-  kind: HarnessKind
-  id: string
-  /** Child transcript id when the pane shows one subagent on its own. */
-  file: string | null
+  /** The address this pane renders; its stream identity is the route's session + file. */
+  route: Route
   /** Listing row for this session, when the list has it. */
   summary: SessionSummary | null
   onNavigate: (route: Route) => void
   t: TrajectoryTranslate
+  locale: 'en' | 'zh'
   durationStore: SnapshotStore<boolean>
+}
+
+/** The tab strip's labels, in both UI locales. */
+const TAB_LABELS: Record<'en' | 'zh', Record<SessionTab, string>> = {
+  en: { trajectory: 'Trajectory', context: 'Context' },
+  zh: { trajectory: '轨迹', context: '上下文' },
 }
 
 function formatBytes(bytes: number): string {
@@ -190,7 +196,11 @@ function SubagentCatalog({ rows, sessionLive, noun, onOpen }: {
   )
 }
 
-export function SessionPane({ kind, id, file, summary: listSummary, onNavigate, t, durationStore }: SessionPaneProps) {
+export function SessionPane({ route, summary: listSummary, onNavigate, t, locale, durationStore }: SessionPaneProps) {
+  const kind = route.kind
+  const id = route.id
+  const file = route.file ?? null
+  const tab: SessionTab = route.tab ?? 'trajectory'
   const runtime = useMemo(() => new SessionRuntime(kind, id, file), [kind, id, file])
   useEffect(() => {
     runtime.start()
@@ -208,6 +218,12 @@ export function SessionPane({ kind, id, file, summary: listSummary, onNavigate, 
   const agent = file === null ? undefined : (state.files[0]?.agent ?? self?.file.agent)
   const agentTitle = file === null ? null : (agent?.description ?? shortAgentId(file))
   const openChild = (fileId: string) => { onNavigate({ kind, id, file: fileId }) }
+  // The trajectory's own subagent view streams one file; the Context tab folds
+  // the whole session, so it is offered only on the session address.
+  const tabs: readonly SessionTab[] = file === null ? ['trajectory', 'context'] : ['trajectory']
+  const selectTab = (next: SessionTab) => {
+    onNavigate(next === 'context' ? { kind, id, tab: 'context' } : { kind, id })
+  }
   return (
     <div className={css.pane}>
       <header className={css.paneHeader}>
@@ -284,15 +300,49 @@ export function SessionPane({ kind, id, file, summary: listSummary, onNavigate, 
           )}
         </div>
         {state.error !== null && <div className={css.paneError}>{state.error}</div>}
+        {tabs.length > 1 && (
+          <div className={css.tabs} role="tablist">
+            {tabs.map(entry => (
+              <button
+                key={entry}
+                type="button"
+                role="tab"
+                aria-selected={entry === tab}
+                className={entry === tab ? `${css.tab} ${css.tabActive}` : css.tab}
+                onClick={() => { selectTab(entry) }}
+              >
+                {TAB_LABELS[locale][entry]}
+              </button>
+            ))}
+          </div>
+        )}
       </header>
-      <div className={css.paneBody}>
-        <TrajectoryView
-          snapshot={state.snapshot}
-          loading={state.loading && state.snapshot.eventNodes.length === 0}
-          loadImage={runtime.loadImage}
-          durationStore={durationStore}
-          t={t}
-        />
+      <div className={css.paneBody} data-tab={tab}>
+        {tab === 'context'
+          ? (
+            <ContextPane
+              runtime={runtime}
+              kind={kind}
+              id={id}
+              agent={route.agent ?? null}
+              summary={summary}
+              locale={locale}
+              onOpenAgent={(fileId) => {
+                onNavigate(fileId === null
+                  ? { kind, id, tab: 'context' }
+                  : { kind, id, tab: 'context', agent: fileId })
+              }}
+            />
+          )
+          : (
+            <TrajectoryView
+              snapshot={state.snapshot}
+              loading={state.loading && state.snapshot.eventNodes.length === 0}
+              loadImage={runtime.loadImage}
+              durationStore={durationStore}
+              t={t}
+            />
+          )}
       </div>
     </div>
   )

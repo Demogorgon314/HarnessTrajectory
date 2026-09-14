@@ -24,28 +24,60 @@ const COLLAPSE_SETTLE_MS = 150
 const THEME_CYCLE: readonly ThemePreference[] = ['system', 'light', 'dark']
 const EMPTY_KINDS: ReadonlySet<HarnessKind> = new Set()
 
+/** The pane's tabs; `trajectory` is the address without a tab segment. */
+export type SessionTab = 'trajectory' | 'context'
+
 export interface Route {
   kind: HarnessKind
   id: string
-  /** Child (subagent) transcript id when a subagent view is open. */
+  /**
+   * Child (subagent) transcript id when the TRAJECTORY view folds one subagent
+   * on its own (`/agent/<id>`); the stream then serves that file alone.
+   */
   file?: string
+  /** The open tab; absent means the trajectory. */
+  tab?: SessionTab
+  /**
+   * Context tab only: which of the session's folded transcripts the dashboard
+   * shows (`/context/<id>`). Unlike `file` this does NOT narrow the stream —
+   * the Context tab folds every file of the session at once.
+   */
+  agent?: string
 }
 
 function parseHash(hash: string): Route | null {
-  const match = /^#\/(claude|codex)\/([^/]+)(?:\/agent\/([^/]+))?$/.exec(hash)
+  const match = /^#\/(claude|codex)\/([^/]+)(?:\/(agent|context)(?:\/([^/]+))?)?$/.exec(hash)
   if (match === null) return null
-  const file = match[3]
-  return {
-    kind: match[1] as HarnessKind,
-    id: decodeURIComponent(match[2] ?? ''),
-    ...(file === undefined ? {} : { file: decodeURIComponent(file) }),
+  const section = match[3]
+  const tail = match[4]
+  const base = { kind: match[1] as HarnessKind, id: decodeURIComponent(match[2] ?? '') }
+  if (section === 'agent') {
+    // `/agent` with no id is not an address of its own.
+    if (tail === undefined) return base
+    return { ...base, file: decodeURIComponent(tail) }
   }
+  if (section === 'context') {
+    return { ...base, tab: 'context', ...(tail === undefined ? {} : { agent: decodeURIComponent(tail) }) }
+  }
+  return base
 }
 
-/** Hash for a route; the subagent segment keeps the parent session as the address root. */
+/** Hash for a route; both tail segments keep the parent session as the address root. */
 export function routeHash(route: Route): string {
   const base = `#/${route.kind}/${encodeURIComponent(route.id)}`
+  if (route.tab === 'context') {
+    return route.agent === undefined ? `${base}/context` : `${base}/context/${encodeURIComponent(route.agent)}`
+  }
   return route.file === undefined ? base : `${base}/agent/${encodeURIComponent(route.file)}`
+}
+
+/**
+ * The runtime identity of a route: the stream a pane opens. Both tabs of one
+ * session share it, so switching tabs (or agents inside the Context tab)
+ * never reopens the stream.
+ */
+export function runtimeKey(route: Route): string {
+  return `${route.kind}/${route.id}/${route.file ?? ''}`
 }
 
 function useHashRoute(): [Route | null, (route: Route | null) => void] {
@@ -284,13 +316,12 @@ export function App() {
           )
           : (
             <SessionPane
-              key={routeHash(route)}
-              kind={route.kind}
-              id={route.id}
-              file={route.file ?? null}
+              key={runtimeKey(route)}
+              route={route}
               summary={selectedSummary}
               onNavigate={navigate}
               t={t}
+              locale={locale}
               durationStore={durationStore}
             />
           )}

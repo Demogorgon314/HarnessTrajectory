@@ -1,8 +1,11 @@
 /**
- * Per-session runtime: owns the harness parser, feeds it lines from the live
- * stream, and publishes throttled snapshots the trajectory view subscribes to.
+ * Per-session runtime: owns the harness parser AND the Context dashboard's
+ * fold, feeds both from the live stream, and publishes throttled snapshots the
+ * views subscribe to. One runtime serves both tabs, so switching tabs never
+ * reopens the stream.
  */
 
+import { ContextSession } from '@harness-trajectory/context'
 import {
   createSessionParser, EMPTY_TRAJECTORY_SNAPSHOT,
   type HarnessKind, type ImageAttachmentRef, type SessionChildSummary, type SessionFileRef,
@@ -24,6 +27,12 @@ export interface SessionRuntimeState {
   children: readonly SessionChildSummary[]
   /** Subagent runs the folded transcript spawned. */
   subagents: readonly SubagentRun[]
+  /**
+   * Revision of the Context fold (`runtime.context`). The fold is mutable and
+   * memoizes its views, so the store carries only its revision: a bump is the
+   * signal to re-read `timelineOf`/`headersOf`/`metaOf`.
+   */
+  contextRevision: number
   error: string | null
   connected: boolean
 }
@@ -33,6 +42,8 @@ const PUBLISH_INTERVAL_MS = 80
 export class SessionRuntime {
   readonly store: SnapshotStore<SessionRuntimeState>
   readonly loadImage: MessageImageLoader
+  /** The Context dashboard's per-file fold, fed the same lines as the parser. */
+  context: ContextSession
   private parser: SessionParser
   private stream: LiveStream | null = null
   private publishTimer: ReturnType<typeof setTimeout> | null = null
@@ -45,6 +56,7 @@ export class SessionRuntime {
    */
   constructor(readonly kind: HarnessKind, readonly id: string, readonly fileId: string | null = null) {
     this.parser = createSessionParser(kind)
+    this.context = new ContextSession(kind)
     this.store = createSnapshotStore<SessionRuntimeState>({
       snapshot: EMPTY_TRAJECTORY_SNAPSHOT,
       loading: true,
@@ -53,6 +65,7 @@ export class SessionRuntime {
       files: [],
       children: [],
       subagents: [],
+      contextRevision: 0,
       error: null,
       connected: false,
     })
@@ -98,7 +111,10 @@ export class SessionRuntime {
         else this.noteFile(event.file)
         break
       case 'lines':
-        for (const line of event.lines) this.parser.push(line, event.file)
+        for (const line of event.lines) {
+          this.parser.push(line, event.file)
+          this.context.push(line, event.file)
+        }
         this.lineCount += event.lines.length
         this.schedulePublish()
         break
@@ -123,9 +139,13 @@ export class SessionRuntime {
   /** The server truncated or rewrote a file: rebuild from scratch by reopening the stream. */
   private reset(): void {
     this.parser = createSessionParser(this.kind)
+    this.context = new ContextSession(this.kind)
     this.lineCount = 0
     this.stream?.close()
-    this.patch({ snapshot: EMPTY_TRAJECTORY_SNAPSHOT, loading: true, lines: 0, files: [], subagents: [] })
+    this.patch({
+      snapshot: EMPTY_TRAJECTORY_SNAPSHOT, loading: true, lines: 0, files: [], subagents: [],
+      contextRevision: this.context.revision,
+    })
     this.start()
   }
 
@@ -139,7 +159,12 @@ export class SessionRuntime {
 
   private publish(): void {
     if (this.closed) return
-    this.patch({ snapshot: this.parser.snapshot(), lines: this.lineCount, subagents: this.parser.subagents() })
+    this.patch({
+      snapshot: this.parser.snapshot(),
+      lines: this.lineCount,
+      subagents: this.parser.subagents(),
+      contextRevision: this.context.revision,
+    })
   }
 
   private patch(partial: Partial<SessionRuntimeState>): void {

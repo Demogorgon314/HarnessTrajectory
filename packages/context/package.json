@@ -1,0 +1,33 @@
+{
+  "name": "@harness-trajectory/context",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "description": "Context dashboard (stats, composition, trend, browser, events, file activity, agent network) ported from dsh-context and fed by Claude Code and Codex transcripts",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./client": "./src/client/index.ts",
+    "./styles.css": "./src/client/styles/index.css"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run --project context --project context-ui"
+  },
+  "dependencies": {
+    "@harness-trajectory/core": "workspace:*",
+    "@harness-trajectory/ui": "workspace:*"
+  },
+  "peerDependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@types/react": "~18.3.1",
+    "@types/react-dom": "~18.3.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.8"
+  }
+}

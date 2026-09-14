@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { createCodexParser } from '../src/adapters/codex.ts'
+import { createCodexParser, isCodexHumanPrompt } from '../src/adapters/codex.ts'
 import type { SessionFileRef } from '../src/session.ts'
 import type { AssistantMessageNode, ToolResultNode } from '../src/contract.ts'
 
@@ -435,6 +435,22 @@ describe('codex adapter', () => {
     expect(parser.kind).toBe('codex')
   })
 
+  it('treats an AGENTS.md preamble as project instructions, not a prompt', () => {
+    const parser = feed([
+      sessionMeta(0),
+      taskStarted(1_000, 'turn-1'),
+      userMessage(1_100, '# AGENTS.md\n\nBe brief in this repo.'),
+      userMessage(2_000, 'Please list the files'),
+      assistantMessage(3_000, 'Two files.'),
+      taskComplete(4_000, 'turn-1', 'Two files.'),
+    ])
+    const contexts = parser.snapshot().eventNodes.filter(node => node.kind === 'context')
+    expect(contexts.map(node => node.kind === 'context' ? [node.provenance.label, node.form] : null))
+      .toEqual([['agents-md', 'instructions']])
+    expect(parser.meta().promptCount).toBe(1)
+    expect(parser.meta().title).toBe('Please list the files')
+  })
+
   it('ignores blank, malformed, and truncated lines', () => {
     const lines = twoTurnFixture()
     const parser = createCodexParser()
@@ -448,5 +464,35 @@ describe('codex adapter', () => {
     expect(parser.snapshot()).not.toBe(before)
     expect(assistants(parser)).toHaveLength(4)
     expect(parser.snapshot().partial?.blocks).toEqual([{ kind: 'text', text: 'late' }])
+  })
+})
+
+describe('isCodexHumanPrompt', () => {
+  it('accepts a person\'s prompt', () => {
+    expect(isCodexHumanPrompt('Please list the files')).toBe(true)
+    expect(isCodexHumanPrompt('  continue')).toBe(true)
+    // An attached image rides a tag but is still the person speaking.
+    expect(isCodexHumanPrompt('<image>')).toBe(true)
+  })
+
+  it('rejects the injected wrappers and preambles', () => {
+    expect(isCodexHumanPrompt('<environment_context>\n  <cwd>/work</cwd>\n</environment_context>')).toBe(false)
+    expect(isCodexHumanPrompt('<user_instructions>Be brief.</user_instructions>')).toBe(false)
+    expect(isCodexHumanPrompt('The following is the Codex agent history for the previous window.')).toBe(false)
+    expect(isCodexHumanPrompt('Here is a list of the available skills.')).toBe(false)
+  })
+
+  it('rejects an AGENTS.md project-instruction block', () => {
+    expect(isCodexHumanPrompt('# AGENTS.md\n\nBe brief in this repo.')).toBe(false)
+    expect(isCodexHumanPrompt('#AGENTS.md\n\nno space after the hash')).toBe(false)
+    expect(isCodexHumanPrompt('\n\n  # AGENTS.md\n\nleading blank lines')).toBe(false)
+  })
+
+  it('keeps a prompt that only mentions AGENTS.md', () => {
+    // The rule is anchored at the start of the message: a person asking about
+    // the file is still a person.
+    expect(isCodexHumanPrompt('please update # AGENTS.md with the new rule')).toBe(true)
+    expect(isCodexHumanPrompt('# AGENTS.mdx is a different file')).toBe(true)
+    expect(isCodexHumanPrompt('## AGENTS.md section')).toBe(true)
   })
 })

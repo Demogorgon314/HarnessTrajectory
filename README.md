@@ -2,13 +2,16 @@
 
 A local viewer for agent sessions. It scans the transcripts that **Claude Code** and
 **Codex** write on this machine, folds them into a turn-aware event ledger with an
-interactive timing overview, and follows sessions that are still running.
+interactive timing overview and a context dashboard, and follows sessions that are
+still running.
 
 The ledger, timeline, inspector, and toolbar are a port of the Trajectory view from
 [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) (`ui-trajectory`,
 MIT), kept pixel-faithful by vendoring the primitives and theme tokens it renders with.
 The harness-specific plumbing was replaced with a small contract that any transcript
-adapter can target.
+adapter can target. The **Context** tab is a port of
+[dsh-context](https://github.com/bowenliang123/dsh-context) (Apache-2.0): the same cards,
+charts, and browser, fed by the transcript files instead of the dsh runtime.
 
 ## Run it
 
@@ -50,6 +53,16 @@ directories. `--port` / `HARNESS_TRAJECTORY_PORT` change the port.
   from the parent's receipts and task notifications, tool count, duration); picking one
   opens that transcript as a session of its own, with a breadcrumb back to the parent.
   Subagent transcripts created while you watch are picked up live.
+- **Context tab** (next to Trajectory in the session header): Context Stats (turns, steps,
+  human inputs, live tool calls, cache hit, cost), Session Info (harness, model, context
+  window, CLI version, resume command), Token Stats and Timing Stats donuts, Current
+  Context occupancy bar, per-step / per-turn Context Trend with the step brief, the
+  Context Browser (every request's assembled context, expandable to the actual system
+  prompt, tool schemas, messages, and tool results), Context Events (injections,
+  compactions, model switches, plan mode), File Activity (reads, writes with line deltas,
+  searches), and the Agent Network (one node per subagent; click to open its own context,
+  breadcrumb back). A gear popover keeps the trend granularity, trend mode, tool sort, and
+  file sort defaults in localStorage.
 - Light, dark, and system themes; English and Chinese copy.
 
 ## Layout
@@ -57,6 +70,7 @@ directories. `--port` / `HARNESS_TRAJECTORY_PORT` change the port.
 ```
 packages/core     contract types + Claude Code and Codex adapters (pure TS, runs in the browser)
 packages/ui       the ported trajectory view, vendored primitives (markdown, JSON tree, tooltip, icons), theme CSS
+packages/context  the ported dsh-context dashboard: fold (src/fold), transcript → fold-event synthesizers (src/synth), client (src/client)
 apps/server       Hono server: transcript discovery, metadata index, file tailing, SSE, static UI
 apps/web          Vite + React shell: session list, live session runtime, view host
 ```
@@ -66,11 +80,19 @@ reads a memoized `TrajectorySnapshot` (nodes, requests, partial output, running 
 Replays merge the main transcript and its child transcripts by timestamp so subagents
 land where they actually happened.
 
+The Context tab runs on the same line stream: a per-harness synthesizer turns each
+transcript file into dsh-context's fold events (`request/header`, `user/message`,
+`assistant/message`, `tool/call`, `tool/result`, `compaction/summary`, …) and the
+vendored fold produces the dashboard's timeline. Every file (main and each subagent) is
+folded on its own, exactly like a dsh subagent session. Token figures follow the
+dsh-context convention: per-request prompt, cache, and output tokens are the provider's
+own numbers; the per-category split is an estimate (≈), anchored to the provider total.
+
 ## Develop
 
 ```sh
 pnpm typecheck     # tsc for every package
-pnpm test          # vitest: core adapters, ui (jsdom), server index
+pnpm test          # vitest: core adapters, ui (jsdom), context fold + synthesizers, context-ui (jsdom), server index, web
 ```
 
 Adapter tests use synthetic fixtures only; never copy real transcript content into the
@@ -78,10 +100,20 @@ repository.
 
 ## Known limits
 
-- Neither harness records first-token time, so the TTFT split in the overview is blank;
-  durations come from record timestamps.
-- Claude Code transcripts do not include the system prompt or tool catalog; Codex
-  sessions show their base instructions as the initial system prompt.
+- Claude Code does not record first-token time (its records land at block completion), so
+  TTFT stays unattributed for Claude sessions; the thinking / answer / tool-args split
+  comes from block completion times. Codex reports both.
+- Claude Code records the system prompt and tool schemas only in newer transcripts
+  (`prompt_snapshot` attachments); older sessions show the System Prompt as a derived
+  remainder (actual prompt tokens minus the estimated messages, marked "≈ derived") and
+  Tool Schemas as "not recorded". Codex records its base instructions but no tool schemas.
+- Claude Code does not record the context window; the dashboard assumes 200k tokens and
+  switches to 1M when the model carries a `[1m]` tag or a request exceeds 200k. Codex
+  reports its window per turn.
+- Cost uses list prices fetched from models.dev at page load (blank offline); a Claude
+  `cost-state` record, when present, is shown as the reported cost.
+- Codex compaction summaries are encrypted in the rollout, so a compaction shows its
+  retained history but no summary text.
 - Whole sessions load into the browser (a 60 MB rollout takes a few seconds); the
   "load earlier history" control only pages the rendered window.
 - A subagent's status comes from the parent transcript (launch receipt, sync result,
@@ -91,6 +123,9 @@ repository.
 ## License
 
 The vendored `packages/ui` sources derive from deepseek-harness (MIT); see
-`packages/ui/LICENSE.deepseek-harness`. Harness brand marks in `apps/web/src/harnesses.tsx`
+`packages/ui/LICENSE.deepseek-harness`. `packages/context` derives from
+[dsh-context](https://github.com/bowenliang123/dsh-context) and is distributed under the
+Apache License 2.0; see `packages/context/LICENSE` and `packages/context/NOTICE`. Its
+stylesheets use [Tailwind CSS](https://tailwindcss.com) utilities (MIT). Harness brand marks in `apps/web/src/harnesses.tsx`
 use path data from [Simple Icons](https://simpleicons.org) (CC0) and
 [lobe-icons](https://github.com/lobehub/lobe-icons) (MIT); the marks themselves belong to their owners. Everything else is MIT as well.
