@@ -7,7 +7,7 @@ import css from './app.module.css'
 
 const { IconFolderClose16, IconFolderOpen16, IconTriangleRightFill14 } = icons
 
-function relativeTime(epochMs: number, now = Date.now()): string {
+export function relativeTime(epochMs: number, now = Date.now()): string {
   const delta = Math.max(0, now - epochMs)
   const minutes = Math.round(delta / 60_000)
   if (minutes < 1) return 'now'

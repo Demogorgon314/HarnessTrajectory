@@ -682,3 +682,120 @@
   min-height: 0;
   display: flex;
 }
+
+/* -- subagent lineage and catalog ------------------------------------------ */
+
+.crumbs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  margin-bottom: 2px;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.crumbLink {
+  appearance: none;
+  border: none;
+  background: transparent;
+  padding: 0;
+  font: inherit;
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+  min-width: 0;
+  max-width: 50%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.crumbLink:hover {
+  color: var(--dsw-alias-label-primary);
+  text-decoration: underline;
+}
+
+.crumbSeparator {
+  flex: none;
+}
+
+.crumbCurrent {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.agentTrigger {
+  flex: none;
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 11px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-secondary);
+  font: inherit;
+  font-size: 12px;
+  line-height: 16px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.agentTrigger:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+
+.agentTrigger[data-running]::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--dsw-alias-state-success-primary);
+  animation: live-pulse 2s var(--ds-ease-in-out) infinite;
+}
+
+.agentMenu {
+  flex: none;
+}
+
+.agentRow {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  max-width: 420px;
+}
+
+.agentRowTitle {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.agentRowMeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 8px;
+  font-size: 11px;
+  line-height: 14px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.agentStatus {
+  font-weight: 600;
+}
+
+.agentRow[data-status='running'] .agentStatus,
+.agentRow[data-status='launching'] .agentStatus {
+  color: var(--dsw-alias-state-success-primary);
+}
+
+.agentRow[data-status='failed'] .agentStatus {
+  color: var(--dsw-alias-state-error-primary);
+}

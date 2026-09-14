@@ -27,12 +27,25 @@ const EMPTY_KINDS: ReadonlySet<HarnessKind> = new Set()
 export interface Route {
   kind: HarnessKind
   id: string
+  /** Child (subagent) transcript id when a subagent view is open. */
+  file?: string
 }
 
 function parseHash(hash: string): Route | null {
-  const match = /^#\/(claude|codex)\/([^/]+)$/.exec(hash)
+  const match = /^#\/(claude|codex)\/([^/]+)(?:\/agent\/([^/]+))?$/.exec(hash)
   if (match === null) return null
-  return { kind: match[1] as HarnessKind, id: decodeURIComponent(match[2] ?? '') }
+  const file = match[3]
+  return {
+    kind: match[1] as HarnessKind,
+    id: decodeURIComponent(match[2] ?? ''),
+    ...(file === undefined ? {} : { file: decodeURIComponent(file) }),
+  }
+}
+
+/** Hash for a route; the subagent segment keeps the parent session as the address root. */
+export function routeHash(route: Route): string {
+  const base = `#/${route.kind}/${encodeURIComponent(route.id)}`
+  return route.file === undefined ? base : `${base}/agent/${encodeURIComponent(route.file)}`
 }
 
 function useHashRoute(): [Route | null, (route: Route | null) => void] {
@@ -43,7 +56,7 @@ function useHashRoute(): [Route | null, (route: Route | null) => void] {
     return () => { window.removeEventListener('hashchange', onChange) }
   }, [])
   const navigate = useCallback((next: Route | null) => {
-    window.location.hash = next === null ? '' : `#/${next.kind}/${encodeURIComponent(next.id)}`
+    window.location.hash = next === null ? '' : routeHash(next)
   }, [])
   return [route, navigate]
 }
@@ -271,10 +284,12 @@ export function App() {
           )
           : (
             <SessionPane
-              key={`${route.kind}/${route.id}`}
+              key={routeHash(route)}
               kind={route.kind}
               id={route.id}
+              file={route.file ?? null}
               summary={selectedSummary}
+              onNavigate={navigate}
               t={t}
               durationStore={durationStore}
             />

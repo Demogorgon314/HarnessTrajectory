@@ -41,8 +41,15 @@ directories. `--port` / `HARNESS_TRAJECTORY_PORT` change the port.
 - **Live follow**: the server tails transcript files and streams appended lines over
   SSE; in-flight assistant output and running tool calls render as they happen.
 - **Subagents** nest under the call that spawned them: Claude Code `Agent` transcripts
-  (`agent-*.jsonl`, `<session>/subagents/`) and Codex child threads
-  (`parent_thread_id`) become sub-tool rows of the parent record.
+  (`<session>/subagents/agent-*.jsonl`, older `agent-*.jsonl`) and Codex child threads
+  (`parent_thread_id`) become sub-tool rows of the parent record. Claude children are
+  bound to their call by the `toolUseId` in the sidecar `.meta.json`, the `agentId` in
+  the parent's launch receipt, or a fork's inherited tool result, so parallel and
+  relaunched agents land on the right row and an in-flight subagent tool shows before
+  its result lands. The pane header lists every run (description, type, model, status
+  from the parent's receipts and task notifications, tool count, duration); picking one
+  opens that transcript as a session of its own, with a breadcrumb back to the parent.
+  Subagent transcripts created while you watch are picked up live.
 - Light, dark, and system themes; English and Chinese copy.
 
 ## Layout
@@ -77,8 +84,9 @@ repository.
   sessions show their base instructions as the initial system prompt.
 - Whole sessions load into the browser (a 60 MB rollout takes a few seconds); the
   "load earlier history" control only pages the rendered window.
-- Claude Code subagent transcript layouts were implemented from the documented file
-  patterns but could not be verified against real files on the development machine.
+- A subagent's status comes from the parent transcript (launch receipt, sync result,
+  task notification); a run whose parent stopped without a notification stays "running"
+  until the session is no longer live, when the catalog shows it as idle.
 
 ## License
 

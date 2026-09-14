@@ -5,10 +5,12 @@
 
 import { EventEmitter } from 'node:events'
 import { watch, type FSWatcher } from 'node:fs'
-import { readdir, stat } from 'node:fs/promises'
+import { readdir, readFile, stat } from 'node:fs/promises'
 import { basename, dirname, join, relative, sep } from 'node:path'
-import type {
-  HarnessKind, SessionDetail, SessionFileRef, SessionLiveEvent, SessionSummary,
+import {
+  asString, isRecord,
+  type AgentFileMeta, type HarnessKind, type SessionChildSummary, type SessionDetail, type SessionFileRef,
+  type SessionLiveEvent, type SessionSummary,
 } from '@harness-trajectory/core'
 import { createMetaScanner, readHead, type MetaScanner } from './meta.ts'
 import type { HarnessRoot } from './roots.ts'
@@ -143,32 +145,51 @@ export class SessionIndex extends EventEmitter {
     return {
       ...this.summarize(session),
       files: [session.main.ref, ...[...session.children.values()].map(entry => entry.ref)],
+      children: this.childSummaries(session),
     }
+  }
+
+  /** Whether a session has a child transcript with this id. */
+  hasChild(kind: HarnessKind, id: string, fileId: string): boolean {
+    return this.sessions.get(sessionKey(kind, id))?.children.has(fileId) === true
   }
 
   /**
    * Stream the existing content of every file of a session, chunked. Lines
    * from the main transcript and child (subagent) transcripts are merged in
    * timestamp order so adapters see children where they actually happened.
+   *
+   * With `fileId`, only that child transcript is replayed, served as the main
+   * file of its own view (see `scopeToFile`).
    */
   async readAll(
     kind: HarnessKind,
     id: string,
     emit: (event: SessionLiveEvent) => void,
+    fileId?: string,
   ): Promise<void> {
     const session = this.sessions.get(sessionKey(kind, id))
     if (session === undefined || session.main === null) return
-    const entries = [session.main, ...session.children.values()]
-    for (const entry of entries) emit({ type: 'file', file: entry.ref })
+    let entries: FileEntry[]
+    let refOf: (entry: FileEntry) => SessionFileRef = entry => entry.ref
+    if (fileId === undefined) {
+      entries = [session.main, ...session.children.values()]
+    } else {
+      const child = session.children.get(fileId)
+      if (child === undefined) return
+      entries = [child]
+      refOf = entry => standaloneRef(entry.ref)
+    }
+    for (const entry of entries) emit({ type: 'file', file: refOf(entry) })
     const sources = await Promise.all(entries.map(async (entry) => {
       // Read up to the index's consumed offset; live events cover the rest.
       const lines = await readWholeFile(entry.path, entry.offset)
-      return { ref: entry.ref, lines, times: lineTimes(lines) }
+      return { ref: refOf(entry), lines, times: lineTimes(lines) }
     }))
     for (const chunk of mergeChronologically(sources)) {
       emit({ type: 'lines', file: chunk.ref, lines: chunk.lines })
     }
-    emit({ type: 'meta', summary: this.summarize(session) })
+    emit({ type: 'meta', summary: this.summarize(session), children: this.childSummaries(session) })
   }
 
   subscribe(kind: HarnessKind, id: string, subscriber: Subscriber): () => void {
@@ -190,11 +211,16 @@ export class SessionIndex extends EventEmitter {
   private async scanRoot(root: HarnessRoot): Promise<void> {
     const paths = await walk(root.dir)
     for (const path of paths) {
-      await this.register(root, path)
+      await this.register(root, path, true)
     }
   }
 
-  private async register(root: HarnessRoot, path: string): Promise<FileEntry | undefined> {
+  /**
+   * Add a transcript to the index. During the initial scan its content only
+   * feeds the metadata; a file that appears later (a subagent transcript of a
+   * session someone is watching) is announced and its lines are forwarded.
+   */
+  private async register(root: HarnessRoot, path: string, initial = false): Promise<FileEntry | undefined> {
     const classified = classifyPath(root.kind, root.dir, path)
     if (classified === null) return undefined
     let info
@@ -221,7 +247,14 @@ export class SessionIndex extends EventEmitter {
     }
     const role: 'main' | 'child' = parentId !== undefined ? 'child' : classified.role
     const sessionId = parentId ?? id
-    const ref: SessionFileRef = { id, role, path, ...(parentId === undefined ? {} : { parentId }) }
+    const agent = role === 'child' && root.kind === 'claude' ? await readAgentMeta(path) : undefined
+    const ref: SessionFileRef = {
+      id,
+      role,
+      path,
+      ...(parentId === undefined ? {} : { parentId }),
+      ...(agent === undefined ? {} : { agent }),
+    }
     const entry: FileEntry = {
       kind: root.kind,
       path,
@@ -233,13 +266,23 @@ export class SessionIndex extends EventEmitter {
       rest: '',
       meta: role === 'main' ? createMetaScanner(root.kind) : null,
     }
+    if (this.files.has(path)) return this.files.get(path)
     this.files.set(path, entry)
     const session = this.sessionFor(root.kind, sessionId)
     if (role === 'main') session.main = entry
     else session.children.set(id, entry)
-    await this.consume(entry, info.size, info.mtimeMs, true)
-    if (role === 'child') this.emitTo(session, { type: 'file', file: ref })
+    if (role === 'child' && !initial) this.emitTo(session, { type: 'file', file: ref })
+    await this.consume(entry, info.size, info.mtimeMs, initial)
     return entry
+  }
+
+  /** Re-read a child's sidecar facts when they were missing at registration (written a moment later). */
+  private async refreshAgentMeta(session: SessionRecord, entry: FileEntry): Promise<void> {
+    if (entry.kind !== 'claude' || entry.ref.role !== 'child' || entry.ref.agent?.toolUseId !== undefined) return
+    const agent = await readAgentMeta(entry.path)
+    if (agent?.toolUseId === undefined) return
+    entry.ref = { ...entry.ref, agent }
+    this.emitTo(session, { type: 'file', file: entry.ref })
   }
 
   private sessionFor(kind: HarnessKind, id: string): SessionRecord {
@@ -260,7 +303,7 @@ export class SessionIndex extends EventEmitter {
       entry.offset = 0
       entry.rest = ''
       entry.meta = entry.ref.role === 'main' ? createMetaScanner(entry.kind) : null
-      if (session !== undefined) this.emitTo(session, { type: 'file', file: entry.ref })
+      if (session !== undefined) this.emitTo(session, { type: 'file', file: entry.ref, reset: true })
     }
     entry.size = size
     entry.mtimeMs = Math.max(entry.mtimeMs, mtimeMs)
@@ -274,7 +317,7 @@ export class SessionIndex extends EventEmitter {
     if (result.lines.length === 0 || session === undefined) return
     if (!initial) {
       this.emitTo(session, { type: 'lines', file: entry.ref, lines: result.lines })
-      this.emitTo(session, { type: 'meta', summary: this.summarize(session) })
+      this.emitTo(session, { type: 'meta', summary: this.summarize(session), children: this.childSummaries(session) })
     }
     this.emit('change', entry.kind, entry.sessionId)
   }
@@ -283,6 +326,14 @@ export class SessionIndex extends EventEmitter {
     const set = this.subscribers.get(sessionKey(session.kind, session.id))
     if (set === undefined) return
     for (const subscriber of set) subscriber(event)
+  }
+
+  private childSummaries(session: SessionRecord): SessionChildSummary[] {
+    return [...session.children.values()].map(entry => ({
+      file: entry.ref,
+      updatedAt: entry.mtimeMs,
+      bytes: entry.size,
+    }))
   }
 
   private summarize(session: SessionRecord): SessionSummary {
@@ -361,6 +412,7 @@ export class SessionIndex extends EventEmitter {
         try {
           const info = await stat(entry.path)
           if (info.size !== entry.size) await this.consume(entry, info.size, info.mtimeMs)
+          await this.refreshAgentMeta(session, entry)
         } catch {
           // Ignore transient errors.
         }
@@ -383,6 +435,52 @@ export class SessionIndex extends EventEmitter {
       if (path.startsWith(root.dir + sep)) return root
     }
     return undefined
+  }
+}
+
+/** The ref a child transcript is served with when it is viewed as a session of its own. */
+export function standaloneRef(ref: SessionFileRef): SessionFileRef {
+  const { parentId: _parentId, ...rest } = ref
+  return { ...rest, role: 'main' }
+}
+
+/**
+ * Narrow a session's live event to one child transcript's own view: events
+ * about other files are dropped and the child's ref is served as `main`.
+ */
+export function scopeToFile(event: SessionLiveEvent, fileId: string): SessionLiveEvent | null {
+  switch (event.type) {
+    case 'lines':
+      return event.file.id === fileId ? { ...event, file: standaloneRef(event.file) } : null
+    case 'file':
+      return event.file.id === fileId ? { ...event, file: standaloneRef(event.file) } : null
+    default:
+      return event
+  }
+}
+
+/** Claude Code writes `agent-<id>.meta.json` beside each subagent transcript. */
+export async function readAgentMeta(transcriptPath: string): Promise<AgentFileMeta | undefined> {
+  const name = basename(transcriptPath, '.jsonl')
+  const agentId = name.startsWith('agent-') ? name.slice('agent-'.length) : name
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(await readFile(`${transcriptPath.slice(0, -'.jsonl'.length)}.meta.json`, 'utf8'))
+  } catch {
+    return { agentId }
+  }
+  if (!isRecord(parsed)) return { agentId }
+  const toolUseId = asString(parsed['toolUseId'])
+  const description = asString(parsed['description'])
+  const agentType = asString(parsed['agentType'])
+  const model = asString(parsed['model'])
+  return {
+    agentId,
+    ...(toolUseId === undefined ? {} : { toolUseId }),
+    ...(description === undefined ? {} : { description }),
+    ...(agentType === undefined ? {} : { agentType }),
+    ...(model === undefined ? {} : { model }),
+    ...(parsed['isFork'] === true ? { isFork: true } : {}),
   }
 }
 

@@ -5,8 +5,8 @@
 
 import {
   createSessionParser, EMPTY_TRAJECTORY_SNAPSHOT,
-  type HarnessKind, type ImageAttachmentRef, type SessionFileRef, type SessionLiveEvent,
-  type SessionParser, type SessionSummary, type TrajectorySnapshot,
+  type HarnessKind, type ImageAttachmentRef, type SessionChildSummary, type SessionFileRef,
+  type SessionLiveEvent, type SessionParser, type SessionSummary, type SubagentRun, type TrajectorySnapshot,
 } from '@harness-trajectory/core'
 import { createSnapshotStore, type MessageImageLoader, type SnapshotStore } from '@harness-trajectory/ui'
 import { openSessionStream, type LiveStream } from './api.ts'
@@ -18,6 +18,12 @@ export interface SessionRuntimeState {
   /** Lines consumed so far (all files). */
   lines: number
   summary: SessionSummary | null
+  /** Files feeding this view, as announced by the server. */
+  files: readonly SessionFileRef[]
+  /** Child (subagent) transcripts of the session, whichever file this view folds. */
+  children: readonly SessionChildSummary[]
+  /** Subagent runs the folded transcript spawned. */
+  subagents: readonly SubagentRun[]
   error: string | null
   connected: boolean
 }
@@ -33,13 +39,20 @@ export class SessionRuntime {
   private lineCount = 0
   private closed = false
 
-  constructor(readonly kind: HarnessKind, readonly id: string) {
+  /**
+   * @param fileId - a child transcript id to fold on its own (the subagent
+   * view); omitted, the whole session folds with children nested.
+   */
+  constructor(readonly kind: HarnessKind, readonly id: string, readonly fileId: string | null = null) {
     this.parser = createSessionParser(kind)
     this.store = createSnapshotStore<SessionRuntimeState>({
       snapshot: EMPTY_TRAJECTORY_SNAPSHOT,
       loading: true,
       lines: 0,
       summary: null,
+      files: [],
+      children: [],
+      subagents: [],
       error: null,
       connected: false,
     })
@@ -63,7 +76,7 @@ export class SessionRuntime {
       onError: () => {
         this.patch({ connected: false })
       },
-    })
+    }, { file: this.fileId ?? undefined })
     this.patch({ connected: true })
   }
 
@@ -81,7 +94,8 @@ export class SessionRuntime {
     if (this.closed) return
     switch (event.type) {
       case 'file':
-        this.resetFileIfReplayed(event.file)
+        if (event.reset === true) this.reset()
+        else this.noteFile(event.file)
         break
       case 'lines':
         for (const line of event.lines) this.parser.push(line, event.file)
@@ -89,7 +103,7 @@ export class SessionRuntime {
         this.schedulePublish()
         break
       case 'meta':
-        this.patch({ summary: event.summary })
+        this.patch({ summary: event.summary, children: event.children })
         break
       case 'ready':
         this.publish()
@@ -98,21 +112,20 @@ export class SessionRuntime {
     }
   }
 
-  private readonly seenFiles = new Set<string>()
+  /** A file joined the view or its facts changed (a subagent's sidecar meta arrived late). */
+  private noteFile(file: SessionFileRef): void {
+    const files = this.store.getSnapshot().files
+    const index = files.findIndex(known => known.role === file.role && known.id === file.id)
+    const next = index < 0 ? [...files, file] : files.map((known, at) => (at === index ? file : known))
+    this.patch({ files: next })
+  }
 
-  /** A repeated `file` event means the server reset that file (truncate/rewrite): rebuild from scratch. */
-  private resetFileIfReplayed(file: SessionFileRef): void {
-    const key = `${file.role}:${file.id}`
-    if (!this.seenFiles.has(key)) {
-      this.seenFiles.add(key)
-      return
-    }
-    // Rebuilding requires a full replay; the simplest correct move is to reopen the stream.
-    this.seenFiles.clear()
+  /** The server truncated or rewrote a file: rebuild from scratch by reopening the stream. */
+  private reset(): void {
     this.parser = createSessionParser(this.kind)
     this.lineCount = 0
     this.stream?.close()
-    this.patch({ snapshot: EMPTY_TRAJECTORY_SNAPSHOT, loading: true, lines: 0 })
+    this.patch({ snapshot: EMPTY_TRAJECTORY_SNAPSHOT, loading: true, lines: 0, files: [], subagents: [] })
     this.start()
   }
 
@@ -126,7 +139,7 @@ export class SessionRuntime {
 
   private publish(): void {
     if (this.closed) return
-    this.patch({ snapshot: this.parser.snapshot(), lines: this.lineCount })
+    this.patch({ snapshot: this.parser.snapshot(), lines: this.lineCount, subagents: this.parser.subagents() })
   }
 
   private patch(partial: Partial<SessionRuntimeState>): void {

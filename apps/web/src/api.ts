@@ -26,7 +26,8 @@ export interface LiveStream {
 
 /**
  * Open the live event stream of a session. The server replays existing
- * content, sends `ready`, then keeps appending until closed.
+ * content, sends `ready`, then keeps appending until closed. With `file`,
+ * only that child transcript streams, served as a session of its own.
  */
 export function openSessionStream(
   kind: HarnessKind,
@@ -35,8 +36,10 @@ export function openSessionStream(
     onEvent: (event: SessionLiveEvent) => void
     onError?: (error: Event) => void
   },
+  options: { file?: string | undefined } = {},
 ): LiveStream {
-  const source = new EventSource(`/api/sessions/${kind}/${encodeURIComponent(id)}/events`)
+  const suffix = options.file === undefined ? '' : `?file=${encodeURIComponent(options.file)}`
+  const source = new EventSource(`/api/sessions/${kind}/${encodeURIComponent(id)}/events${suffix}`)
   const forward = (message: MessageEvent<string>) => {
     if (message.data === '') return
     let event: SessionLiveEvent

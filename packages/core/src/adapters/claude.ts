@@ -3,22 +3,34 @@
  *
  * Reads the JSONL Claude Code writes under `~/.claude/projects/<slug>/<sessionId>.jsonl`
  * (one record per line) and folds it incrementally into the harness-agnostic
- * trajectory contract. Subagent transcripts (`agent-*.jsonl` files, or records
- * flagged `isSidechain`) nest their tool calls under the parent `Agent` call.
+ * trajectory contract.
+ *
+ * Subagents: every `Agent` (formerly `Task`) tool call spawns a child
+ * transcript (`<sessionId>/subagents/agent-<agentId>.jsonl`, older layouts
+ * `agent-<id>.jsonl` beside the session, older still `isSidechain` records in
+ * the main file). Child records are bound to the parent call that spawned
+ * them, in order of certainty: the `toolUseId` from the child's `.meta.json`,
+ * the `agentId` the parent's tool result reports, the synthetic tool result a
+ * fork carries in its first message, then the prompt text. Bound children
+ * contribute their tool calls as sub-calls of the parent record; their prompts
+ * and assistant output stay in their own transcript, which the server can
+ * serve on its own (`role: 'main'` plus `agent` facts) for the subagent view.
  */
 
 import type {
   AssistantBlock, AssistantRequestConfig, AssistantRequestView, ContentBlock, ConversationLocation,
   ImageAttachmentRef, TokenUsage,
 } from '../contract.ts'
-import type { ParsedSessionMeta, SessionFileRef, SessionParser } from '../session.ts'
+import type {
+  AgentFileMeta, ParsedSessionMeta, SessionFileRef, SessionParser, SubagentRun, SubagentStatus,
+} from '../session.ts'
 import { asArray, asString, isRecord, parseJsonLine, parseTime } from '../jsonl.ts'
 import { DataUrlImageStore, TrajectoryAssembler, normalizeImageMediaType, titleFrom } from './shared.ts'
 
 const SUBAGENT_TOOL_NAMES: ReadonlySet<string> = new Set(['Agent', 'Task'])
 const TURN_END_STOP_REASONS: ReadonlySet<string> = new Set(['end_turn', 'max_tokens', 'stop_sequence'])
-/** Virtual file key for `isSidechain` records written into the main transcript. */
-const SIDECHAIN_FILE = ' sidechain'
+/** Virtual file key prefix for `isSidechain` records written into the main transcript. */
+const SIDECHAIN_PREFIX = ' sidechain:'
 
 /** One API response being accumulated from its per-block lines. */
 interface OpenRequest {
@@ -45,10 +57,39 @@ interface Nesting {
 }
 
 interface FileState {
+  /** Records nest under a parent call instead of forming turns. */
   readonly child: boolean
+  /** An agent transcript served as a session of its own. */
+  readonly standalone: boolean
+  /** Transcript file id, or `null` for sidechain records inside the main file. */
+  readonly fileId: string | null
+  agentId: string | null
+  toolUseId: string | null
+  fork: boolean
+  sawPrompt: boolean
   nesting: Nesting | undefined
   open: OpenRequest | undefined
   lastInputTime: number | null
+  lastTime: number | null
+  toolCalls: number
+}
+
+/** Parent-side view of one `Agent` tool call. */
+interface AgentCall {
+  callId: string
+  turn: number
+  step: number
+  time: number
+  prompt: string | null
+  description: string | null
+  agentType: string | null
+  model: string | null
+  agentId: string | null
+  /** A child transcript has been bound to this call. */
+  claimed: boolean
+  fileKey: string | null
+  status: SubagentStatus
+  endedAt: number | null
 }
 
 function usageFrom(value: unknown): TokenUsage | undefined {
@@ -77,17 +118,28 @@ function stringifyArgs(input: unknown): string {
   }
 }
 
-function promptOfArgs(argsRaw: string): string | undefined {
-  try {
-    const parsed: unknown = JSON.parse(argsRaw)
-    return isRecord(parsed) ? asString(parsed.prompt) : undefined
-  } catch {
-    return undefined
-  }
-}
-
 function textOfContent(content: readonly ContentBlock[]): string {
   return content.flatMap(block => (block.type === 'text' ? [block.text] : [])).join('\n')
+}
+
+/** Text of a simple `<tag>value</tag>` element inside harness-injected markup. */
+function taggedValue(text: string, tag: string): string | undefined {
+  const match = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`).exec(text)
+  return match?.[1]?.trim()
+}
+
+function notificationStatus(value: string | undefined): SubagentStatus {
+  switch (value) {
+    case 'completed':
+      return 'completed'
+    case 'killed':
+    case 'stopped':
+    case 'cancelled':
+    case 'canceled':
+      return 'stopped'
+    default:
+      return 'failed'
+  }
 }
 
 class ClaudeParser implements SessionParser {
@@ -98,6 +150,9 @@ class ClaudeParser implements SessionParser {
   private readonly files = new Map<string, FileState>()
   private readonly turnSeqs = new Map<number, number[]>()
   private readonly closedTurns = new Set<number>()
+  /** `Agent` calls in launch order. */
+  private readonly agentCalls = new Map<string, AgentCall>()
+  private readonly callByAgentId = new Map<string, string>()
   private turn = 0
   private step = 0
   private lastTime = 0
@@ -117,6 +172,16 @@ class ClaudeParser implements SessionParser {
     const time = this.recordTime(record)
     this.observeMeta(record, time)
     const state = this.stateFor(file, record)
+    if (state.child) {
+      state.lastTime = time
+      if (type === 'fork-context-ref') {
+        state.fork = true
+        return
+      }
+      // A child record ahead of its prompt (or after a lost one) can still bind
+      // by id; until it binds, nothing from the child may reach the parent ledger.
+      if (state.nesting === undefined && type !== 'user' && !this.bindChild(state, '', [])) return
+    }
     switch (type) {
       case 'user':
         this.onUser(record, time, state)
@@ -131,6 +196,9 @@ class ClaudeParser implements SessionParser {
       case 'attachment':
         this.finalize(state)
         this.onAttachment(record, time, state)
+        return
+      case 'fork-context-ref':
+        this.onForkContextRef(record, time, state)
         return
       case 'ai-title': {
         const title = asString(record.aiTitle)
@@ -163,6 +231,47 @@ class ClaudeParser implements SessionParser {
     }
   }
 
+  subagents(): readonly SubagentRun[] {
+    const runs: SubagentRun[] = []
+    const seen = new Set<string>()
+    for (const call of this.agentCalls.values()) {
+      const state = call.fileKey === null ? undefined : this.files.get(call.fileKey)
+      if (state?.fileId !== undefined && state.fileId !== null) seen.add(state.fileId)
+      runs.push({
+        agentId: call.agentId ?? call.callId,
+        fileId: state?.fileId ?? null,
+        callId: call.callId,
+        description: call.description,
+        agentType: call.agentType,
+        model: call.model,
+        status: call.status,
+        startedAt: call.time,
+        endedAt: call.endedAt,
+        lastTime: state?.lastTime ?? null,
+        toolCalls: state?.toolCalls ?? 0,
+      })
+    }
+    // Child transcripts whose spawning call is not in this transcript (for
+    // example a session resumed after the launch) still deserve a row.
+    for (const state of this.files.values()) {
+      if (!state.child || state.fileId === null || seen.has(state.fileId) || state.nesting !== undefined) continue
+      runs.push({
+        agentId: state.agentId ?? state.fileId,
+        fileId: state.fileId,
+        callId: null,
+        description: null,
+        agentType: state.fork ? 'fork' : null,
+        model: null,
+        status: 'running',
+        startedAt: null,
+        endedAt: null,
+        lastTime: state.lastTime,
+        toolCalls: state.toolCalls,
+      })
+    }
+    return runs
+  }
+
   imageUrl(attachment: ImageAttachmentRef): string | undefined {
     return this.images.get(attachment.attachmentId)
   }
@@ -178,15 +287,31 @@ class ClaudeParser implements SessionParser {
     const results = (items ?? []).filter(
       (item): item is Record<string, unknown> => isRecord(item) && item.type === 'tool_result',
     )
-    if (results.length > 0) {
-      this.finalize(state)
-      for (const item of results) this.onToolResult(item, record, time, state)
-      state.lastInputTime = time
-      return
-    }
     const content: ContentBlock[] = typeof rawContent === 'string'
       ? [{ type: 'text', text: rawContent }]
       : this.contentBlocks(items ?? [])
+    const text = textOfContent(content)
+    const resultIds = results.flatMap(item => (typeof item.tool_use_id === 'string' ? [item.tool_use_id] : []))
+    if (state.child && state.nesting === undefined && !this.bindChild(state, text, resultIds)) return
+    // A fork's first message carries the parent's own `Agent` tool result
+    // ("Fork started"): inherited context, not a result this transcript produced.
+    const inherited = state.fork && !state.sawPrompt && results.length > 0
+    const own = results.filter(item => !inherited && !(state.child && this.agentCalls.has(asString(item.tool_use_id) ?? '')))
+    if (inherited && state.standalone) {
+      const blocks = results.flatMap(item => this.resultContent(item.content))
+      this.pushContext(blocks, time, { kind: 'meta', origin: 'fork' }, 'fork-context', state)
+    }
+    if (own.length > 0) {
+      this.finalize(state)
+      for (const item of own) this.onToolResult(item, record, time, state)
+      state.lastInputTime = time
+      return
+    }
+    if (results.length > 0 && !inherited) {
+      // Only synthetic results: nothing to record.
+      state.lastInputTime = time
+      return
+    }
     this.finalize(state)
     if (record.isCompactSummary === true) {
       this.onCompaction(content, time, state)
@@ -196,22 +321,22 @@ class ClaudeParser implements SessionParser {
       this.pushContext(content, time, { kind: 'meta' }, 'meta', state)
       return
     }
-    const text = textOfContent(content)
     const injected = classifyInjectedUser(record, text)
     if (injected !== null) {
       // Harness-injected user messages (task notifications, slash-command
       // expansions, local command output) steer the model without being a
       // human prompt: keep them as context so they neither open a turn nor
       // count as prompts.
-      this.finalize(state)
+      if (injected === 'task-notification') this.onTaskNotification(text, time)
       this.pushContext(content, time, { kind: 'meta', origin: injected }, injected, state)
       state.lastInputTime = time
       return
     }
+    state.sawPrompt = true
     if (state.child) {
-      this.attachChild(state, text)
+      // The child's prompt is the parent's `Agent` argument; it stays in the child's own view.
       state.lastInputTime = time
-      if (state.nesting !== undefined) return
+      return
     }
     this.turn += 1
     this.step = 0
@@ -241,10 +366,9 @@ class ClaudeParser implements SessionParser {
   ): void {
     const callId = asString(block.tool_use_id)
     if (callId === undefined) return
-    const raw = block.content
-    const content: ContentBlock[] = typeof raw === 'string'
-      ? [{ type: 'text', text: raw }]
-      : this.contentBlocks(asArray(raw) ?? [])
+    const content = this.resultContent(block.content)
+    const agentCall = state.child ? undefined : this.agentCalls.get(callId)
+    if (agentCall !== undefined) this.onAgentResult(agentCall, block, record, time)
     const seq = this.assembler.seq.next()
     const { node, topLevel } = this.assembler.tools.complete(callId, {
       seq,
@@ -253,7 +377,7 @@ class ClaudeParser implements SessionParser {
       isError: block.is_error === true,
       ...(record.toolUseResult === undefined ? {} : { meta: record.toolUseResult }),
     })
-    if (topLevel && state.nesting === undefined) {
+    if (topLevel && !state.child) {
       this.locate(seq, this.turn)
       this.assembler.pushNode(node)
     } else {
@@ -306,6 +430,9 @@ class ClaudeParser implements SessionParser {
       ? [{ type: 'text', text: rawContent }]
       : asArray(rawContent) ?? []
     let sawToolUse = false
+    // A fork's transcript opens with a copy of the parent's assistant message
+    // (the fork point); its tool use belongs to the parent, not to this run.
+    const inheritedCalls = state.fork && !state.sawPrompt
     for (const item of items) {
       if (!isRecord(item)) continue
       switch (item.type) {
@@ -322,6 +449,7 @@ class ClaudeParser implements SessionParser {
           const name = asString(item.name) ?? 'tool'
           const argsRaw = stringifyArgs(item.input)
           open.blocks.push({ kind: 'tool-call', callId, name, argsRaw })
+          if (inheritedCalls || (state.child && this.assembler.tools.has(callId))) break
           this.assembler.tools.start({
             callId,
             ...(state.nesting === undefined ? {} : { parentCallId: state.nesting.parentCallId }),
@@ -332,6 +460,10 @@ class ClaudeParser implements SessionParser {
             time,
             subCalls: [],
           })
+          state.toolCalls += 1
+          if (!state.child && SUBAGENT_TOOL_NAMES.has(name)) {
+            this.onAgentCall(callId, item.input, open.turn, open.step, time)
+          }
           break
         }
         case 'image': {
@@ -361,6 +493,7 @@ class ClaudeParser implements SessionParser {
   }
 
   private onCompaction(content: readonly ContentBlock[], time: number, state: FileState): void {
+    if (state.child) return
     const requestSeq = this.assembler.seq.next()
     const seq = this.assembler.seq.next()
     const summary = textOfContent(content)
@@ -398,6 +531,21 @@ class ClaudeParser implements SessionParser {
     this.pushContext([{ type: 'text', text }], time, { kind: 'attachment', name: label }, label, state)
   }
 
+  /** A fork's first line: which parent message it branched from and how much context it inherits. */
+  private onForkContextRef(record: Record<string, unknown>, time: number, state: FileState): void {
+    state.fork = true
+    if (!state.standalone) return
+    const parent = asString(record.parentSessionId)
+    const length = typeof record.contextLength === 'number' ? record.contextLength : null
+    const text = [
+      'Forked from the parent session',
+      parent === undefined ? '' : ` ${parent}`,
+      length === null ? '' : `, inheriting ${length} context items`,
+      '.',
+    ].join('')
+    this.pushContext([{ type: 'text', text }], time, { kind: 'meta', origin: 'fork' }, 'fork-context-ref', state)
+  }
+
   private pushContext(
     content: readonly ContentBlock[],
     time: number,
@@ -405,7 +553,7 @@ class ClaudeParser implements SessionParser {
     label: string,
     state: FileState,
   ): void {
-    if (state.nesting !== undefined) return
+    if (state.child) return
     const seq = this.assembler.seq.next()
     this.locate(seq, this.turn)
     this.assembler.pushNode({
@@ -421,6 +569,106 @@ class ClaudeParser implements SessionParser {
   }
 
   // -------------------------------------------------------------------------
+  // Subagent bookkeeping
+  // -------------------------------------------------------------------------
+
+  private onAgentCall(callId: string, input: unknown, turn: number, step: number, time: number): void {
+    const args = isRecord(input) ? input : {}
+    this.agentCalls.set(callId, {
+      callId,
+      turn,
+      step,
+      time,
+      prompt: asString(args.prompt) ?? null,
+      description: asString(args.description) ?? null,
+      agentType: asString(args.subagent_type) ?? null,
+      model: asString(args.model) ?? null,
+      agentId: null,
+      claimed: false,
+      fileKey: null,
+      status: 'launching',
+      endedAt: null,
+    })
+  }
+
+  /** The parent's tool result for an `Agent` call: a launch receipt (async) or the final report (sync). */
+  private onAgentResult(
+    call: AgentCall,
+    block: Record<string, unknown>,
+    record: Record<string, unknown>,
+    time: number,
+  ): void {
+    const meta = isRecord(record.toolUseResult) ? record.toolUseResult : undefined
+    const agentId = asString(meta?.agentId)
+    if (agentId !== undefined) this.claim(call, agentId)
+    call.model ??= asString(meta?.resolvedModel) ?? null
+    call.description ??= asString(meta?.description) ?? null
+    if (meta?.status === 'async_launched' || meta?.isAsync === true) {
+      if (call.status === 'launching') call.status = 'running'
+      return
+    }
+    if (call.endedAt === null) {
+      call.status = block.is_error === true ? 'failed' : 'completed'
+      call.endedAt = time
+    }
+  }
+
+  /** `<task-notification>` in the parent: a background agent stopped. */
+  private onTaskNotification(text: string, time: number): void {
+    const taskId = taggedValue(text, 'task-id')
+    const toolUseId = taggedValue(text, 'tool-use-id')
+    const callId = toolUseId ?? (taskId === undefined ? undefined : this.callByAgentId.get(taskId))
+    const call = callId === undefined ? undefined : this.agentCalls.get(callId)
+    if (call === undefined) return
+    if (taskId !== undefined) this.claim(call, taskId)
+    call.status = notificationStatus(taggedValue(text, 'status'))
+    call.endedAt = time
+  }
+
+  private claim(call: AgentCall, agentId: string): void {
+    call.agentId ??= agentId
+    call.claimed = true
+    this.callByAgentId.set(agentId, call.callId)
+  }
+
+  /**
+   * Bind a child transcript to the parent call it answers. Returns false when
+   * no call can be identified yet; the caller then drops the record.
+   */
+  private bindChild(state: FileState, prompt: string, resultIds: readonly string[]): boolean {
+    let call: AgentCall | undefined
+    if (state.toolUseId !== null) call = this.agentCalls.get(state.toolUseId)
+    if (call === undefined && state.agentId !== null) {
+      const callId = this.callByAgentId.get(state.agentId)
+      if (callId !== undefined) call = this.agentCalls.get(callId)
+    }
+    for (const id of resultIds) {
+      if (call !== undefined) break
+      call = this.agentCalls.get(id)
+    }
+    if (call === undefined) {
+      const unclaimed = [...this.agentCalls.values()].filter(candidate => !candidate.claimed)
+      if (prompt !== '') call = unclaimed.findLast(candidate => candidate.prompt === prompt)
+      // Last resort: the newest launch nobody has answered yet.
+      call ??= unclaimed.findLast(candidate => this.assembler.tools.isPending(candidate.callId))
+    }
+    if (call === undefined) return false
+    state.nesting = { parentCallId: call.callId, turn: call.turn, step: call.step }
+    call.claimed = true
+    call.fileKey = this.fileKeyOf(state)
+    if (state.agentId !== null) this.claim(call, state.agentId)
+    if (call.status === 'launching') call.status = 'running'
+    return true
+  }
+
+  private fileKeyOf(state: FileState): string | null {
+    for (const [key, candidate] of this.files) {
+      if (candidate === state) return key
+    }
+    return null
+  }
+
+  // -------------------------------------------------------------------------
   // Request finalization
   // -------------------------------------------------------------------------
 
@@ -428,7 +676,7 @@ class ClaudeParser implements SessionParser {
     const open = state.open
     if (open === undefined) return
     state.open = undefined
-    if (state.nesting !== undefined) {
+    if (state.child) {
       // Nested transcripts contribute only their tool calls; the parent's
       // tool_result carries the subagent's report.
       this.assembler.touch()
@@ -518,7 +766,7 @@ class ClaudeParser implements SessionParser {
   }
 
   private closeTurn(state: FileState): void {
-    if (state.nesting !== undefined || this.turn <= 0) return
+    if (state.child || this.turn <= 0) return
     this.closedTurns.add(this.turn)
     const location = this.turnLocation(this.turn)
     for (const seq of this.turnSeqs.get(this.turn) ?? []) this.assembler.locations.set(seq, location)
@@ -530,34 +778,49 @@ class ClaudeParser implements SessionParser {
   // -------------------------------------------------------------------------
 
   private stateFor(file: SessionFileRef, record: Record<string, unknown>): FileState {
-    const child = file.role === 'child'
-    const key = child ? file.id : (record.isSidechain === true ? SIDECHAIN_FILE : file.id)
+    const agent: AgentFileMeta | undefined = file.agent
+    const standalone = file.role === 'main' && agent !== undefined
+    const recordAgentId = asString(record.agentId)
+    let key = file.id
+    let child = file.role === 'child'
+    if (!child && !standalone && record.isSidechain === true) {
+      key = `${SIDECHAIN_PREFIX}${recordAgentId ?? ''}`
+      child = true
+    }
     let state = this.files.get(key)
     if (state === undefined) {
-      state = { child: child || key === SIDECHAIN_FILE, nesting: undefined, open: undefined, lastInputTime: null }
+      state = {
+        child,
+        standalone,
+        fileId: child && key.startsWith(SIDECHAIN_PREFIX) ? null : file.id,
+        agentId: agent?.agentId ?? null,
+        toolUseId: agent?.toolUseId ?? null,
+        fork: agent?.isFork === true,
+        sawPrompt: false,
+        nesting: undefined,
+        open: undefined,
+        lastInputTime: null,
+        lastTime: null,
+        toolCalls: 0,
+      }
       this.files.set(key, state)
     }
-    return state
-  }
-
-  /** Bind a subagent transcript to the parent call it answers, by prompt text first. */
-  private attachChild(state: FileState, prompt: string): void {
-    const tools = this.assembler.tools
-    const candidates = tools.pendingIds()
-      .map(id => tools.pendingCall(id))
-      .filter((call): call is NonNullable<typeof call> =>
-        call !== undefined && SUBAGENT_TOOL_NAMES.has(call.name) && call.parentCallId === undefined)
-    const match = candidates.find(call => promptOfArgs(call.argsRaw) === prompt) ?? candidates[0]
-    if (match === undefined) {
-      state.nesting = undefined
-      return
+    if (child) {
+      state.agentId ??= recordAgentId ?? null
+      if (agent?.toolUseId !== undefined) state.toolUseId ??= agent.toolUseId
     }
-    state.nesting = { parentCallId: match.callId, turn: match.turn, step: match.step }
+    return state
   }
 
   // -------------------------------------------------------------------------
   // Content
   // -------------------------------------------------------------------------
+
+  private resultContent(raw: unknown): ContentBlock[] {
+    return typeof raw === 'string'
+      ? [{ type: 'text', text: raw }]
+      : this.contentBlocks(asArray(raw) ?? [])
+  }
 
   private contentBlocks(items: readonly unknown[]): ContentBlock[] {
     const blocks: ContentBlock[] = []

@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { SessionLiveEvent } from '@harness-trajectory/core'
-import { SessionIndex, classifyPath, lineTimes, mergeChronologically } from '../src/index.ts'
+import { SessionIndex, classifyPath, lineTimes, mergeChronologically, scopeToFile } from '../src/index.ts'
 import { createMetaScanner } from '../src/meta.ts'
 
 function jsonl(records: readonly unknown[]): string {
@@ -187,5 +187,90 @@ describe('SessionIndex', () => {
     await writeFile(path, jsonl([claudeUser('Late arrival', 'main-2', 0)]))
     await index.refreshPath(path)
     expect(index.get('claude', 'main-2')).toMatchObject({ title: 'Late arrival' })
+  })
+})
+
+describe('SessionIndex live children', () => {
+  let dir: string
+  let index: SessionIndex
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'harness-trajectory-live-'))
+    await mkdir(join(dir, 'claude', '-slug'), { recursive: true })
+    await writeFile(join(dir, 'claude', '-slug', 'main-1.jsonl'), jsonl([
+      claudeUser('Hello there', 'main-1', 0),
+      claudeAssistant('Hi', 'main-1', 1000),
+    ]))
+    index = new SessionIndex({
+      roots: [{ kind: 'claude', dir: join(dir, 'claude') }],
+      watch: false,
+      now: () => T0 + 60_000,
+    })
+    await index.start()
+  })
+
+  afterEach(async () => {
+    index.stop()
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('announces a subagent transcript created while watching and forwards its existing lines', async () => {
+    const events: SessionLiveEvent[] = []
+    const unsubscribe = index.subscribe('claude', 'main-1', event => events.push(event))
+    const childDir = join(dir, 'claude', '-slug', 'main-1', 'subagents')
+    await mkdir(childDir, { recursive: true })
+    const path = join(childDir, 'agent-a1.jsonl')
+    await writeFile(`${childDir}/agent-a1.meta.json`, JSON.stringify({
+      agentType: 'Explore', description: 'Find things', toolUseId: 'toolu_1', isFork: false, model: 'sonnet',
+    }))
+    await writeFile(path, jsonl([
+      claudeUser('child prompt', 'main-1', 500, { isSidechain: true, agentId: 'a1' }),
+      claudeAssistant('child reply', 'main-1', 800),
+    ]))
+    await index.refreshPath(path)
+    expect(events.map(event => event.type)).toEqual(['file', 'lines', 'meta'])
+    const [file, lines, meta] = events
+    expect(file?.type === 'file' && file.file).toMatchObject({
+      id: 'main-1/agent-a1', role: 'child', parentId: 'main-1',
+      agent: { agentId: 'a1', toolUseId: 'toolu_1', description: 'Find things', agentType: 'Explore', model: 'sonnet' },
+    })
+    expect(file?.type === 'file' && file.reset).toBeUndefined()
+    expect(lines?.type === 'lines' && lines.lines).toHaveLength(2)
+    expect(meta?.type === 'meta' && meta.children.map(child => child.file.id)).toEqual(['main-1/agent-a1'])
+    expect(index.get('claude', 'main-1')?.children[0]).toMatchObject({ file: { id: 'main-1/agent-a1' }, bytes: expect.any(Number) })
+
+    // Later appends keep flowing; a truncation is flagged as a reset.
+    await appendFile(path, jsonl([claudeAssistant('more', 'main-1', 900)]))
+    await index.refreshPath(path)
+    expect(events.filter(event => event.type === 'lines')).toHaveLength(2)
+    await writeFile(path, jsonl([claudeUser('rewritten', 'main-1', 100, { isSidechain: true })]))
+    await index.refreshPath(path)
+    expect(events.some(event => event.type === 'file' && event.reset === true)).toBe(true)
+    unsubscribe()
+  })
+
+  it('serves one child transcript as a session of its own', async () => {
+    const childDir = join(dir, 'claude', '-slug', 'main-1', 'subagents')
+    await mkdir(childDir, { recursive: true })
+    const path = join(childDir, 'agent-a1.jsonl')
+    await writeFile(path, jsonl([claudeUser('child prompt', 'main-1', 500, { isSidechain: true, agentId: 'a1' })]))
+    await index.refreshPath(path)
+    expect(index.hasChild('claude', 'main-1', 'main-1/agent-a1')).toBe(true)
+    expect(index.hasChild('claude', 'main-1', 'main-1/agent-zz')).toBe(false)
+    const replay: SessionLiveEvent[] = []
+    await index.readAll('claude', 'main-1', event => replay.push(event), 'main-1/agent-a1')
+    expect(replay.map(event => event.type)).toEqual(['file', 'lines', 'meta'])
+    const [file, lines] = replay
+    expect(file?.type === 'file' && file.file).toEqual({
+      id: 'main-1/agent-a1', role: 'main', path, agent: { agentId: 'a1' },
+    })
+    expect(lines?.type === 'lines' && lines.file.role).toBe('main')
+    expect(lines?.type === 'lines' && lines.lines).toHaveLength(1)
+
+    const main: SessionLiveEvent = { type: 'lines', file: { id: 'main-1', role: 'main', path: '/m' }, lines: ['{}'] }
+    const child: SessionLiveEvent = { type: 'lines', file: { id: 'main-1/agent-a1', role: 'child', path, parentId: 'main-1' }, lines: ['{}'] }
+    expect(scopeToFile(main, 'main-1/agent-a1')).toBeNull()
+    expect(scopeToFile(child, 'main-1/agent-a1')).toMatchObject({ file: { id: 'main-1/agent-a1', role: 'main' } })
+    expect(scopeToFile({ type: 'ready' }, 'main-1/agent-a1')).toEqual({ type: 'ready' })
   })
 })

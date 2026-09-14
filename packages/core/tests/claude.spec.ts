@@ -411,3 +411,236 @@ describe('claude adapter', () => {
     expect(parser.snapshot()).not.toBe(first)
   })
 })
+
+describe('claude adapter subagents', () => {
+  const AGENT_META = { agentId: 'a1', toolUseId: 'agent-b', description: 'docs', agentType: 'Explore', model: 'sonnet' }
+  const CHILD_WITH_META: SessionFileRef = { ...CHILD, id: 'main/agent-a1', agent: AGENT_META }
+
+  function agentLaunch(callId: string, agentId: string, offsetMs: number): Extra {
+    return toolResult(callId, 'Async agent launched.', offsetMs, {
+      meta: { agentId, status: 'async_launched', isAsync: true, description: 'docs', resolvedModel: 'claude-sonnet-5' },
+    })
+  }
+
+  it('binds a child by the tool-use id in its sidecar meta, even after the async launch receipt', () => {
+    const parser = createClaudeParser()
+    feed(parser, [
+      user('Survey the repo', 0),
+      assistantLine('req-1', toolUse('agent-a', 'Agent', { prompt: 'List tests', description: 'tests' }), 1_000),
+      assistantLine('req-1', toolUse('agent-b', 'Agent', { prompt: 'List docs', description: 'docs' }), 1_100, { stop: 'tool_use' }),
+      agentLaunch('agent-b', 'a1', 1_200),
+      agentLaunch('agent-a', 'a0', 1_300),
+    ])
+    // Both calls already completed (async receipts) when the child's lines arrive.
+    feed(parser, [
+      user('List tests', 1_500, { agentId: 'a1', isSidechain: true }), // prompt text deliberately misleading
+      assistantLine('req-c1', toolUse('child-call', 'Bash', { command: 'ls docs' }), 2_000, { stop: 'tool_use' }),
+    ], CHILD_WITH_META)
+    let snapshot = parser.snapshot()
+    // The parent ledger has no extra turn and no top-level running call from the child.
+    expect(snapshot.eventNodes.map(node => node.kind)).toEqual(['user', 'assistant', 'tool-result', 'tool-result'])
+    expect(parser.meta().promptCount).toBe(1)
+    expect(snapshot.runningCalls).toEqual([])
+    const [docs, tests] = toolResults(parser)
+    expect(docs?.callId).toBe('agent-b')
+    // A running nested call is visible under the completed Agent result before its own result lands.
+    expect(docs?.subCalls.map(call => call.callId)).toEqual(['child-call'])
+    expect(docs?.subCalls[0] !== undefined && 'kind' in docs.subCalls[0]).toBe(false)
+    expect(tests?.subCalls).toEqual([])
+
+    feed(parser, [toolResult('child-call', 'README.md', 2_500)], CHILD_WITH_META)
+    snapshot = parser.snapshot()
+    const [docsDone] = toolResults(parser)
+    expect(docsDone?.subCalls[0]).toMatchObject({ kind: 'tool-result', callId: 'child-call', parentCallId: 'agent-b' })
+    expect(parser.subagents().map(run => [run.agentId, run.callId, run.status, run.toolCalls])).toEqual([
+      ['a0', 'agent-a', 'running', 0],
+      ['a1', 'agent-b', 'running', 1],
+    ])
+  })
+
+  it('binds by the agent id from the launch receipt when no sidecar meta exists', () => {
+    const parser = createClaudeParser()
+    feed(parser, [
+      user('Go', 0),
+      assistantLine('req-1', toolUse('agent-a', 'Agent', { prompt: 'One', description: 'one' }), 1_000),
+      assistantLine('req-1', toolUse('agent-b', 'Agent', { prompt: 'Two', description: 'two' }), 1_100, { stop: 'tool_use' }),
+      agentLaunch('agent-a', 'aa', 1_200),
+      agentLaunch('agent-b', 'bb', 1_300),
+    ])
+    const childB: SessionFileRef = { ...CHILD, id: 'main/agent-bb', agent: { agentId: 'bb' } }
+    feed(parser, [
+      user('Two (edited)', 1_500, { agentId: 'bb', isSidechain: true }),
+      assistantLine('req-c1', toolUse('b-call', 'Read', { file_path: '/x' }), 2_000, { stop: 'tool_use' }),
+      toolResult('b-call', 'contents', 2_100),
+    ], childB)
+    const [one, two] = toolResults(parser)
+    expect(one?.callId).toBe('agent-a')
+    expect(one?.subCalls).toEqual([])
+    expect(two?.callId).toBe('agent-b')
+    expect(two?.subCalls.map(call => call.callId)).toEqual(['b-call'])
+  })
+
+  it('treats a fork\'s synthetic first tool result as the binding, not as a result', () => {
+    const parser = createClaudeParser()
+    feed(parser, [
+      user('Implement it', 0),
+      assistantLine('req-1', toolUse('fork-call', 'Agent', { prompt: 'Do the work', subagent_type: 'fork' }), 1_000, { stop: 'tool_use' }),
+    ])
+    const forkFile: SessionFileRef = { ...CHILD, id: 'main/agent-ff', agent: { agentId: 'ff', isFork: true } }
+    feed(parser, [
+      { type: 'fork-context-ref', agentId: 'ff', parentSessionId: 'session-1', parentLastUuid: 'a-1000', contextLength: 12 },
+      user('', 1_050, {
+        agentId: 'ff',
+        isSidechain: true,
+        message: {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'fork-call', content: [{ type: 'text', text: 'Fork started — processing in background' }] },
+            { type: 'text', text: '<fork-boilerplate>\nYou are a worker fork.\n</fork-boilerplate>\n\nDo the work' },
+          ],
+        },
+      }),
+      assistantLine('req-f1', toolUse('f-call', 'Bash', { command: 'make' }), 1_500, { stop: 'tool_use' }),
+    ], forkFile)
+    feed(parser, [agentLaunch('fork-call', 'ff', 1_100)])
+    const snapshot = parser.snapshot()
+    expect(snapshot.eventNodes.map(node => node.kind)).toEqual(['user', 'assistant', 'tool-result'])
+    const [fork] = toolResults(parser)
+    // The parent's own receipt is the result; the fork's copy never reached the ledger.
+    expect(fork?.content).toEqual([{ type: 'text', text: 'Async agent launched.' }])
+    expect(fork?.subCalls.map(call => call.callId)).toEqual(['f-call'])
+    expect(parser.subagents()[0]).toMatchObject({ agentId: 'ff', callId: 'fork-call', status: 'running', toolCalls: 1 })
+  })
+
+  it('ignores the fork point copied into a fork transcript, nested and standalone', () => {
+    const forkPoint = assistantLine('req-1', toolUse('fork-call', 'Agent', { prompt: 'Do the work', subagent_type: 'fork' }), 1_000, {
+      stop: 'tool_use', extra: { isSidechain: true, agentId: 'ff' },
+    })
+    const forkStart = user('', 1_050, {
+      agentId: 'ff',
+      isSidechain: true,
+      message: {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'fork-call', content: [{ type: 'text', text: 'Fork started' }] },
+          { type: 'text', text: '<fork-boilerplate>\nYou are a worker fork.\n</fork-boilerplate>\n\nDo the work' },
+        ],
+      },
+    })
+    const work = [
+      assistantLine('req-f1', toolUse('f-call', 'Bash', { command: 'make' }), 1_500, { stop: 'tool_use', extra: { isSidechain: true, agentId: 'ff' } }),
+      { ...toolResult('f-call', 'ok', 1_600), isSidechain: true, agentId: 'ff' },
+    ]
+
+    const parent = createClaudeParser()
+    feed(parent, [
+      user('Implement it', 0),
+      assistantLine('req-1', toolUse('fork-call', 'Agent', { prompt: 'Do the work', subagent_type: 'fork' }), 1_000, { stop: 'tool_use' }),
+    ])
+    const forkFile: SessionFileRef = { ...CHILD, id: 'main/agent-ff', agent: { agentId: 'ff', toolUseId: 'fork-call', isFork: true } }
+    feed(parent, [
+      { type: 'fork-context-ref', agentId: 'ff', parentSessionId: 'session-1', parentLastUuid: 'a-1000', contextLength: 12 },
+      forkPoint, forkStart, ...work,
+    ], forkFile)
+    feed(parent, [toolResult('fork-call', 'Async agent launched.', 1_100, { meta: { agentId: 'ff', status: 'async_launched' } })])
+    let snapshot = parent.snapshot()
+    expect(snapshot.eventNodes.map(node => node.kind)).toEqual(['user', 'assistant', 'tool-result'])
+    expect(snapshot.runningCalls).toEqual([])
+    const [fork] = toolResults(parent)
+    expect(fork?.subCalls.map(call => call.callId)).toEqual(['f-call'])
+
+    const alone = createClaudeParser()
+    feed(alone, [
+      { type: 'fork-context-ref', agentId: 'ff', parentSessionId: 'session-1', parentLastUuid: 'a-1000', contextLength: 12 },
+      forkPoint, forkStart, ...work,
+    ], { id: 'main/agent-ff', role: 'main', path: '/x', agent: { agentId: 'ff', toolUseId: 'fork-call', isFork: true } })
+    snapshot = alone.snapshot()
+    expect(snapshot.eventNodes.map(node => node.kind)).toEqual(['context', 'assistant', 'context', 'user', 'assistant', 'tool-result'])
+    expect(snapshot.runningCalls).toEqual([])
+    expect(snapshot.eventLocations.get(2)).toEqual({ kind: 'session' })
+  })
+
+  it('never lets an unbound child leak into the parent ledger', () => {
+    const parser = createClaudeParser()
+    feed(parser, [user('Hello', 0), assistantLine('req-1', { type: 'text', text: 'Hi' }, 1_000, { stop: 'end_turn' })])
+    const stray: SessionFileRef = { ...CHILD, id: 'main/agent-zz', agent: { agentId: 'zz' } }
+    feed(parser, [
+      user('Stray prompt', 2_000, { agentId: 'zz', isSidechain: true }),
+      assistantLine('req-z1', toolUse('z-call', 'Bash', { command: 'ls' }), 2_500, { stop: 'tool_use' }),
+      toolResult('z-call', 'a b', 2_600),
+    ], stray)
+    const snapshot = parser.snapshot()
+    expect(snapshot.eventNodes.map(node => node.kind)).toEqual(['user', 'assistant'])
+    expect(snapshot.runningCalls).toEqual([])
+    expect(snapshot.partial).toBeNull()
+    expect(parser.meta().promptCount).toBe(1)
+    // It is still reported so the catalog can open its transcript.
+    expect(parser.subagents()).toEqual([expect.objectContaining({ agentId: 'zz', fileId: 'main/agent-zz', callId: null })])
+  })
+
+  it('tracks run status from receipts and task notifications', () => {
+    const parser = createClaudeParser()
+    feed(parser, [
+      user('Go', 0),
+      assistantLine('req-1', toolUse('agent-a', 'Agent', { prompt: 'A', description: 'a' }), 1_000),
+      assistantLine('req-1', toolUse('agent-b', 'Agent', { prompt: 'B', description: 'b' }), 1_100),
+      assistantLine('req-1', toolUse('agent-c', 'Agent', { prompt: 'C', description: 'c' }), 1_200, { stop: 'tool_use' }),
+    ])
+    expect(parser.subagents().map(run => run.status)).toEqual(['launching', 'launching', 'launching'])
+    feed(parser, [
+      agentLaunch('agent-a', 'aa', 1_300),
+      agentLaunch('agent-b', 'bb', 1_400),
+      toolResult('agent-c', 'Sync report', 5_000, { meta: { agentId: 'cc', status: 'completed' } }),
+      user('<task-notification>\n<task-id>aa</task-id>\n<tool-use-id>agent-a</tool-use-id>\n<status>completed</status>\n<summary>Agent "a" finished</summary>\n</task-notification>', 6_000),
+      user('<task-notification>\n<task-id>bb</task-id>\n<tool-use-id>agent-b</tool-use-id>\n<status>failed</status>\n</task-notification>', 6_500),
+    ])
+    const runs = parser.subagents()
+    expect(runs.map(run => [run.agentId, run.status, run.endedAt])).toEqual([
+      ['aa', 'completed', T0 + 6_000],
+      ['bb', 'failed', T0 + 6_500],
+      ['cc', 'completed', T0 + 5_000],
+    ])
+    expect(runs[0]).toMatchObject({ description: 'a', startedAt: T0 + 1_000, model: 'claude-sonnet-5' })
+    // Notifications are context, not prompts.
+    expect(parser.meta().promptCount).toBe(1)
+    expect(parser.snapshot().eventNodes.filter(node => node.kind === 'context')).toHaveLength(2)
+  })
+
+  it('folds an agent transcript served on its own as a complete session', () => {
+    const parser = createClaudeParser()
+    const standalone: SessionFileRef = {
+      id: 'main/agent-ff', role: 'main', path: '/sessions/main/subagents/agent-ff.jsonl',
+      agent: { agentId: 'ff', toolUseId: 'fork-call', isFork: true, description: 'Implement it' },
+    }
+    feed(parser, [
+      { type: 'fork-context-ref', agentId: 'ff', parentSessionId: 'session-1', parentLastUuid: 'a-1', contextLength: 12 },
+      user('', 1_050, {
+        agentId: 'ff',
+        isSidechain: true,
+        message: {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'fork-call', content: [{ type: 'text', text: 'Fork started' }] },
+            { type: 'text', text: '<fork-boilerplate>\nYou are a worker fork.\n</fork-boilerplate>\n\nDo the work' },
+          ],
+        },
+      }),
+      assistantLine('req-f1', { type: 'text', text: 'On it.' }, 1_200, { extra: { isSidechain: true, agentId: 'ff' } }),
+      assistantLine('req-f1', toolUse('f-call', 'Bash', { command: 'make' }), 1_500, { stop: 'tool_use', extra: { isSidechain: true, agentId: 'ff' } }),
+      { ...toolResult('f-call', 'ok', 1_600), isSidechain: true, agentId: 'ff' },
+      assistantLine('req-f2', { type: 'text', text: 'Done.' }, 2_000, { stop: 'end_turn', extra: { isSidechain: true, agentId: 'ff' } }),
+    ], standalone)
+    const snapshot = parser.snapshot()
+    expect(snapshot.eventNodes.map(node => node.kind)).toEqual([
+      'context', 'context', 'user', 'assistant', 'tool-result', 'assistant',
+    ])
+    expect(snapshot.eventNodes[0]).toMatchObject({ provenance: { label: 'fork-context-ref' } })
+    expect(snapshot.eventNodes[1]).toMatchObject({
+      provenance: { label: 'fork-context' }, content: [{ type: 'text', text: 'Fork started' }],
+    })
+    expect(assistants(parser).map(node => [node.turn, node.step])).toEqual([[1, 1], [1, 2]])
+    expect(snapshot.runningCalls).toEqual([])
+    expect(parser.meta().promptCount).toBe(1)
+    expect(parser.subagents()).toEqual([])
+  })
+})

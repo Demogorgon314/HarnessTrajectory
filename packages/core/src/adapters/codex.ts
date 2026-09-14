@@ -12,7 +12,7 @@ import type {
   RequestPromptChange, TokenUsage, TrajectorySnapshot,
 } from '../contract.ts'
 import { asArray, asNumber, asString, isRecord, parseJsonLine, parseTime } from '../jsonl.ts'
-import type { ImageStore, ParsedSessionMeta, SessionFileRef, SessionParser } from '../session.ts'
+import type { ImageStore, ParsedSessionMeta, SessionFileRef, SessionParser, SubagentRun } from '../session.ts'
 import { DataUrlImageStore, TrajectoryAssembler, normalizeImageMediaType, textOf, titleFrom } from './shared.ts'
 
 /** One model response in progress: blocks accumulate until an input arrives. */
@@ -31,6 +31,13 @@ interface OpenStep {
 /** A subagent thread nested under one synthetic tool call in the parent ledger. */
 interface ChildThread {
   callId: string
+  fileId: string
+  threadId: string
+  label: string
+  startedAt: number
+  endedAt: number | null
+  lastTime: number
+  toolCalls: number
   lastAgentMessage: string | null
   completed: boolean
 }
@@ -201,6 +208,22 @@ class CodexParser implements SessionParser {
       startedAt: this.startedAt,
       promptCount: this.promptCount,
     }
+  }
+
+  subagents(): readonly SubagentRun[] {
+    return [...this.children.values()].map(child => ({
+      agentId: child.threadId,
+      fileId: child.fileId,
+      callId: child.callId,
+      description: child.label,
+      agentType: null,
+      model: null,
+      status: child.completed ? 'completed' : 'running',
+      startedAt: child.startedAt,
+      endedAt: child.endedAt,
+      lastTime: child.lastTime,
+      toolCalls: child.toolCalls,
+    }))
   }
 
   imageUrl(attachment: ImageAttachmentRef): string | undefined {
@@ -660,7 +683,10 @@ class CodexParser implements SessionParser {
       const label = type === 'session_meta' ? subagentLabel(payload) : 'subagent'
       const threadId = (type === 'session_meta' ? asString(payload['id']) : undefined) ?? file.id
       const callId = `subagent:${file.id}`
-      child = { callId, lastAgentMessage: null, completed: false }
+      child = {
+        callId, fileId: file.id, threadId, label, startedAt: time, endedAt: null, lastTime: time, toolCalls: 0,
+        lastAgentMessage: null, completed: false,
+      }
       this.children.set(file.id, child)
       const name = `subagent:${label}`
       const argsRaw = JSON.stringify({ threadId, source: label })
@@ -677,6 +703,7 @@ class CodexParser implements SessionParser {
       this.assembler.touch()
     }
     if (child.completed) return
+    child.lastTime = Math.max(child.lastTime, time)
     if (type === 'response_item') {
       switch (asString(payload['type'])) {
         case 'message': {
@@ -691,6 +718,7 @@ class CodexParser implements SessionParser {
         case 'custom_tool_call':
         case 'function_call':
         case 'local_shell_call':
+          child.toolCalls += 1
           this.handleToolCall(payload, time, child.callId)
           return
         case 'custom_tool_call_output':
@@ -718,6 +746,7 @@ class CodexParser implements SessionParser {
   private completeChild(child: ChildThread, time: number): void {
     if (child.completed) return
     child.completed = true
+    child.endedAt = time
     this.closeOpenStep('complete')
     this.lastInputTime = time
     const seq = this.assembler.seq.next()

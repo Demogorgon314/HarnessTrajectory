@@ -81,12 +81,16 @@ export class ToolCallTracker {
   private readonly parentOf = new Map<string, string>()
   private readonly completed = new Map<string, ToolResultNode>()
 
+  /** Parents with at least one child still running: their nested view must be recomputed per snapshot. */
+  private readonly pendingChildren = new Map<string, number>()
+
   /** Register an emitted call. */
   start(call: RunningToolCall): void {
     this.pending.set(call.callId, { call })
     this.order.push(call.callId)
-    if (call.parentCallId !== undefined) {
+    if (call.parentCallId !== undefined && call.parentCallId !== call.callId) {
       this.parentOf.set(call.callId, call.parentCallId)
+      this.pendingChildren.set(call.parentCallId, (this.pendingChildren.get(call.parentCallId) ?? 0) + 1)
     }
   }
 
@@ -128,6 +132,11 @@ export class ToolCallTracker {
     const call = pending?.call
     this.pending.delete(callId)
     const parentCallId = call?.parentCallId ?? this.parentOf.get(callId)
+    if (pending !== undefined && parentCallId !== undefined) {
+      const remaining = (this.pendingChildren.get(parentCallId) ?? 1) - 1
+      if (remaining <= 0) this.pendingChildren.delete(parentCallId)
+      else this.pendingChildren.set(parentCallId, remaining)
+    }
     const node: ToolResultNode = {
       kind: 'tool-result',
       seq: result.seq,
@@ -154,8 +163,10 @@ export class ToolCallTracker {
   }
 
   private refreshCompletedAncestors(callId: string): void {
+    const visited = new Set<string>()
     let current: string | undefined = callId
-    while (current !== undefined) {
+    while (current !== undefined && !visited.has(current)) {
+      visited.add(current)
       const done = this.completed.get(current)
       if (done !== undefined) {
         this.completed.set(current, { ...done, subCalls: this.subCallsOf(current) })
@@ -164,9 +175,15 @@ export class ToolCallTracker {
     }
   }
 
-  /** Latest version of a completed node (subCalls may have grown since emission). */
+  /**
+   * Latest version of a completed node (subCalls may have grown since
+   * emission). While a nested call is still running under it, the view is
+   * recomputed so an in-flight subagent tool shows before its result lands.
+   */
   completedNode(callId: string): ToolResultNode | undefined {
-    return this.completed.get(callId)
+    const done = this.completed.get(callId)
+    if (done === undefined || !this.pendingChildren.has(callId)) return done
+    return { ...done, subCalls: this.subCallsOf(callId) }
   }
 
   private subCallsOf(callId: string): readonly ToolCallBlock[] {

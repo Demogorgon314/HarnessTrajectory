@@ -6,7 +6,7 @@ import { extname, join, normalize } from 'node:path'
 import { Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import { HARNESS_KINDS, type HarnessKind, type SessionLiveEvent } from '@harness-trajectory/core'
-import type { SessionIndex } from './index.ts'
+import { scopeToFile, type SessionIndex } from './index.ts'
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -61,13 +61,18 @@ export function createApp({ index, staticDir }: AppOptions): Hono {
 
   /**
    * One stream per open session: existing content first (file + lines events,
-   * chunked), then live appends until the client disconnects.
+   * chunked), then live appends until the client disconnects. `?file=<childId>`
+   * narrows the stream to one subagent transcript, served as its own session.
    */
   app.get('/api/sessions/:kind/:id/events', (c) => {
     const kind = c.req.param('kind')
     const id = c.req.param('id')
+    const fileId = c.req.query('file')
     if (!isKind(kind) || index.get(kind, id) === undefined) {
       return c.json({ error: 'session not found' }, 404)
+    }
+    if (fileId !== undefined && !index.hasChild(kind, id, fileId)) {
+      return c.json({ error: 'child transcript not found' }, 404)
     }
     return streamSSE(c, async (stream) => {
       let closed = false
@@ -79,7 +84,9 @@ export function createApp({ index, staticDir }: AppOptions): Hono {
         counter += 1
         await stream.writeSSE({ event: event.type, data: JSON.stringify(event), id: String(counter) })
       }
-      const unsubscribe = index.subscribe(kind, id, (event) => {
+      const unsubscribe = index.subscribe(kind, id, (raw) => {
+        const event = fileId === undefined ? raw : scopeToFile(raw, fileId)
+        if (event === null) return
         if (replaying) queue.push(event)
         else void send(event)
       })
@@ -89,7 +96,7 @@ export function createApp({ index, staticDir }: AppOptions): Hono {
       })
       try {
         const pending: Promise<void>[] = []
-        await index.readAll(kind, id, (event) => { pending.push(send(event)) })
+        await index.readAll(kind, id, (event) => { pending.push(send(event)) }, fileId)
         await Promise.all(pending)
         replaying = false
         for (const event of queue.splice(0)) await send(event)

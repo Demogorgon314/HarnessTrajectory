@@ -6,7 +6,23 @@ export type HarnessKind = 'claude' | 'codex'
 
 export const HARNESS_KINDS: readonly HarnessKind[] = ['claude', 'codex']
 
-/** One JSONL file that contributes to a session: the main transcript or a child (subagent) transcript. */
+/** Facts about a subagent transcript recorded next to it (Claude Code `agent-<id>.meta.json`). */
+export interface AgentFileMeta {
+  agentId: string
+  /** Id of the parent's `Agent` tool call that spawned this transcript. */
+  toolUseId?: string
+  description?: string
+  agentType?: string
+  model?: string
+  isFork?: boolean
+}
+
+/**
+ * One JSONL file that contributes to a session: the main transcript or a child
+ * (subagent) transcript. A child served on its own (the subagent view) is sent
+ * with `role: 'main'` and its `agent` facts, so adapters fold it as a complete
+ * transcript rather than nesting it.
+ */
 export interface SessionFileRef {
   /** Stable identity within the session (main transcript id, or the child's own id). */
   id: string
@@ -15,6 +31,16 @@ export interface SessionFileRef {
   path: string
   /** For a child transcript, the parent transcript id when known. */
   parentId?: string
+  /** Subagent facts when this file is (or was served as) an agent transcript. */
+  agent?: AgentFileMeta
+}
+
+/** Listing row for one child transcript of a session. */
+export interface SessionChildSummary {
+  file: SessionFileRef
+  /** Epoch milliseconds of the last write to the file. */
+  updatedAt: number
+  bytes: number
 }
 
 /** Listing row for the session picker. */
@@ -42,6 +68,31 @@ export interface SessionSummary {
 
 export interface SessionDetail extends SessionSummary {
   files: readonly SessionFileRef[]
+  children: readonly SessionChildSummary[]
+}
+
+/** Lifecycle of one subagent run as the parent transcript reports it. */
+export type SubagentStatus = 'launching' | 'running' | 'completed' | 'failed' | 'stopped'
+
+/** One subagent run seen while parsing a session, joined from the parent's calls and the child's transcript. */
+export interface SubagentRun {
+  /** Harness id of the run (Claude `agentId`, Codex child thread id). */
+  agentId: string
+  /** Child transcript file id once one of its lines has been seen. */
+  fileId: string | null
+  /** Parent tool call that spawned the run, when bound. */
+  callId: string | null
+  description: string | null
+  agentType: string | null
+  model: string | null
+  status: SubagentStatus
+  /** Epoch milliseconds the run was requested (parent call time). */
+  startedAt: number | null
+  /** Epoch milliseconds the parent learned the run ended. */
+  endedAt: number | null
+  /** Epoch milliseconds of the last child transcript record. */
+  lastTime: number | null
+  toolCalls: number
 }
 
 /** Session-level facts an adapter learns while parsing. */
@@ -70,6 +121,8 @@ export interface SessionParser {
   /** Current trajectory fold; a new object only when something changed. */
   snapshot(): TrajectorySnapshot
   meta(): ParsedSessionMeta
+  /** Subagent runs spawned by this session, in launch order. */
+  subagents(): readonly SubagentRun[]
   images: ImageStore
   /** Resolve an image reference to a data URL, if the transcript embedded the bytes. */
   imageUrl(attachment: ImageAttachmentRef): string | undefined
@@ -78,7 +131,8 @@ export interface SessionParser {
 /** Server-sent live update for one open session. */
 export type SessionLiveEvent =
   | { type: 'lines'; file: SessionFileRef; lines: readonly string[] }
-  | { type: 'file'; file: SessionFileRef }
-  | { type: 'meta'; summary: SessionSummary }
+  /** A file joined the session or its facts changed; `reset` means it was truncated and must be refolded. */
+  | { type: 'file'; file: SessionFileRef; reset?: boolean }
+  | { type: 'meta'; summary: SessionSummary; children: readonly SessionChildSummary[] }
   /** Existing content has been replayed; later events are live appends. */
   | { type: 'ready' }
