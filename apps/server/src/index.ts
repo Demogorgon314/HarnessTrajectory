@@ -80,10 +80,23 @@ export function classifyPath(
     }
     return null
   }
-  // codex: YYYY/MM/DD/rollout-<timestamp>-<threadId>.jsonl; identity comes from session_meta.
-  if (!name.startsWith('rollout-')) return null
-  const match = /-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(name)
-  return { id: match?.[1] ?? name, role: 'main' }
+  if (kind === 'codex') {
+    // YYYY/MM/DD/rollout-<timestamp>-<threadId>.jsonl; identity comes from session_meta.
+    if (!name.startsWith('rollout-')) return null
+    const match = /-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(name)
+    return { id: match?.[1] ?? name, role: 'main' }
+  }
+  if (kind === 'kimi') {
+    // <workspace>/session_<id>/agents/<agentId>/wire.jsonl — identity is entirely path-derived.
+    if (parts.length !== 5 || parts[2] !== 'agents' || name !== 'wire') return null
+    const sessionId = parts[1]
+    const agentId = parts[3]
+    if (sessionId === undefined || sessionId === '' || agentId === undefined || agentId === '') return null
+    return agentId === 'main'
+      ? { id: sessionId, role: 'main' }
+      : { id: agentId, role: 'child', parentId: sessionId }
+  }
+  return null
 }
 
 export class SessionIndex extends EventEmitter {
@@ -232,7 +245,9 @@ export class SessionIndex extends EventEmitter {
     if (!info.isFile()) return undefined
     let id = classified.id
     let parentId = classified.parentId
-    if (root.kind === 'codex' || classified.role === 'child') {
+    // Codex identity lives in `session_meta`; a Claude child names its parent in its first record.
+    // Kimi needs no probe: `classifyPath` already derived both ids from the path.
+    if (root.kind === 'codex' || (root.kind === 'claude' && classified.role === 'child')) {
       try {
         const head = readHead(root.kind, await readFirstLine(path))
         if (root.kind === 'codex') {
@@ -273,6 +288,7 @@ export class SessionIndex extends EventEmitter {
     else session.children.set(id, entry)
     if (role === 'child' && !initial) this.emitTo(session, { type: 'file', file: ref })
     await this.consume(entry, info.size, info.mtimeMs, initial)
+    await this.syncKimiTitle(entry)
     return entry
   }
 
@@ -283,6 +299,17 @@ export class SessionIndex extends EventEmitter {
     if (agent?.toolUseId === undefined) return
     entry.ref = { ...entry.ref, agent }
     this.emitTo(session, { type: 'file', file: entry.ref })
+  }
+
+  /**
+   * Kimi keeps the session's own (generated or user-set) title in `state.json`
+   * beside `agents/`, rewritten as the session runs — re-read it on every
+   * refresh and surface it the way Claude's `ai-title` record is surfaced.
+   */
+  private async syncKimiTitle(entry: FileEntry): Promise<void> {
+    if (entry.kind !== 'kimi' || entry.ref.role !== 'main' || entry.meta === null) return
+    const title = await readKimiTitle(entry.path)
+    if (title !== undefined) entry.meta.state.aiTitle = title
   }
 
   private sessionFor(kind: HarnessKind, id: string): SessionRecord {
@@ -397,6 +424,7 @@ export class SessionIndex extends EventEmitter {
     try {
       const info = await stat(path)
       await this.consume(entry, info.size, info.mtimeMs)
+      await this.syncKimiTitle(entry)
     } catch {
       // Deleted or momentarily unreadable; keep the last known state.
     }
@@ -413,18 +441,18 @@ export class SessionIndex extends EventEmitter {
           const info = await stat(entry.path)
           if (info.size !== entry.size) await this.consume(entry, info.size, info.mtimeMs)
           await this.refreshAgentMeta(session, entry)
+          await this.syncKimiTitle(entry)
         } catch {
           // Ignore transient errors.
         }
       }
-      // Newly created child transcripts inside a session directory (Claude subagents).
-      if (session.kind === 'claude' && session.main !== null) {
-        const root = this.rootFor(session.main.path)
-        if (root !== undefined) {
-          const dir = join(dirname(session.main.path), session.id, 'subagents')
-          for (const path of await walk(dir)) {
-            if (!this.files.has(path)) await this.register(root, path)
-          }
+      // Newly created child transcripts inside a session directory (subagents).
+      const main = session.main
+      const childDir = main === null ? undefined : liveChildDir(session.kind, session.id, main.path)
+      const root = main === null ? undefined : this.rootFor(main.path)
+      if (childDir !== undefined && root !== undefined) {
+        for (const path of await walk(childDir)) {
+          if (!this.files.has(path)) await this.register(root, path)
         }
       }
     }
@@ -484,6 +512,36 @@ export async function readAgentMeta(transcriptPath: string): Promise<AgentFileMe
   }
 }
 
+/**
+ * Directory a live session's subagent transcripts appear in, so they can be
+ * picked up while someone is watching. Codex writes children as top-level
+ * rollouts, which the root walk already covers.
+ */
+export function liveChildDir(kind: HarnessKind, sessionId: string, mainPath: string): string | undefined {
+  // claude: <slug>/<sessionId>/subagents/agent-<id>.jsonl
+  if (kind === 'claude') return join(dirname(mainPath), sessionId, 'subagents')
+  // kimi: the main file is <session>/agents/main/wire.jsonl, siblings are <session>/agents/<agentId>/wire.jsonl
+  if (kind === 'kimi') return dirname(dirname(mainPath))
+  return undefined
+}
+
+/**
+ * Kimi's session title sidecar: `<session>/state.json`, two levels above the
+ * `agents/main/wire.jsonl` transcript. Best effort — unreadable means no title.
+ */
+export async function readKimiTitle(transcriptPath: string): Promise<string | undefined> {
+  const sessionDir = dirname(dirname(dirname(transcriptPath)))
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(await readFile(join(sessionDir, 'state.json'), 'utf8'))
+  } catch {
+    return undefined
+  }
+  if (!isRecord(parsed)) return undefined
+  const title = asString(parsed['title'])
+  return title === undefined || title.trim() === '' ? undefined : title
+}
+
 async function readWholeFile(path: string, end: number): Promise<string[]> {
   const lines: string[] = []
   let from = 0
@@ -499,18 +557,25 @@ async function readWholeFile(path: string, end: number): Promise<string[]> {
 }
 
 const TIMESTAMP_PATTERN = /"timestamp"\s*:\s*(?:"([^"]+)"|(\d+(?:\.\d+)?))/
+/** Kimi records carry `"time":<epoch ms>` and no `timestamp`. */
+const TIME_PATTERN = /"time"\s*:\s*(\d+(?:\.\d+)?)/
 
-/** Epoch milliseconds of a raw JSONL line's `timestamp`, or `null`. */
+/** Epoch milliseconds from a numeric timestamp; values below 1e12 are seconds. */
+function epochMs(raw: string | undefined): number | null {
+  const numeric = Number(raw)
+  if (raw === undefined || !Number.isFinite(numeric)) return null
+  return numeric < 1e12 ? Math.round(numeric * 1000) : Math.round(numeric)
+}
+
+/** Epoch milliseconds of a raw JSONL line's `timestamp` (or Kimi's `time`), or `null`. */
 export function lineTime(line: string): number | null {
   const match = TIMESTAMP_PATTERN.exec(line)
-  if (match === null) return null
+  if (match === null) return epochMs(TIME_PATTERN.exec(line)?.[1])
   if (match[1] !== undefined) {
     const parsed = Date.parse(match[1])
     return Number.isNaN(parsed) ? null : parsed
   }
-  const numeric = Number(match[2])
-  if (!Number.isFinite(numeric)) return null
-  return numeric < 1e12 ? Math.round(numeric * 1000) : Math.round(numeric)
+  return epochMs(match[2])
 }
 
 /**

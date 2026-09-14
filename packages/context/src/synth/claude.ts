@@ -51,6 +51,8 @@ interface Usage {
   inputTokens?: number
   cacheReadTokens?: number
   cacheWriteTokens?: number
+  /** The 1h-TTL SUBSET of `cacheWriteTokens` (see {@link usageOf}). */
+  cacheWrite1hTokens?: number
   outputTokens?: number
 }
 
@@ -119,6 +121,26 @@ interface PendingCompaction {
   durationMs: number | undefined
 }
 
+/**
+ * `message.usage` → the fold's disjoint buckets. `input_tokens` is the
+ * UNCACHED input (cache reads and cache writes are their own fields), and
+ * `output_tokens` already includes the thinking tokens
+ * (`output_tokens_details.thinking_tokens` is an informational subset —
+ * verified against a `cost-state` record whose `outputTokens` equals the
+ * transcript's `output_tokens` while its `thinkingTokens` is smaller).
+ *
+ * `cache_creation.ephemeral_1h_input_tokens` is the 1h-TTL SHARE of
+ * `cache_creation_input_tokens`, carried separately because the two TTLs bill
+ * at different rates (5m = 1.25x input, 1h = 2x input). Anthropic's own
+ * cost math splits exactly this way, so the client can only match it when the
+ * split survives the synthesizer.
+ *
+ * NOT carried: `usage.iterations[]` (one entry per API iteration of the same
+ * request — in every sampled record the outer `usage` is exactly the sum,
+ * i.e. the list is a breakdown, not extra billing) and `server_tool_use`
+ * (web search / web fetch bill per REQUEST, not per token, and the registry
+ * publishes no per-request rate — see the cost card's residual note).
+ */
 function usageOf(value: unknown): Usage | undefined {
   if (!isRecord(value)) return undefined
   const input = asNumber(value.input_tokens)
@@ -128,10 +150,13 @@ function usageOf(value: unknown): Usage | undefined {
   if (input === undefined && cacheRead === undefined && cacheWrite === undefined && output === undefined) {
     return undefined
   }
+  const creation = isRecord(value.cache_creation) ? value.cache_creation : undefined
+  const write1h = asNumber(creation?.ephemeral_1h_input_tokens)
   return {
     ...(input === undefined ? {} : { inputTokens: input }),
     ...(cacheRead === undefined ? {} : { cacheReadTokens: cacheRead }),
     ...(cacheWrite === undefined ? {} : { cacheWriteTokens: cacheWrite }),
+    ...(write1h === undefined ? {} : { cacheWrite1hTokens: write1h }),
     ...(output === undefined ? {} : { outputTokens: output }),
   }
 }

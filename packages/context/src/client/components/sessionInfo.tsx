@@ -17,6 +17,8 @@ import { makeRichText } from './richText'
 export interface SessionInfo {
   /** The harness identity as a node — the web app passes its mark plus label. */
   harness: ReactNode
+  /** The harness's plain name, for the copy that has to name it in a sentence. */
+  harnessName?: string | undefined
   model?: string | undefined
   provider?: string | undefined
   contextWindow?: number | undefined
@@ -66,7 +68,22 @@ export function makeSessionInfo(kit: ViewKit): (props: SessionInfoProps) => Reac
       rows.push(row('cwd', t('session.cwd'), info.cwd, info.cwd))
     }
     if (info.reportedCostUsd !== undefined && Number.isFinite(info.reportedCostUsd)) {
-      rows.push(row('cost', t('session.cost'), '$' + info.reportedCostUsd.toFixed(4), t('session.costTip')))
+      // The one figure on this card that is NOT about the shown agent: the
+      // harness bills a session, subagents included, so the row says whose
+      // number it is and what it covers. It is always ≥ the Context Stats
+      // estimate, which can only price the calls the transcript records.
+      const name = info.harnessName
+      rows.push(
+        <div key="cost" className="lc-pi-row lc-pi-cost">
+          <div className="lc-pi-label">
+            {name === undefined || name === '' ? t('session.cost') : t('session.costReported', { harness: name })}
+          </div>
+          <div className="lc-pi-value" title={t('session.costTip')}>
+            {'$' + info.reportedCostUsd.toFixed(4)}
+            <span className="lc-pi-scope">{t('session.costScope')}</span>
+          </div>
+        </div>,
+      )
     }
     if (info.resumeCommand !== undefined && info.resumeCommand !== '') {
       // The command is the one row worth carrying away, so it pairs the

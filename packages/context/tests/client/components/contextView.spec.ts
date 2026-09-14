@@ -379,6 +379,55 @@ describe('ContextView — honesty markers', () => {
   })
 })
 
+describe('ContextView — the stats board’s population', () => {
+  const usage = { uncachedInputTokens: 100, outputTokens: 50, cacheReadTokens: 300, cacheWriteTokens: 0 }
+
+  function statsCard(container: HTMLElement) {
+    const card = queryAll(container, '.lc-card').find(c => text(c).includes(DICT_EN['stats.title']!))
+    assert.ok(card !== undefined)
+    return card
+  }
+
+  function cacheHit(container: HTMLElement): string {
+    const cell = queryAll(statsCard(container), '.lc-stat')
+      .find(c => c.querySelector('.lc-stat-label')?.textContent?.startsWith(DICT_EN['stats.cacheHit']!))
+    return cell?.querySelector('.lc-stat-value')?.textContent ?? ''
+  }
+
+  test('without sessionUsage the cache-hit cell reads the shown agent’s own requests', async () => {
+    const View = viewOf()
+    const m = await mount(h(View, props()))
+    // The fixture's one usage-bearing request: prompt 350 of which 100 read.
+    assert.equal(cacheHit(m.container), '28.57%')
+    await m.unmount()
+  })
+
+  test('sessionUsage moves the cache-hit cell to the host’s population', async () => {
+    const View = viewOf()
+    const m = await mount(h(View, props({ sessionUsage: usage })))
+    // 300 read of 400 billed input.
+    assert.equal(cacheHit(m.container), '75.00%')
+    await m.unmount()
+  })
+
+  test('an explicit null sessionUsage dashes the cell rather than falling back', async () => {
+    const View = viewOf()
+    const m = await mount(h(View, props({ sessionUsage: null })))
+    assert.equal(cacheHit(m.container), '—')
+    await m.unmount()
+  })
+
+  test('the Token Stats card stays on the shown agent whatever the board reads', async () => {
+    const View = viewOf()
+    const m = await mount(h(View, props({ sessionUsage: { ...usage, outputTokens: 999_999 } })))
+    const tokens = queryAll(m.container, '.lc-card').find(c => text(c).includes(DICT_EN['tokens.title']!))
+    assert.ok(tokens !== undefined)
+    // The session-wide output never reaches the per-window card.
+    assert.ok(!text(tokens).includes('1.0M'), text(tokens))
+    await m.unmount()
+  })
+})
+
 describe('ContextView — the agent network', () => {
   test('a child node navigates through onOpenAgent', async () => {
     const opened: string[] = []
@@ -401,6 +450,36 @@ describe('ContextView — the agent network', () => {
     assert.ok(text(crumb).includes('Main session'))
     await click(crumb)
     assert.deepEqual(opened, ['main'])
+    await m.unmount()
+  })
+
+  test('showBreadcrumb false lets a host own the lineage instead', async () => {
+    const View = viewOf()
+    const m = await mount(h(View, props({ currentAgentId: 'kid', showBreadcrumb: false })))
+    assert.equal(queryAll(m.container, '.lc-crumb').length, 0)
+    // The gear stays — the top bar is not only the crumb.
+    assert.equal(queryAll(m.container, '.lc-settings-gear').length, 1)
+    await m.unmount()
+  })
+
+  test('a host-supplied cost overrides the shown agent’s own, with the per-agent bubble', async () => {
+    const share = (uncached: number) => ({
+      'deepseek-official': { 'deepseek-v4-flash': { peak: { uncached, cacheRead: 0, cacheWrite: 0, output: 0 } } },
+    })
+    const View = viewOf()
+    const m = await mount(h(View, props({
+      timeline: richTimeline({ cost: share(1_000_000) }),
+      cost: share(3_000_000),
+      costParts: [
+        { id: 'main', label: 'Main session', cost: share(1_000_000) },
+        { id: 'kid', label: 'Explore the repo', cost: share(2_000_000) },
+      ],
+    })))
+    // The price book stays dormant in tests, so the cell dashes; what this
+    // pins is that the SESSION-wide figure reached the card, not the agent's.
+    const statsCard = queryAll(m.container, '.lc-card').find(c => text(c).includes(DICT_EN['stats.title']!))
+    assert.ok(statsCard !== undefined)
+    assert.ok(text(statsCard).includes(DICT_EN['stats.cost']!))
     await m.unmount()
   })
 

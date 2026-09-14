@@ -209,6 +209,34 @@ describe('claude synthesizer — request grouping', () => {
     })
   })
 
+  it('carries the 1h share of cache_creation as its own bucket', () => {
+    const events = run([
+      human(0, 'hello'),
+      assistantBlock(5, {
+        requestId: 'r1', index: 0, block: textBlock('a'), stopReason: 'end_turn',
+        usage: {
+          ...usage(10, 20, 30, 5),
+          cache_creation: { ephemeral_1h_input_tokens: 25, ephemeral_5m_input_tokens: 5 },
+        },
+      }),
+      human(9, 'next'),
+    ])
+    expect(data(first(events, 'assistant/message')).usage).toEqual({
+      inputTokens: 10, cacheReadTokens: 20, cacheWriteTokens: 30, cacheWrite1hTokens: 25, outputTokens: 5,
+    })
+  })
+
+  it('omits the 1h bucket when the record carries no cache_creation breakdown', () => {
+    const events = run([
+      human(0, 'hello'),
+      assistantBlock(5, { requestId: 'r1', index: 0, block: textBlock('a'), stopReason: 'end_turn', usage: usage(10, 20, 30, 5) }),
+      human(9, 'next'),
+    ])
+    expect(data(first(events, 'assistant/message')).usage).toEqual({
+      inputTokens: 10, cacheReadTokens: 20, cacheWriteTokens: 30, outputTokens: 5,
+    })
+  })
+
   it('does not split a group on a non-null stop_reason', () => {
     const events = run([
       human(0, 'hello'),

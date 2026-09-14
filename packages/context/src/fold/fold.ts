@@ -38,6 +38,7 @@ import type {
   Category,
   ContextEventRecord,
   ContextTimelineDetail,
+  CostBucketTotals,
   CostModelUsage,
   FileOpRecord,
   RequestRecord,
@@ -779,6 +780,7 @@ interface UsageLike {
   inputTokens?: unknown
   cacheReadTokens?: unknown
   cacheWriteTokens?: unknown
+  cacheWrite1hTokens?: unknown
   outputTokens?: unknown
 }
 
@@ -787,6 +789,8 @@ interface BilledUsage {
   input: number
   cacheRead: number
   cacheWrite: number
+  /** The 1h-TTL SUBSET of `cacheWrite` (clamped ≤ cacheWrite) — see CostBucketTotals.cacheWrite1h. */
+  cacheWrite1h: number
   output: number
 }
 
@@ -843,12 +847,17 @@ function accumulateCost(st: TimelineState, time: number, usage: BilledUsage): vo
   const periods = models[model] ?? {}
   const b = periods[period] ?? { uncached: 0, cacheRead: 0, cacheWrite: 0, output: 0 }
   const nextPeriods: CostModelUsage = { ...periods }
-  nextPeriods[period] = {
+  const next: CostBucketTotals = {
     uncached: b.uncached + usage.input,
     cacheRead: b.cacheRead + usage.cacheRead,
     cacheWrite: b.cacheWrite + usage.cacheWrite,
     output: b.output + usage.output,
   }
+  // The 1h share rides along only once a 1h write actually happened: a bucket
+  // that never saw one keeps the dsh shape exactly (four keys).
+  const write1h = (b.cacheWrite1h ?? 0) + usage.cacheWrite1h
+  if (write1h > 0) next.cacheWrite1h = write1h
+  nextPeriods[period] = next
   const nextModels: Record<string, CostModelUsage> = { ...models, [model]: nextPeriods }
   st.cost = { ...(st.cost ?? {}), [provider]: nextModels }
 }
@@ -1358,6 +1367,10 @@ export function applyTimeline(state: TimelineState, event: TimelineEvent, bounds
           const cacheRead = tokenCountOf(usage.cacheReadTokens)
           const cacheWrite = tokenCountOf(usage.cacheWriteTokens)
           const output = tokenCountOf(usage.outputTokens)
+          // The 1h-TTL share is a SUBSET of the write bucket, never an extra
+          // one: clamping here means a mis-reporting producer can only shift
+          // tokens between the two write rates, never invent billed tokens.
+          const cacheWrite1h = Math.min(tokenCountOf(usage.cacheWrite1hTokens) ?? 0, cacheWrite ?? 0)
           // Any readable bucket is a billing sample (an output-only sample
           // bills prompt 0). A fully unreadable object is treated as absent, so
           // a fabricated 0 never reaches the client's derived-occupancy anchor.
@@ -1374,6 +1387,7 @@ export function applyTimeline(state: TimelineState, event: TimelineEvent, bounds
               input: input ?? 0,
               cacheRead: cacheRead ?? 0,
               cacheWrite: cacheWrite ?? 0,
+              cacheWrite1h,
               output: output ?? 0,
             })
           }

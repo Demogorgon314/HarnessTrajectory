@@ -12,8 +12,8 @@ import { useCallback, useMemo } from 'react'
 import type { HarnessKind, SessionFileRef, SessionSummary } from '@harness-trajectory/core'
 import { childKeyOf, type AgentSpawn, type ContextTimeline, type SynthMeta } from '@harness-trajectory/context'
 import {
-  ContextView, createContextSettings, createContextTranslate, headlineOf,
-  type AgentNodeInput, type ContextLocale, type ContextViewProps, type SessionInfo,
+  ContextView, createContextSettings, createContextTranslate, headlineOf, mergeCostUsage, usageOfRequests,
+  type AgentNodeInput, type ContextLocale, type ContextViewProps, type CostPart, type SessionInfo,
 } from '@harness-trajectory/context/client'
 import { useSnapshotSelector } from '@harness-trajectory/ui'
 import { HarnessMark, harnessMeta } from './harnesses.tsx'
@@ -162,6 +162,7 @@ export function ContextPane(props: ContextPaneProps) {
           {harness.label}
         </span>
       ),
+      harnessName: harness.label,
       ...(meta?.model !== undefined ? { model: meta.model } : timeline?.model !== undefined ? { model: timeline.model } : {}),
       ...(meta?.provider ?? timeline?.provider ? { provider: meta?.provider ?? timeline?.provider } : {}),
       ...(timeline?.contextWindow !== undefined ? { contextWindow: timeline.contextWindow } : {}),
@@ -174,6 +175,31 @@ export function ContextPane(props: ContextPaneProps) {
       ...(meta?.reportedCostUsd !== undefined ? { reportedCostUsd: meta.reportedCostUsd } : {}),
     }
   }, [kind, meta, timeline, summary, props.id, mainFile, currentId])
+
+  // Cost is the one figure on the board that is about the SESSION rather than
+  // one context window: a subagent's spend is the session's spend. On the main
+  // agent the cell prices the whole family's summed usage and itemizes it per
+  // agent; a selected child shows its own (`cost` left undefined, so the view
+  // falls back to that file's timeline).
+  const onMainAgent = mainFile === null || currentId === mainFile.id
+  const costParts = useMemo<CostPart[]>(
+    () => agents.map(row => ({ id: row.id, label: row.label, cost: session.timelineOf(row.id)?.cost })),
+    [agents, session, revision],
+  )
+  const cost = useMemo(
+    () => (onMainAgent ? mergeCostUsage(costParts.map(part => part.cost)) : undefined),
+    [onMainAgent, costParts],
+  )
+  // The cache-hit cell sits beside the cost cell on the same card, so it takes
+  // the same population: every folded file's requests while the main agent is
+  // shown, that one file's while a child is. (The Token Stats card keeps the
+  // shown agent's own sums — it describes one context window.)
+  const sessionUsage = useMemo(
+    () => (onMainAgent
+      ? usageOfRequests(files.flatMap(file => session.timelineOf(file.id)?.requests ?? []))
+      : undefined),
+    [onMainAgent, files, session, revision],
+  )
 
   const onOpenAgent = props.onOpenAgent
   const openAgent = useCallback((fileId: string) => {
@@ -195,6 +221,12 @@ export function ContextPane(props: ContextPaneProps) {
     t,
     locale: props.locale,
     settings,
+    cost,
+    costParts: onMainAgent ? costParts : undefined,
+    sessionUsage,
+    // The pane header already carries the session → agent lineage for both
+    // tabs, so the dashboard's own back link would only stack on it.
+    showBreadcrumb: false,
   }
   return <ContextView {...viewProps} />
 }

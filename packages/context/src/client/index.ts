@@ -12,6 +12,9 @@
 export { ContextView, makeContextView, joinNodesOf, usageOfRequests } from './components/contextView.tsx'
 export type { ContextViewProps } from './components/contextView.tsx'
 export type { SessionInfo } from './components/sessionInfo.tsx'
+export type { CostPart } from './components/statsContext.tsx'
+
+export { mergeCostUsage } from './costMerge.ts'
 
 export { createContextTranslate, DICT_EN, DICT_ZH } from './i18n.ts'
 export type { ContextLocale, Translate } from './i18n.ts'

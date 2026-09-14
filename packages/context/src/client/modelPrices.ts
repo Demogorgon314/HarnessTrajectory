@@ -47,11 +47,16 @@ export function pricesBookOf(value: unknown): ModelPrices | null {
       const miss = rateOf(cost.input)
       const out = rateOf(cost.output)
       if (miss === null || out === null) continue
+      // `cache_write` is the 5-MINUTE write rate. The registry publishes no
+      // 1h rate today, so the key is read opportunistically and stays absent
+      // otherwise — cost.ts then derives the 1h rate from the input rate.
+      const write1h = rateOf(cost.cache_write_1h)
       models[id] = {
         hit: rateOf(cost.cache_read) ?? miss,
         miss,
         write: rateOf(cost.cache_write) ?? miss,
         out,
+        ...(write1h === null ? {} : { write1h }),
       }
     }
     if (Object.keys(models).length > 0) book[providerId] = models

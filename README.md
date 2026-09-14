@@ -1,9 +1,9 @@
 # Harness Trajectory
 
-A local viewer for agent sessions. It scans the transcripts that **Claude Code** and
-**Codex** write on this machine, folds them into a turn-aware event ledger with an
-interactive timing overview and a context dashboard, and follows sessions that are
-still running.
+A local viewer for agent sessions. It scans the transcripts that **Claude Code**,
+**Codex**, and **Kimi Code** write on this machine, folds them into a turn-aware event
+ledger with an interactive timing overview and a context dashboard, and follows
+sessions that are still running.
 
 The ledger, timeline, inspector, and toolbar are a port of the Trajectory view from
 [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) (`ui-trajectory`,
@@ -27,9 +27,10 @@ pnpm build         # builds every package and bundles the web UI into apps/serve
 pnpm start         # http://127.0.0.1:5170
 ```
 
-Transcript roots default to `~/.claude/projects` and `~/.codex/sessions`; the harness
-overrides `CLAUDE_CONFIG_DIR` and `CODEX_HOME` are honoured, and
-`HARNESS_TRAJECTORY_CLAUDE_ROOT` / `HARNESS_TRAJECTORY_CODEX_ROOT` point at other
+Transcript roots default to `~/.claude/projects`, `~/.codex/sessions`, and
+`~/.kimi-code/sessions`; the harness overrides `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, and
+`KIMI_CODE_HOME` are honoured, and `HARNESS_TRAJECTORY_CLAUDE_ROOT` /
+`HARNESS_TRAJECTORY_CODEX_ROOT` / `HARNESS_TRAJECTORY_KIMI_ROOT` point at other
 directories. `--port` / `HARNESS_TRAJECTORY_PORT` change the port.
 
 ## What you get
@@ -44,15 +45,18 @@ directories. `--port` / `HARNESS_TRAJECTORY_PORT` change the port.
 - **Live follow**: the server tails transcript files and streams appended lines over
   SSE; in-flight assistant output and running tool calls render as they happen.
 - **Subagents** nest under the call that spawned them: Claude Code `Agent` transcripts
-  (`<session>/subagents/agent-*.jsonl`, older `agent-*.jsonl`) and Codex child threads
-  (`parent_thread_id`) become sub-tool rows of the parent record. Claude children are
-  bound to their call by the `toolUseId` in the sidecar `.meta.json`, the `agentId` in
-  the parent's launch receipt, or a fork's inherited tool result, so parallel and
-  relaunched agents land on the right row and an in-flight subagent tool shows before
-  its result lands. The pane header lists every run (description, type, model, status
-  from the parent's receipts and task notifications, tool count, duration); picking one
-  opens that transcript as a session of its own, with a breadcrumb back to the parent.
-  Subagent transcripts created while you watch are picked up live.
+  (`<session>/subagents/agent-*.jsonl`, older `agent-*.jsonl`), Codex child threads
+  (`parent_thread_id`), and Kimi Code child transcripts
+  (`<session>/agents/<agentId>/wire.jsonl`) become sub-tool rows of the parent record.
+  Claude children are bound to their call by the `toolUseId` in the sidecar
+  `.meta.json`, the `agentId` in the parent's launch receipt, or a fork's inherited
+  tool result; Kimi children are bound by `task.started` records of kind `agent`
+  (`info.parentToolCallId` → `info.agentId`); so parallel and relaunched agents land
+  on the right row and an in-flight subagent tool shows before its result lands. The
+  pane header lists every run (description, type, model, status from the parent's
+  receipts and task notifications, tool count, duration); picking one opens that
+  transcript as a session of its own, with a breadcrumb back to the parent. Subagent
+  transcripts created while you watch are picked up live.
 - **Context tab** (next to Trajectory in the session header): Context Stats (turns, steps,
   human inputs, live tool calls, cache hit, cost), Session Info (harness, model, context
   window, CLI version, resume command), Token Stats and Timing Stats donuts, Current
@@ -68,7 +72,7 @@ directories. `--port` / `HARNESS_TRAJECTORY_PORT` change the port.
 ## Layout
 
 ```
-packages/core     contract types + Claude Code and Codex adapters (pure TS, runs in the browser)
+packages/core     contract types + Claude Code, Codex, and Kimi Code adapters (pure TS, runs in the browser)
 packages/ui       the ported trajectory view, vendored primitives (markdown, JSON tree, tooltip, icons), theme CSS
 packages/context  the ported dsh-context dashboard: fold (src/fold), transcript → fold-event synthesizers (src/synth), client (src/client)
 apps/server       Hono server: transcript discovery, metadata index, file tailing, SSE, static UI
@@ -80,13 +84,14 @@ reads a memoized `TrajectorySnapshot` (nodes, requests, partial output, running 
 Replays merge the main transcript and its child transcripts by timestamp so subagents
 land where they actually happened.
 
-The Context tab runs on the same line stream: a per-harness synthesizer turns each
-transcript file into dsh-context's fold events (`request/header`, `user/message`,
-`assistant/message`, `tool/call`, `tool/result`, `compaction/summary`, …) and the
-vendored fold produces the dashboard's timeline. Every file (main and each subagent) is
-folded on its own, exactly like a dsh subagent session. Token figures follow the
-dsh-context convention: per-request prompt, cache, and output tokens are the provider's
-own numbers; the per-category split is an estimate (≈), anchored to the provider total.
+The Context tab runs on the same line stream: a synthesizer for each harness (Claude
+Code, Codex, Kimi Code) turns each transcript file into dsh-context's fold events
+(`request/header`, `user/message`, `assistant/message`, `tool/call`, `tool/result`,
+`compaction/summary`, …) and the vendored fold produces the dashboard's timeline. Every
+file (main and each subagent) is folded on its own, exactly like a dsh subagent
+session. Token figures follow the dsh-context convention: per-request prompt, cache,
+and output tokens are the provider's own numbers; the per-category split is an
+estimate (≈), anchored to the provider total.
 
 ## Develop
 
@@ -102,16 +107,29 @@ repository.
 
 - Claude Code does not record first-token time (its records land at block completion), so
   TTFT stays unattributed for Claude sessions; the thinking / answer / tool-args split
-  comes from block completion times. Codex reports both.
+  comes from block completion times. Codex reports both. Kimi Code records TTFT and
+  decode timing per step (`llmFirstTokenLatencyMs`, `llmStreamDurationMs`), but its tool
+  durations are not recoverable: loop events (parts, tool calls, tool results) are
+  flushed to the transcript only after the response completes, so their recorded times
+  are not the moments they actually happened.
 - Claude Code records the system prompt and tool schemas only in newer transcripts
   (`prompt_snapshot` attachments); older sessions show the System Prompt as a derived
   remainder (actual prompt tokens minus the estimated messages, marked "≈ derived") and
   Tool Schemas as "not recorded". Codex records its base instructions but no tool schemas.
+  Kimi Code records both the system prompt and the tool schemas actually sent on every
+  session (nothing derived).
 - Claude Code does not record the context window; the dashboard assumes 200k tokens and
   switches to 1M when the model carries a `[1m]` tag or a request exceeds 200k. Codex
-  reports its window per turn.
-- Cost uses list prices fetched from models.dev at page load (blank offline); a Claude
-  `cost-state` record, when present, is shown as the reported cost.
+  reports its window per turn. Kimi Code reports its window (`llm.request.maxTokens`)
+  per request as well.
+- Cost uses list prices fetched from models.dev at page load (blank offline). The main
+  session's cost includes every subagent (the tooltip breaks it down per agent); 1-hour
+  cache writes are billed at twice the input rate, as Claude Code does; models missing
+  from the price list are named under the figure. A Claude `cost-state` record, when
+  present, is shown as the reported cost: it is session-wide and also counts calls the
+  transcript never records (interrupted requests, the background title model), so it
+  runs a few percent above the estimate. Kimi Code's subscription models
+  (`kimi-for-coding`) price at $0 on models.dev, so Cost reads $0 for those sessions.
 - Codex compaction summaries are encrypted in the rollout, so a compaction shows its
   retained history but no summary text.
 - Whole sessions load into the browser (a 60 MB rollout takes a few seconds); the
@@ -127,5 +145,7 @@ The vendored `packages/ui` sources derive from deepseek-harness (MIT); see
 [dsh-context](https://github.com/bowenliang123/dsh-context) and is distributed under the
 Apache License 2.0; see `packages/context/LICENSE` and `packages/context/NOTICE`. Its
 stylesheets use [Tailwind CSS](https://tailwindcss.com) utilities (MIT). Harness brand marks in `apps/web/src/harnesses.tsx`
-use path data from [Simple Icons](https://simpleicons.org) (CC0) and
-[lobe-icons](https://github.com/lobehub/lobe-icons) (MIT); the marks themselves belong to their owners. Everything else is MIT as well.
+use path data from [Simple Icons](https://simpleicons.org) (CC0, the Claude sunburst) and
+[lobe-icons](https://github.com/lobehub/lobe-icons) (MIT, the Codex blossom and the Kimi mark);
+the marks themselves belong to Anthropic, OpenAI, and Moonshot AI respectively and identify
+their harnesses here. Everything else is MIT as well.

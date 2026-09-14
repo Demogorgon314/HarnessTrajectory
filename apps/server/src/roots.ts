@@ -12,14 +12,19 @@ export interface HarnessRoot {
 
 /**
  * Resolve transcript roots, honouring the same overrides the harnesses use
- * (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`) plus explicit `HARNESS_TRAJECTORY_*` overrides.
+ * (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `KIMI_CODE_HOME`) plus explicit
+ * `HARNESS_TRAJECTORY_*` overrides.
+ *
+ * Defaults: `~/.claude/projects`, `~/.codex/sessions`, `~/.kimi-code/sessions`.
  */
 export function defaultRoots(env: NodeJS.ProcessEnv = process.env): HarnessRoot[] {
   const home = homedir()
   const claudeConfig = env['CLAUDE_CONFIG_DIR'] ?? join(home, '.claude')
   const codexHome = env['CODEX_HOME'] ?? join(home, '.codex')
+  const kimiHome = env['KIMI_CODE_HOME'] ?? join(home, '.kimi-code')
   return [
     { kind: 'claude', dir: resolve(env['HARNESS_TRAJECTORY_CLAUDE_ROOT'] ?? join(claudeConfig, 'projects')) },
     { kind: 'codex', dir: resolve(env['HARNESS_TRAJECTORY_CODEX_ROOT'] ?? join(codexHome, 'sessions')) },
+    { kind: 'kimi', dir: resolve(env['HARNESS_TRAJECTORY_KIMI_ROOT'] ?? join(kimiHome, 'sessions')) },
   ]
 }

@@ -5,8 +5,8 @@
  */
 
 import {
-  asArray, asString, classifyInjectedUser, isCodexHumanPrompt, isRecord, parseJsonLine, parseTime,
-  titleFrom, type HarnessKind,
+  asArray, asString, classifyInjectedUser, isCodexHumanPrompt, isRecord, kimiMessageClass, parseJsonLine,
+  parseTime, titleFrom, type HarnessKind,
 } from '@harness-trajectory/core'
 
 export interface FileHead {
@@ -36,7 +36,11 @@ export interface MetaScanner {
 }
 
 export function createMetaScanner(kind: HarnessKind): MetaScanner {
-  return kind === 'claude' ? claudeMetaScanner() : codexMetaScanner()
+  switch (kind) {
+    case 'claude': return claudeMetaScanner()
+    case 'codex': return codexMetaScanner()
+    case 'kimi': return kimiMetaScanner()
+  }
 }
 
 function noteTime(state: MetaState, value: unknown): void {
@@ -123,8 +127,68 @@ function codexMetaScanner(): MetaScanner {
   }
 }
 
+/** Text of a Kimi `message.content` array (`[{ type: 'text', text }]`). */
+function kimiText(content: unknown): string {
+  return (asArray(content) ?? [])
+    .flatMap(block => (isRecord(block) && block['type'] === 'text' ? [asString(block['text']) ?? ''] : []))
+    .join('\n')
+}
+
+/** `kimi-code/k3` → `k3`; the display model before the first `llm.request`. */
+function aliasTail(alias: string | undefined): string | undefined {
+  if (alias === undefined) return undefined
+  const slash = alias.lastIndexOf('/')
+  return slash === -1 ? alias : alias.slice(slash + 1)
+}
+
+/**
+ * Kimi wire records are `{ type, time, agentId, ...payload }` with the payload
+ * fields at the top level; `time` is epoch milliseconds.
+ */
+function kimiMetaScanner(): MetaScanner {
+  const state = emptyMeta()
+  return {
+    state,
+    push(line) {
+      const record = parseJsonLine(line)
+      if (!isRecord(record)) return
+      noteTime(state, record['time'])
+      switch (record['type']) {
+        case 'metadata':
+          noteTime(state, record['created_at'])
+          break
+        case 'profile.bind': {
+          const environment = record['environmentDisclosure']
+          if (isRecord(environment)) state.cwd ??= asString(environment['cwd']) ?? null
+          state.model ??= aliasTail(asString(record['modelAlias'])) ?? null
+          break
+        }
+        case 'llm.request':
+          // `provider` here is the wire protocol ('openai'), never the vendor.
+          state.model ??= asString(record['model']) ?? null
+          break
+        case 'context.append_message': {
+          const message = record['message']
+          if (!isRecord(message) || message['role'] !== 'user') break
+          // Human vs injected/task/skill/plugin/compaction is decided by the origin, never by text.
+          if (kimiMessageClass(message['origin']).kind !== 'human') break
+          const text = kimiText(message['content'])
+          if (text.trim() === '') break
+          state.promptCount += 1
+          if (state.title === null) state.title = titleFrom(text)
+          break
+        }
+        default:
+          break
+      }
+    },
+  }
+}
+
 /** Read identity facts from the first record of a transcript. */
 export function readHead(kind: HarnessKind, firstLine: string): FileHead {
+  // Kimi identity is path-derived (`session_<id>/agents/<agentId>/wire.jsonl`); nothing to probe.
+  if (kind === 'kimi') return { id: null, parentId: null }
   const record = parseJsonLine(firstLine)
   if (!isRecord(record)) return { id: null, parentId: null }
   if (kind === 'codex') {

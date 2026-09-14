@@ -57,6 +57,11 @@ export interface SubagentRow {
   toolCalls: number
 }
 
+/** The first characters of a session id, past any harness prefix (Kimi ids start with `session_`). */
+function shortSessionId(id: string): string {
+  return id.replace(/^session_/, '').slice(0, 8)
+}
+
 function shortAgentId(agentId: string): string {
   const name = agentId.split('/').pop() ?? agentId
   return name.startsWith('agent-') ? name.slice('agent-'.length) : name
@@ -213,23 +218,45 @@ export function SessionPane({ route, summary: listSummary, onNavigate, t, locale
   const resumeCommand = harnessMeta(kind).resumeCommand({ id, cwd: summary?.cwd ?? null })
   const rows = useMemo(() => subagentRows(state.subagents, state.children), [state.subagents, state.children])
   const sessionLive = summary?.live === true
-  // The subagent view folds one child file; its facts come from the server's child list.
-  const self = file === null ? undefined : state.children.find(child => child.file.id === file)
-  const agent = file === null ? undefined : (state.files[0]?.agent ?? self?.file.agent)
-  const agentTitle = file === null ? null : (agent?.description ?? shortAgentId(file))
-  const openChild = (fileId: string) => { onNavigate({ kind, id, file: fileId }) }
-  // The trajectory's own subagent view streams one file; the Context tab folds
-  // the whole session, so it is offered only on the session address.
-  const tabs: readonly SessionTab[] = file === null ? ['trajectory', 'context'] : ['trajectory']
+  /*
+   * The subagent a view is ABOUT, whichever tab shows it: the trajectory folds
+   * that one file (`route.file`, a stream of its own), the Context tab folds
+   * the whole session and picks one of its folds (`route.agent`). The header,
+   * the tab strip and the catalog all read this one value, so the two tabs
+   * stay on the same agent as the reader moves between them.
+   */
+  const agentFile = tab === 'context' ? route.agent ?? null : file
+  // The agent's facts: off the streamed file list when it carries the file,
+  // else off the server's child listing (the whole-session stream's case).
+  const self = agentFile === null ? undefined : state.children.find(child => child.file.id === agentFile)
+  const agent = agentFile === null
+    ? undefined
+    : (state.files.find(known => known.id === agentFile)?.agent ?? self?.file.agent)
+  const agentTitle = agentFile === null ? null : (agent?.description ?? shortAgentId(agentFile))
+  // Opening a child keeps the reader in the tab they are reading.
+  const openChild = (fileId: string) => {
+    onNavigate(tab === 'context' ? { kind, id, tab: 'context', agent: fileId } : { kind, id, file: fileId })
+  }
+  const tabs: readonly SessionTab[] = ['trajectory', 'context']
+  // Switching tabs carries the agent across: the Context tab addresses it as a
+  // fold of the session, the trajectory as a stream of its own.
   const selectTab = (next: SessionTab) => {
-    onNavigate(next === 'context' ? { kind, id, tab: 'context' } : { kind, id })
+    if (next === 'context') {
+      onNavigate(agentFile === null ? { kind, id, tab: 'context' } : { kind, id, tab: 'context', agent: agentFile })
+      return
+    }
+    onNavigate(agentFile === null ? { kind, id } : { kind, id, file: agentFile })
   }
   return (
     <div className={css.pane}>
       <header className={css.paneHeader}>
-        {file !== null && (
+        {agentFile !== null && (
           <nav className={css.crumbs} aria-label="Session lineage">
-            <button type="button" className={css.crumbLink} onClick={() => { onNavigate({ kind, id }) }}>
+            <button
+              type="button"
+              className={css.crumbLink}
+              onClick={() => { onNavigate(tab === 'context' ? { kind, id, tab: 'context' } : { kind, id }) }}
+            >
               {summary?.title ?? id}
             </button>
             <span className={css.crumbSeparator} aria-hidden="true">/</span>
@@ -239,10 +266,10 @@ export function SessionPane({ route, summary: listSummary, onNavigate, t, locale
         <div className={css.paneTitleRow}>
           <span className={css.badge}>
             <HarnessMark kind={kind} size={14} />
-            {file === null ? harnessMeta(kind).label : (agent?.agentType ?? 'subagent')}
+            {agentFile === null ? harnessMeta(kind).label : (agent?.agentType ?? 'subagent')}
           </span>
-          <h1 className={css.paneTitle} title={file === null ? (summary?.title ?? id) : file}>
-            {file === null ? (summary?.title ?? id) : agentTitle}
+          <h1 className={css.paneTitle} title={agentFile === null ? (summary?.title ?? id) : agentFile}>
+            {agentFile === null ? (summary?.title ?? id) : agentTitle}
           </h1>
           {sessionLive && <span className={css.live}>live</span>}
           <span className={css.paneStatus} data-connected={state.connected || undefined}>
@@ -261,28 +288,28 @@ export function SessionPane({ route, summary: listSummary, onNavigate, t, locale
           {summary?.cwd !== null && summary?.cwd !== undefined && (
             <span className={css.paneMetaItem} title={summary.cwd}><code>{summary.cwd}</code></span>
           )}
-          {file !== null && agent?.model !== undefined && (
+          {agentFile !== null && agent?.model !== undefined && (
             <span className={css.paneMetaItem}>{agent.model}</span>
           )}
-          {file === null && summary?.model !== null && summary?.model !== undefined && (
+          {agentFile === null && summary?.model !== null && summary?.model !== undefined && (
             <span className={css.paneMetaItem}>{summary.model}</span>
           )}
-          {file === null && started !== null && (
+          {agentFile === null && started !== null && (
             <span className={css.paneMetaItem}>{new Date(started).toLocaleString()}</span>
           )}
-          {file === null && summary !== null && (
+          {agentFile === null && summary !== null && (
             <span className={css.paneMetaItem}>
               {summary.promptCount} prompts · {formatBytes(summary.bytes)}
             </span>
           )}
-          {file !== null && self !== undefined && (
+          {agentFile !== null && self !== undefined && (
             <span className={css.paneMetaItem}>
               {formatBytes(self.bytes)} · last write {relativeTime(self.updatedAt)}
             </span>
           )}
           <span className={css.paneMetaItem}>{state.lines} lines</span>
-          <span className={css.paneMetaItem} title={file ?? id}>{file === null ? id.slice(0, 8) : shortAgentId(file)}</span>
-          {file === null && (
+          <span className={css.paneMetaItem} title={agentFile ?? id}>{agentFile === null ? shortSessionId(id) : shortAgentId(agentFile)}</span>
+          {agentFile === null && (
             <button
               type="button"
               className={css.paneCopy}

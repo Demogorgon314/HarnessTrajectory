@@ -13,7 +13,7 @@
  */
 
 import { createElement as h, useCallback, useLayoutEffect, useMemo, useRef, useState, type ReactElement } from 'react'
-import type { ContextEventRecord, ContextHeaders, ContextTimeline, HeaderEpochContent, RequestRecord, SurfaceNode, TokenUsage } from '../../shared/types'
+import type { ContextEventRecord, ContextHeaders, ContextTimeline, HeaderEpochContent, RequestRecord, SessionCostUsage, SurfaceNode, TokenUsage } from '../../shared/types'
 import type { ContentBlock } from '../../fold/event'
 import { briefNodes, briefOf } from '../brief'
 import { headlineOf } from '../headline'
@@ -36,6 +36,7 @@ import type { SessionInfo } from './sessionInfo'
 import { makeSettingsPopover } from './settingsCard'
 import { makeRequestDetail } from './requestDetail'
 import { countsOfRecords, makeStatsContext } from './statsContext'
+import type { CostPart } from './statsContext'
 import { makeStatsTiming } from './statsTiming'
 import { makeStatsTokens } from './statsTokens'
 import { makeLegend, makeStackedBar } from './stackedBar'
@@ -43,6 +44,7 @@ import { aggregateByTurn, attachMarkers, makeTrendChart, turnStepsOf } from './t
 import { makeErrorBoundary } from './errorBoundary'
 
 export type { SessionInfo } from './sessionInfo'
+export type { CostPart } from './statsContext'
 
 // The Context view scrolls inside its own `.lc-root`; a module-level
 // per-agent position ledger survives tab switches and agent hops, restored
@@ -71,6 +73,30 @@ export interface ContextViewProps {
   t: Translate
   locale: ContextLocale
   settings: ContextSettings
+  /**
+   * The billed totals the Cost cell prices. A session is one transcript per
+   * agent, so a host showing the MAIN agent passes the whole family's summed
+   * usage (`mergeCostUsage`); absent, the shown agent's own `timeline.cost`
+   * stands. Every other card stays per-agent — they describe one context window.
+   */
+  cost?: SessionCostUsage | undefined
+  /** Per-agent shares behind `cost`; two or more itemize the Cost cell's bubble. */
+  costParts?: readonly CostPart[] | undefined
+  /**
+   * The usage the Context Stats board's CACHE-HIT cell reads, when it should
+   * describe a different population than the shown agent's own requests — a
+   * host passing session-wide `cost` passes the session-wide usage too, so
+   * both cells of that card answer for the same population. Absent (the
+   * default) keeps the shown agent's own sums. The Token Stats card is never
+   * affected: it describes this one context window.
+   */
+  sessionUsage?: TokenUsage | null | undefined
+  /**
+   * Show the "← back to the main agent" link while a child is open (default
+   * true). A host whose own chrome already carries the session → agent lineage
+   * passes false so the two do not stack.
+   */
+  showBreadcrumb?: boolean | undefined
   /** Optional durable-image resolver for attachment cards. */
   loadImage?: ImageLoader | undefined
 }
@@ -345,10 +371,11 @@ export function makeContextView(
     const agents = props.agents
     const rootAgent = agents.find(a => a.parentId === undefined) ?? null
     const onCurrent = rootAgent === null || rootAgent.id === agentId
+    const withCrumb = props.showBreadcrumb !== false
 
     const header = (
       <div className="lc-cols lc-topbar">
-        {!onCurrent && rootAgent !== null
+        {withCrumb && !onCurrent && rootAgent !== null
           ? (
             <button
               type="button"
@@ -521,8 +548,18 @@ export function makeContextView(
             flex-wrap stacks each pair in a narrow pane at the shared 360px
             card floor. */}
         <div className="lc-cols lc-head">
-          <StatsContext counts={counts} humanInputs={data.humanInputs} toolCalls={data.toolCalls} usage={usage}
-            cost={data.cost} locale={props.locale} />
+          {/* The board's cost and cache-hit cells share one population: both
+              take the host's session-wide figures when it supplies them
+              (`undefined` — not null — means "the shown agent's own"). */}
+          <StatsContext
+            counts={counts}
+            humanInputs={data.humanInputs}
+            toolCalls={data.toolCalls}
+            usage={props.sessionUsage !== undefined ? props.sessionUsage : usage}
+            cost={props.cost ?? data.cost}
+            costParts={props.costParts}
+            locale={props.locale}
+          />
           <SessionInfoCard info={props.sessionInfo} />
         </div>
         <div className="lc-cols lc-head">

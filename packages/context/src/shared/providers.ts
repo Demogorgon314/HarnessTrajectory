@@ -7,6 +7,13 @@
  * into peak/off-peak periods. Only the renames live here — an id absent from
  * the table passes through verbatim, so `anthropic` and `openai` (the two
  * providers this viewer sees) resolve to themselves and always book `peak`.
+ *
+ * PORT NOTE — Kimi needs no entry: the Kimi synthesizer emits models.dev
+ * provider ids directly. `kimi-for-coding` (the `kimi-code/*` subscription
+ * aliases, whose rates are all $0) and `moonshotai` (the public list) are both
+ * real models.dev ids, so they pass through unchanged and book `peak`. The
+ * `kimi-coding` → `moonshotai` rename below is a legacy dsh provider id and is
+ * unrelated to the harness kind `kimi`.
  */
 
 const MODELS_DEV_PROVIDER_IDS: Record<string, string> = {

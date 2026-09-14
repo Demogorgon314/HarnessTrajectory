@@ -9,6 +9,14 @@
  * prices off-peak at half: the fold already split those buckets (peak =
  * list price), so DeepSeek's `off` buckets simply price at half here —
  * never any other provider's.
+ *
+ * Two things the registry does not spell out and this module supplies:
+ * a 1-HOUR cache write bills at 2x the input rate where the registry's
+ * `cache_write` is the 5-minute rate (see CACHE_WRITE_1H_FACTOR), and a
+ * ROUTED model id (`claude-opus-5[1m]`) prices off its untagged base id
+ * (see `untaggedModel`). Known residuals it does NOT model, because no
+ * registry publishes them: server-tool requests (web search / web fetch bill
+ * per request) and a harness's own regional surcharges.
  */
 
 import type { SessionCostUsage } from '../shared/types'
@@ -25,12 +33,26 @@ const USD_PER_CNY = 0.15
 const OFF_PEAK_FACTOR = 0.5
 
 /**
+ * A 1-HOUR cache write costs 2x the base input rate where the registry's
+ * `cache_write` is the 5-MINUTE rate (1.25x input). The registry publishes no
+ * 1h field, so the 1h rate is derived from the input rate by this factor —
+ * checked against every Anthropic price tier the harness ships (5/25, 3/15,
+ * 2/10, 10/50, 15/75: the 1h write is exactly 2x input in all of them) and
+ * against a real `cost-state` record, which reproduces to the cent only when
+ * the 1h share bills at 2x. Providers with no 1h TTL never fill the bucket,
+ * so the factor can never reach them.
+ */
+const CACHE_WRITE_1H_FACTOR = 2
+
+/**
  * Per-1M-token rates (USD): cache-hit input, cache-miss input, cache
  * write, output (reasoning included). Absent registry fields fall back to
  * the input rate (a provider that publishes no cache prices bills those
- * buckets as plain input).
+ * buckets as plain input). `write1h` is the 1-hour cache-write rate, present
+ * only when the registry publishes one — {@link write1hOf} derives it
+ * otherwise.
  */
-export interface PriceTriple { hit: number; miss: number; write: number; out: number }
+export interface PriceTriple { hit: number; miss: number; write: number; out: number; write1h?: number }
 
 /**
  * The client's price book: models.dev provider id → model id → USD rates,
@@ -45,6 +67,11 @@ export function toCurrency(usd: number, currency: CostCurrency): number {
   return currency === 'cny' ? usd / USD_PER_CNY : usd
 }
 
+/** The 1-hour cache-write rate: the registry's own figure, else {@link CACHE_WRITE_1H_FACTOR} x the input rate. */
+export function write1hOf(rate: PriceTriple): number {
+  return rate.write1h ?? rate.miss * CACHE_WRITE_1H_FACTOR
+}
+
 /** One rate triple at the half-price off-peak rate (the tooltip's `peak | off` pair). */
 export function offPeakOf(rate: PriceTriple): PriceTriple {
   return {
@@ -52,6 +79,7 @@ export function offPeakOf(rate: PriceTriple): PriceTriple {
     miss: rate.miss * OFF_PEAK_FACTOR,
     write: rate.write * OFF_PEAK_FACTOR,
     out: rate.out * OFF_PEAK_FACTOR,
+    ...(rate.write1h === undefined ? {} : { write1h: rate.write1h * OFF_PEAK_FACTOR }),
   }
 }
 
@@ -84,20 +112,44 @@ function lookup(models: Record<string, PriceTriple>, model: string): PriceTriple
 }
 
 /**
+ * A routed model id without its variant tag. A harness may name the ROUTE
+ * rather than the model — Claude Code spells the 1M-context route
+ * `claude-opus-5[1m]` and books its cost under that exact string — while the
+ * registry carries only the base id. Stripping the tag happens HERE, at
+ * lookup time, and nowhere else: the fold's cost keys stay byte-identical to
+ * the harness's own `cost-state.modelUsage` keys, so a per-model comparison
+ * against the harness's reported figure lines up 1:1 and the tooltip names
+ * the route the session actually took. Pricing off the base id is what the
+ * harness itself does (its rate tables are keyed by the base model; a tagged
+ * route has no separate price list).
+ */
+function untaggedModel(model: string): string {
+  return model.replace(/\[[^\]]*\]\s*$/, '')
+}
+
+/** `lookup` over the routed id, then over its untagged base id. */
+function lookupRouted(models: Record<string, PriceTriple>, model: string): PriceTriple | null {
+  const direct = lookup(models, model)
+  if (direct !== null) return direct
+  const base = untaggedModel(model)
+  return base === model ? null : lookup(models, base)
+}
+
+/**
  * The book's rates for one folded (provider, model) bucket, or null when
  * the book cannot price it: the dsh provider id resolves through
  * modelsDevProviderOf (unmapped ids pass through) and prices by model id —
- * exact, case-insensitive, or suffix; a provider the book does not carry
- * falls back to a cross-provider scan, priced only when exactly one branch
- * carries the model id.
+ * exact, case-insensitive, suffix, or (for a routed id) the same three over
+ * the untagged base id; a provider the book does not carry falls back to a
+ * cross-provider scan, priced only when exactly one branch carries the model.
  */
 export function priceOf(prices: ModelPrices | null | undefined, provider: string, model: string): PriceTriple | null {
   if (prices === null || prices === undefined) return null
   const direct = branchOf(prices, modelsDevProviderOf(provider))
-  if (direct !== null) return lookup(direct, model)
+  if (direct !== null) return lookupRouted(direct, model)
   let found: PriceTriple | null = null
   for (const models of Object.values(prices)) {
-    const rate = lookup(models, model)
+    const rate = lookupRouted(models, model)
     if (rate === null) continue
     if (found !== null) return null
     found = rate
@@ -108,10 +160,16 @@ export function priceOf(prices: ModelPrices | null | undefined, provider: string
 /**
  * Price the session's cumulative billed-token totals. Cache reads bill at
  * the hit rate, uncached input at the miss rate, cache writes at the write
- * rate, output (reasoning included) at the out rate; `off` buckets (the
- * Host splits DeepSeek's period-based list at fold time) price at half.
+ * rate — split so the 1h-TTL share bills at {@link write1hOf} — and output
+ * (reasoning included) at the out rate; `off` buckets (the Host splits
+ * DeepSeek's period-based list at fold time) price at half.
  * Null when nothing was priced (no usage folded, no book yet, or no model
  * the book prices), so the cell can show a dash.
+ *
+ * A model the book cannot price contributes NOTHING rather than a guess, so
+ * a mixed-model session's figure is a floor, not a total: pair every printed
+ * estimate with {@link unpricedCostModels} so the reader is told which models
+ * the figure leaves out.
  */
 export function estimateSessionCost(
   usage: SessionCostUsage | null | undefined,
@@ -134,14 +192,48 @@ export function estimateSessionCost(
       for (const period of ['peak', 'off'] as const) {
         const bucket = asRecord(periods[period])
         if (bucket === null) continue
+        // `cacheWrite1h` is a SUBSET of `cacheWrite`: the 1h share bills at
+        // the 1h rate and the remainder at the 5m rate, so the two can never
+        // between them bill more tokens than the write bucket holds.
+        const write = numOf(bucket.cacheWrite)
+        const write1h = Math.min(Math.max(0, numOf(bucket.cacheWrite1h)), write)
         const price = (numOf(bucket.cacheRead) * rate.hit + numOf(bucket.uncached) * rate.miss
-          + numOf(bucket.cacheWrite) * rate.write + numOf(bucket.output) * rate.out) / 1e6
+          + (write - write1h) * rate.write + write1h * write1hOf(rate)
+          + numOf(bucket.output) * rate.out) / 1e6
         total += offPeak && period === 'off' ? price * OFF_PEAK_FACTOR : price
         any = true
       }
     }
   }
   return any ? toCurrency(total, currency) : null
+}
+
+/**
+ * The billed (provider, model) keys the book cannot price — every one of them
+ * is tokens the session really spent that {@link estimateSessionCost} left
+ * out. A session whose models ALL price returns an empty list; a session that
+ * prices none returns every key it billed (the cell's "no prices" case). Keys
+ * are `model` alone, or `model · provider` when the session billed more than
+ * one provider — the same label shape as the tooltip's rate rows.
+ */
+export function unpricedCostModels(
+  usage: SessionCostUsage | null | undefined,
+  prices: ModelPrices | null | undefined,
+): string[] {
+  if (usage === null || usage === undefined) return []
+  const providers = Object.keys(usage)
+  const multi = providers.length > 1
+  const out: string[] = []
+  for (const provider of providers) {
+    const models = asRecord(usage[provider])
+    if (models === null) continue
+    for (const model of Object.keys(models)) {
+      if (priceOf(prices, provider, model) !== null) continue
+      if (asRecord(models[model]) === null) continue
+      out.push(multi && provider !== '' ? `${model} · ${provider}` : model)
+    }
+  }
+  return out
 }
 
 export function formatCost(amount: number, currency: CostCurrency): string {

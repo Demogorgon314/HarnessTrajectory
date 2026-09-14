@@ -115,8 +115,11 @@ describe('codex synthesizer → fold', () => {
     const [first, second] = view.requests
     expect([first?.turn, first?.step]).toEqual([1, 1])
     expect([second?.turn, second?.step]).toEqual([1, 2])
-    // prompt = uncached input + cacheRead + cacheWrite (the disjoint buckets).
-    expect(first?.prompt).toBe(1000 + 3000 + 100)
+    // prompt = uncached input + cacheRead + cacheWrite (the disjoint buckets),
+    // which must add back up to the record's own `input_tokens` — the cached
+    // and cache-written shares live INSIDE it.
+    expect(first?.prompt).toBe(900 + 3000 + 100)
+    expect(first?.prompt).toBe(4000)
     expect(first?.cacheRead).toBe(3000)
     expect(first?.output).toBe(200)
     expect(second?.prompt).toBe(1000 + 4000)

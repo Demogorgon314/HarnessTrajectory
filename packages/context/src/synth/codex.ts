@@ -840,8 +840,23 @@ function buildStream(group: OpenGroup, completed: number): StreamRecord[] {
 }
 
 /**
- * Codex's usage buckets → the fold's disjoint vocabulary: `input_tokens`
- * INCLUDES the cached half, so the uncached figure is the difference.
+ * Codex's usage buckets → the fold's disjoint vocabulary. `input_tokens` is
+ * the WHOLE prompt and `cached_input_tokens` its cache-served share, so the
+ * uncached figure is the difference; `output_tokens` already includes
+ * `reasoning_output_tokens`. EVIDENCE (9471 `token_usage_record`s across 78
+ * rollouts): `total_tokens === input_tokens + output_tokens` in every single
+ * record, which holds only if the cached half is inside `input_tokens` and
+ * reasoning is inside `output_tokens`; and summing `usage` over a rollout
+ * reproduces that file's last `thread_token_usage` exactly (39 of 45 files —
+ * the other 6 are resumed threads whose cumulative figure also covers the
+ * rollout files that came before, which is why the per-FILE sum is the one
+ * we bill).
+ *
+ * `cache_write_input_tokens` is 0 in all 9471 sampled records, so which side
+ * of `input_tokens` it falls on is unprovable from data. It is treated as a
+ * SHARE of the prompt (like the cached half) and subtracted — but only when
+ * the prompt is large enough to contain it, so the reading can shift tokens
+ * between the miss and write rates and never invent or double-bill any.
  */
 function usageOf(value: unknown): Record<string, number> | undefined {
   if (!isRecord(value)) return undefined
@@ -850,8 +865,12 @@ function usageOf(value: unknown): Record<string, number> | undefined {
   const cached = asNumber(value['cached_input_tokens'])
   const cacheWrite = asNumber(value['cache_write_input_tokens'])
   if (input === undefined && output === undefined && cached === undefined) return undefined
+  const prompt = input ?? 0
+  const read = cached ?? 0
+  const written = cacheWrite ?? 0
+  const uncached = prompt - read - (prompt >= read + written ? written : 0)
   return {
-    inputTokens: Math.max(0, (input ?? 0) - (cached ?? 0)),
+    inputTokens: Math.max(0, uncached),
     ...(cached === undefined ? {} : { cacheReadTokens: cached }),
     ...(cacheWrite === undefined ? {} : { cacheWriteTokens: cacheWrite }),
     outputTokens: output ?? 0,

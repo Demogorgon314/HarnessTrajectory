@@ -177,6 +177,148 @@ describe('StatsContext', () => {
     await m.unmount()
   })
 
+  test('a partly priced session keeps its figure and names what it leaves out', async () => {
+    // PORT ADDITION — the real case: a Codex session billing `codex-auto-review`
+    // (not in models.dev) beside a priced model. The estimate is a floor, so
+    // the cell prints it AND says which models it could not price.
+    const mixed: SessionCostUsage = {
+      'deepseek-official': {
+        'deepseek-v4-flash': { peak: { uncached: 1_000_000, cacheRead: 0, cacheWrite: 0, output: 0 } },
+        'codex-auto-review': { peak: { uncached: 5_000_000, cacheRead: 0, cacheWrite: 0, output: 0 } },
+      },
+    }
+    const m = await mount(h(StatsContext, {
+      counts: { turns: 0, steps: 0, injects: 0, compactions: 0, prunes: 0 },
+      usage: null,
+      cost: mixed,
+      locale: 'en',
+    }))
+    await flush()
+    // Only the priced model's 1M uncached tokens reach the figure.
+    assert.equal(cells(m.container).values.at(-1), '$0.15')
+    const note = text(queryAll(m.container, '.lc-stat-note')[0]!)
+    assert.ok(note.includes('excludes 1 model'), note)
+    assert.ok(note.includes('codex-auto-review'), note)
+    // A floor is still a figure: the outage copy stays out of the bubble.
+    assert.ok(!text(queryAll(m.container, '.lc-stat-tip')[2]!).includes('unavailable'))
+    await m.unmount()
+  })
+
+  test('a session the book prices none of dashes and keeps the outage note', async () => {
+    const none: SessionCostUsage = {
+      'deepseek-official': { 'codex-auto-review': { peak: { uncached: 5_000_000, cacheRead: 0, cacheWrite: 0, output: 0 } } },
+    }
+    const m = await mount(h(StatsContext, {
+      counts: { turns: 0, steps: 0, injects: 0, compactions: 0, prunes: 0 },
+      usage: null,
+      cost: none,
+      locale: 'en',
+    }))
+    await flush()
+    assert.equal(cells(m.container).values.at(-1), '—')
+    assert.ok(text(queryAll(m.container, '.lc-stat-tip')[2]!).includes('Model prices are unavailable'))
+    // Nothing priced is not a partial figure — no "excludes" line.
+    assert.equal(queryAll(m.container, '.lc-stat-note').length, 0)
+    await m.unmount()
+  })
+
+  test('a fully priced session carries no scope note at all', async () => {
+    const m = await mount(h(StatsContext, {
+      counts: { turns: 0, steps: 0, injects: 0, compactions: 0, prunes: 0 },
+      usage: null,
+      cost: COST,
+      locale: 'en',
+    }))
+    await flush()
+    assert.equal(queryAll(m.container, '.lc-stat-note').length, 0)
+    await m.unmount()
+  })
+
+  test('a model that booked a 1-hour cache write prints that rate beside the 5m one', async () => {
+    // `cacheWrite1h` is a SUBSET of `cacheWrite`; its presence is what makes
+    // the higher rate part of the total, so the bubble has to show it.
+    const with1h: SessionCostUsage = {
+      'deepseek-official': {
+        'deepseek-v4-flash': { peak: { uncached: 0, cacheRead: 0, cacheWrite: 1_000_000, cacheWrite1h: 400_000, output: 0 } },
+      },
+    }
+    const m = await mount(h(StatsContext, {
+      counts: { turns: 0, steps: 0, injects: 0, compactions: 0, prunes: 0 },
+      usage: null,
+      cost: with1h,
+      locale: 'en',
+    }))
+    await flush()
+    const costTip = text(queryAll(m.container, '.lc-stat-tip')[2]!)
+    // The book publishes no cache_write rate for this model, so both fall back
+    // to the input rate ($0.15) and its 1h multiple.
+    assert.ok(costTip.includes('write $0.15'), costTip)
+    assert.ok(costTip.includes('1h $0.3'), costTip)
+    await m.unmount()
+  })
+
+  test('a model without a 1-hour write keeps the original four rate cells', async () => {
+    const m = await mount(h(StatsContext, {
+      counts: { turns: 0, steps: 0, injects: 0, compactions: 0, prunes: 0 },
+      usage: null,
+      cost: COST,
+      locale: 'en',
+    }))
+    await flush()
+    assert.ok(!text(queryAll(m.container, '.lc-stat-tip')[2]!).includes('1h'))
+    await m.unmount()
+  })
+
+  test('several agents itemize the cost bubble and the cell names the scope', async () => {
+    // PORT ADDITION — a session is one transcript per agent, so the caller
+    // hands the cell the summed usage plus each agent's own share.
+    const share = (uncached: number): SessionCostUsage => ({
+      'deepseek-official': { 'deepseek-v4-flash': { peak: { uncached, cacheRead: 0, cacheWrite: 0, output: 0 } } },
+    })
+    const m = await mount(h(StatsContext, {
+      counts: { turns: 0, steps: 0, injects: 0, compactions: 0, prunes: 0 },
+      usage: null,
+      cost: share(3_000_000),
+      costParts: [
+        { id: 'main', label: 'Port the Context tab', cost: share(1_000_000) },
+        { id: 'kid', label: 'Explore the repo', cost: share(2_000_000) },
+        // An agent that never reached the model contributes no line.
+        { id: 'idle', label: 'Never ran', cost: undefined },
+      ],
+      locale: 'en',
+    }))
+    await flush()
+    const costTip = text(queryAll(m.container, '.lc-stat-tip')[2]!)
+    assert.ok(costTip.includes('By agent:'))
+    assert.ok(costTip.includes('Port the Context tab · $0.15'))
+    assert.ok(costTip.includes('Explore the repo · $0.30'))
+    assert.ok(!costTip.includes('Never ran'), 'an unbilled agent has no line')
+    assert.ok(costTip.includes('Total · $0.45'))
+    // The per-1M rate list stays.
+    assert.ok(costTip.includes('Per-1M-token rates:'))
+    assert.equal(cells(m.container).values.at(-1), '$0.45')
+    assert.equal(text(queryAll(m.container, '.lc-stat-note')[0]!), 'incl. 1 subagents')
+    await m.unmount()
+  })
+
+  test('one billing agent keeps the bubble exactly as it was', async () => {
+    const m = await mount(h(StatsContext, {
+      counts: { turns: 0, steps: 0, injects: 0, compactions: 0, prunes: 0 },
+      usage: null,
+      cost: COST,
+      costParts: [
+        { id: 'main', label: 'Port the Context tab', cost: COST },
+        { id: 'kid', label: 'Explore the repo', cost: undefined },
+      ],
+      locale: 'en',
+    }))
+    await flush()
+    const costTip = text(queryAll(m.container, '.lc-stat-tip')[2]!)
+    assert.ok(!costTip.includes('By agent:'))
+    assert.equal(queryAll(m.container, '.lc-stat-note').length, 0)
+    await m.unmount()
+  })
+
   test('the zh locale localizes labels and prices the cost in CNY at 1 CNY = 0.15 USD', async () => {
     const m = await mount(h(StatsContextZh, {
       counts: { turns: 1, steps: 1, injects: 0, compactions: 1, prunes: 0 },

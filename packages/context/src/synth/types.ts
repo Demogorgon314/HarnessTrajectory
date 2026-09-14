@@ -11,7 +11,11 @@ import type { TimelineEvent } from '../fold/event.ts'
 
 /** A child agent spawned from this file, keyed by the harness-native child key. */
 export interface AgentSpawn {
-  /** Claude: the `agentId` (child file basename is `agent-<agentId>`); Codex: the child thread id. */
+  /**
+   * Claude: the `agentId` (child file basename is `agent-<agentId>`);
+   * Codex: the child thread id; Kimi: the `agents/<agentId>` directory name
+   * (`task.started.info.agentId`).
+   */
   key: string
   /** Task description shown as the node caption. */
   label: string
@@ -49,7 +53,16 @@ export interface EventSynthesizer {
 
 export type SynthesizerFactory = (file: SessionFileRef) => EventSynthesizer
 
-/** The harness-native child key of a child file, matching `AgentSpawn.key`. */
+/**
+ * The harness-native child key of a child file, matching `AgentSpawn.key`.
+ *
+ * Only Claude needs a transform (its child files are named `agent-<agentId>`).
+ * Codex child files are keyed by their thread id and KIMI child files by their
+ * `agents/<agentId>` directory name — which is exactly the id the server hands
+ * back as `file.id` and exactly the id `task.started.info.agentId` records — so
+ * both fall through to `file.id` unchanged. Keep it that way: a transform here
+ * would break the Agent Network's parent→child join for Kimi.
+ */
 export function childKeyOf(kind: HarnessKind, file: SessionFileRef): string {
   if (kind === 'claude') {
     const base = file.id.slice(file.id.lastIndexOf('/') + 1)

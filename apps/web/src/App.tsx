@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { HarnessKind, SessionSummary } from '@harness-trajectory/core'
+import { HARNESS_KINDS, type HarnessKind, type SessionSummary } from '@harness-trajectory/core'
 import {
   createTrajectoryDurationStore, createTrajectoryTranslate, icons, Tooltip, useSnapshotSelector,
   type TrajectoryLocale,
@@ -45,8 +45,11 @@ export interface Route {
   agent?: string
 }
 
-function parseHash(hash: string): Route | null {
-  const match = /^#\/(claude|codex)\/([^/]+)(?:\/(agent|context)(?:\/([^/]+))?)?$/.exec(hash)
+// Kinds are lowercase words, so no escaping is needed to join them into an alternation.
+const ROUTE_KIND_PATTERN = new RegExp(`^#/(${HARNESS_KINDS.join('|')})/([^/]+)(?:/(agent|context)(?:/([^/]+))?)?$`)
+
+export function parseHash(hash: string): Route | null {
+  const match = ROUTE_KIND_PATTERN.exec(hash)
   if (match === null) return null
   const section = match[3]
   const tail = match[4]
@@ -309,7 +312,8 @@ export function App() {
             <div className={css.empty}>
               <div className={css.emptyTitle}>Pick a session</div>
               <div className={css.emptyHint}>
-                Sessions are scanned from <code>~/.claude/projects</code> and <code>~/.codex/sessions</code> on this machine.
+                Sessions are scanned from <code>~/.claude/projects</code>, <code>~/.codex/sessions</code>, and{' '}
+                <code>~/.kimi-code/sessions</code> on this machine.
                 Running sessions update live.
               </div>
             </div>

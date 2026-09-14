@@ -3,8 +3,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { SessionLiveEvent } from '@harness-trajectory/core'
-import { SessionIndex, classifyPath, lineTimes, mergeChronologically, scopeToFile } from '../src/index.ts'
+import { SessionIndex, classifyPath, lineTime, lineTimes, mergeChronologically, scopeToFile } from '../src/index.ts'
 import { createMetaScanner } from '../src/meta.ts'
+import { defaultRoots } from '../src/roots.ts'
 
 function jsonl(records: readonly unknown[]): string {
   return records.map(record => JSON.stringify(record)).join('\n') + '\n'
@@ -39,6 +40,37 @@ function codexUser(text: string, offset: number) {
   return { timestamp: iso(offset), type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] } }
 }
 
+/** Kimi wire records: `{ type, time (epoch ms), agentId, ...payload }`. */
+function kimi(type: string, offset: number, payload: Record<string, unknown> = {}, agentId = 'main') {
+  return { type, time: T0 + offset, agentId, ...payload }
+}
+
+function kimiUser(text: string, offset: number, origin: unknown = { kind: 'user' }) {
+  return kimi('context.append_message', offset, {
+    message: { role: 'user', content: [{ type: 'text', text }], toolCalls: [], origin },
+  })
+}
+
+function kimiMain(prompt: string): string {
+  return jsonl([
+    { type: 'metadata', created_at: T0, protocol_version: '1.5' },
+    kimi('runtime.set_binding', 1, { runtimeId: 'rt-1', workspaceId: 'wd_project_abc123def456' }),
+    kimi('profile.bind', 2, {
+      profileName: 'agent', modelAlias: 'kimi-code/k3', thinkingEffort: 'medium',
+      systemPrompt: 'You are Kimi.', activeToolNames: ['Read'], agentsMdPaths: [],
+      environmentDisclosure: { cwd: '/work/kimi' }, subagents: [],
+    }),
+    kimiUser(prompt, 10),
+    kimi('context.append_loop_event', 11, { event: { type: 'step.begin', turnId: '0', step: 1, uuid: 's-1' } }),
+    kimi('llm.request', 12, {
+      kind: 'loop', model: 'k3', modelAlias: 'kimi-code/k3', provider: 'openai',
+      maxTokens: 1048576, messageCount: 2, turnStep: '0.1',
+    }),
+    kimiUser('Todo list reminder', 20, { kind: 'injection', variant: 'todo_list_reminder' }),
+    kimi('turn.ended', 30, { durationMs: 30, reason: 'completed', turnId: 0 }),
+  ])
+}
+
 describe('classifyPath', () => {
   it('recognizes Claude main transcripts, agent files, and subagent directories', () => {
     const root = '/r'
@@ -53,6 +85,38 @@ describe('classifyPath', () => {
     const path = '/r/2026/09/14/rollout-2026-09-14T10-00-00-0199aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee.jsonl'
     expect(classifyPath('codex', '/r', path)).toEqual({ id: '0199aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee', role: 'main' })
     expect(classifyPath('codex', '/r', '/r/2026/09/14/notes.jsonl')).toBeNull()
+  })
+
+  it('recognizes Kimi wire transcripts and binds children to their session directory', () => {
+    const root = '/r'
+    expect(classifyPath('kimi', root, '/r/wd_project_ab12/session_k1/agents/main/wire.jsonl'))
+      .toEqual({ id: 'session_k1', role: 'main' })
+    expect(classifyPath('kimi', root, '/r/wd_project_ab12/session_k1/agents/sub-1/wire.jsonl'))
+      .toEqual({ id: 'sub-1', role: 'child', parentId: 'session_k1' })
+    // Side stores and anything that is not `wire.jsonl` at exactly that depth are not transcripts.
+    expect(classifyPath('kimi', root, '/r/wd_project_ab12/session_k1/agents/main/tasks/t1.jsonl')).toBeNull()
+    expect(classifyPath('kimi', root, '/r/wd_project_ab12/session_k1/agents/main/notes.jsonl')).toBeNull()
+    expect(classifyPath('kimi', root, '/r/wd_project_ab12/session_k1/wire.jsonl')).toBeNull()
+    expect(classifyPath('kimi', root, '/r/session_index.jsonl')).toBeNull()
+  })
+})
+
+describe('defaultRoots', () => {
+  it('resolves all three harness roots from harness homes and explicit overrides', () => {
+    expect(defaultRoots({
+      CLAUDE_CONFIG_DIR: join('/h', '.claude'),
+      CODEX_HOME: join('/h', '.codex'),
+      KIMI_CODE_HOME: join('/h', '.kimi-code'),
+    })).toEqual([
+      { kind: 'claude', dir: join('/h', '.claude', 'projects') },
+      { kind: 'codex', dir: join('/h', '.codex', 'sessions') },
+      { kind: 'kimi', dir: join('/h', '.kimi-code', 'sessions') },
+    ])
+    expect(defaultRoots({
+      HARNESS_TRAJECTORY_CLAUDE_ROOT: join('/roots', 'c'),
+      HARNESS_TRAJECTORY_CODEX_ROOT: join('/roots', 'x'),
+      HARNESS_TRAJECTORY_KIMI_ROOT: join('/roots', 'k'),
+    }).map(root => root.dir)).toEqual([join('/roots', 'c'), join('/roots', 'x'), join('/roots', 'k')])
   })
 })
 
@@ -77,6 +141,15 @@ describe('chronological merge', () => {
       { ref: child, lines: childLines, times: lineTimes(childLines) },
     ])]
     expect(chunks.map(chunk => `${chunk.ref.id}:${chunk.lines.length}`)).toEqual(['m:2', 'c:2', 'm:1'])
+  })
+
+  it('reads Kimi epoch-millisecond "time" fields and still prefers "timestamp"', () => {
+    expect(lineTime(JSON.stringify(kimi('turn.ended', 4000)))).toBe(T0 + 4000)
+    expect(lineTime(JSON.stringify({ type: 'metadata', created_at: T0 }))).toBeNull()
+    // Seconds stay seconds; a record with both keeps the `timestamp`.
+    expect(lineTime('{"type":"x","time":1789372800}')).toBe(1789372800_000)
+    expect(lineTime(JSON.stringify({ timestamp: iso(1000), time: T0 + 9000 }))).toBe(T0 + 1000)
+    expect(lineTime('{"type":"x"}')).toBeNull()
   })
 })
 
@@ -108,6 +181,36 @@ describe('meta scanners', () => {
     for (const line of jsonl(lines).split('\n')) scanner.push(line)
     expect(scanner.state).toMatchObject({ title: 'Refactor the parser', cwd: '/work/codex', model: 'gpt-test', promptCount: 1 })
   })
+
+  it('summarizes a Kimi wire transcript and counts only origin-user messages', () => {
+    const scanner = createMetaScanner('kimi')
+    const lines = [
+      { type: 'metadata', created_at: T0, protocol_version: '1.5' },
+      kimi('profile.bind', 2, { modelAlias: 'kimi-code/k3', environmentDisclosure: { cwd: '/work/kimi' } }),
+      kimiUser('Port the viewer to Kimi', 10),
+      kimi('llm.request', 12, { model: 'k3', provider: 'openai', maxTokens: 1048576 }),
+      kimiUser('todo reminder', 20, { kind: 'injection', variant: 'todo_list_reminder' }),
+      kimiUser('agent finished', 21, { kind: 'task', taskId: 't1', status: 'completed' }),
+      kimiUser('skill text', 22, { kind: 'skill_activation', skillName: 'design' }),
+      kimiUser('/plugin', 23, { kind: 'plugin_command' }),
+      kimiUser('previous summary', 24, { kind: 'compaction_summary' }),
+      kimiUser('And now the second prompt', 30),
+      kimi('turn.ended', 40, { durationMs: 40, reason: 'completed', turnId: 0 }),
+    ]
+    for (const line of jsonl(lines).split('\n')) scanner.push(line)
+    expect(scanner.state).toMatchObject({
+      title: 'Port the viewer to Kimi', cwd: '/work/kimi', model: 'k3',
+      promptCount: 2, startedAt: T0, lastTime: T0 + 40,
+    })
+  })
+
+  it('tolerates malformed and unknown Kimi lines', () => {
+    const scanner = createMetaScanner('kimi')
+    for (const line of ['', '{ not json', 'null', '[]', JSON.stringify(kimi('mcp.tools_discovered', 1))]) {
+      expect(() => { scanner.push(line) }).not.toThrow()
+    }
+    expect(scanner.state).toMatchObject({ title: null, promptCount: 0 })
+  })
 })
 
 describe('SessionIndex', () => {
@@ -132,10 +235,25 @@ describe('SessionIndex', () => {
     await writeFile(join(dir, 'codex', '2026', '09', '14', 'rollout-2026-09-14T10-00-01-child.jsonl'), jsonl([
       codexMeta('child-thread', 50, 'parent-thread'),
     ]))
+    const kimiSession = join(dir, 'kimi', 'wd_project_ab12cd34ef56', 'session_k1')
+    await mkdir(join(kimiSession, 'agents', 'main', 'tasks'), { recursive: true })
+    await mkdir(join(kimiSession, 'agents', 'sub-1'), { recursive: true })
+    await writeFile(join(kimiSession, 'state.json'), JSON.stringify({
+      id: 'session_k1', version: 2, cwd: '/work/kimi', createdAt: T0, updatedAt: T0 + 30,
+      title: 'Kimi session title', titleKind: 'generated', lastTurnReason: 'completed',
+      agents: { main: { type: 'main' }, 'sub-1': { type: 'sub', parentAgentId: 'main' } },
+    }))
+    await writeFile(join(kimiSession, 'agents', 'main', 'wire.jsonl'), kimiMain('Add Kimi support'))
+    await writeFile(join(kimiSession, 'agents', 'main', 'tasks', 't1.jsonl'), jsonl([{ ignored: true }]))
+    await writeFile(join(kimiSession, 'agents', 'sub-1', 'wire.jsonl'), jsonl([
+      kimi('runtime.set_binding', 15, { runtimeId: 'rt-2' }, 'sub-1'),
+      kimi('profile.bind', 16, { profileName: 'explore', modelAlias: 'kimi-code/k3' }, 'sub-1'),
+    ]))
     index = new SessionIndex({
       roots: [
         { kind: 'claude', dir: join(dir, 'claude') },
         { kind: 'codex', dir: join(dir, 'codex') },
+        { kind: 'kimi', dir: join(dir, 'kimi') },
       ],
       watch: false,
       now: () => T0 + 60_000,
@@ -151,7 +269,7 @@ describe('SessionIndex', () => {
   it('lists main sessions with metadata and attaches children by parent id', () => {
     const sessions = index.list()
     expect(sessions.map(session => `${session.kind}:${session.id}`).sort())
-      .toEqual(['claude:main-1', 'codex:parent-thread'])
+      .toEqual(['claude:main-1', 'codex:parent-thread', 'kimi:session_k1'])
     const claude = index.get('claude', 'main-1')
     expect(claude).toMatchObject({ title: 'Hello there', cwd: '/work/project', childCount: 1, promptCount: 1 })
     expect(claude?.files.map(file => file.role)).toEqual(['main', 'child'])
@@ -159,6 +277,54 @@ describe('SessionIndex', () => {
     expect(codex).toMatchObject({ title: 'Parent prompt', childCount: 1 })
     expect(codex?.files[1]).toMatchObject({ id: 'child-thread', role: 'child', parentId: 'parent-thread' })
     expect(index.get('codex', 'child-thread')).toBeUndefined()
+  })
+
+  it('indexes a Kimi session by directory name, titles it from state.json, and attaches its agents', async () => {
+    const session = index.get('kimi', 'session_k1')
+    expect(session).toMatchObject({
+      id: 'session_k1', kind: 'kimi', title: 'Kimi session title', cwd: '/work/kimi',
+      model: 'k3', startedAt: T0, childCount: 1, promptCount: 1,
+    })
+    expect(session?.files.map(file => `${file.role}:${file.id}`)).toEqual(['main:session_k1', 'child:sub-1'])
+    expect(session?.files[1]).toMatchObject({ parentId: 'session_k1' })
+    // The subagent transcript is not a session of its own, and side stores are skipped.
+    expect(index.get('kimi', 'sub-1')).toBeUndefined()
+    expect(index.hasChild('kimi', 'session_k1', 'sub-1')).toBe(true)
+
+    // state.json is rewritten as the session runs; a refresh picks the new title up.
+    const statePath = join(dir, 'kimi', 'wd_project_ab12cd34ef56', 'session_k1', 'state.json')
+    const mainPath = join(dir, 'kimi', 'wd_project_ab12cd34ef56', 'session_k1', 'agents', 'main', 'wire.jsonl')
+    await writeFile(statePath, JSON.stringify({ id: 'session_k1', title: 'Renamed by the user', titleKind: 'custom' }))
+    await appendFile(mainPath, jsonl([kimiUser('One more thing', 5000)]))
+    await index.refreshPath(mainPath)
+    expect(index.get('kimi', 'session_k1')).toMatchObject({ title: 'Renamed by the user', promptCount: 2 })
+  })
+
+  it('falls back to the first human prompt when state.json has no usable title', async () => {
+    await rm(join(dir, 'kimi', 'wd_project_ab12cd34ef56', 'session_k1', 'state.json'))
+    const fresh = new SessionIndex({
+      roots: [{ kind: 'kimi', dir: join(dir, 'kimi') }],
+      watch: false,
+      now: () => T0 + 60_000,
+    })
+    await fresh.start()
+    expect(fresh.get('kimi', 'session_k1')).toMatchObject({ title: 'Add Kimi support', childCount: 1 })
+    fresh.stop()
+  })
+
+  it('announces a Kimi subagent transcript created while the session is watched', async () => {
+    const events: SessionLiveEvent[] = []
+    const unsubscribe = index.subscribe('kimi', 'session_k1', event => events.push(event))
+    const childDir = join(dir, 'kimi', 'wd_project_ab12cd34ef56', 'session_k1', 'agents', 'sub-2')
+    await mkdir(childDir, { recursive: true })
+    const path = join(childDir, 'wire.jsonl')
+    await writeFile(path, jsonl([kimi('runtime.set_binding', 2000, { runtimeId: 'rt-3' }, 'sub-2')]))
+    await index.refreshPath(path)
+    expect(events.map(event => event.type)).toEqual(['file', 'lines', 'meta'])
+    const [file] = events
+    expect(file?.type === 'file' && file.file).toMatchObject({ id: 'sub-2', role: 'child', parentId: 'session_k1' })
+    expect(index.get('kimi', 'session_k1')?.childCount).toBe(2)
+    unsubscribe()
   })
 
   it('replays files in timestamp order and then reports live appends', async () => {

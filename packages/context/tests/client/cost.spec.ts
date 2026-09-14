@@ -5,7 +5,7 @@
 
 import assert from './helpers/assert.ts'
 import { describe, test } from 'vitest'
-import { estimateSessionCost, formatCost, formatPriceRate, offPeakOf, priceOf, toCurrency } from '../../src/client/cost'
+import { estimateSessionCost, formatCost, formatPriceRate, offPeakOf, priceOf, toCurrency, unpricedCostModels, write1hOf } from '../../src/client/cost'
 import type { ModelPrices } from '../../src/client/cost'
 import type { CostBucketTotals } from '../../src/shared/types'
 
@@ -149,6 +149,105 @@ describe('estimateSessionCost', () => {
 describe('offPeakOf', () => {
   test('halves every rate component', () => {
     assert.deepEqual(offPeakOf(FLASH), { hit: 0.0015, miss: 0.075, write: 0.075, out: 0.3 })
+  })
+
+  test('halves a published 1h rate too, and stays absent without one', () => {
+    assert.deepEqual(offPeakOf({ ...FLASH, write1h: 0.3 }), {
+      hit: 0.0015, miss: 0.075, write: 0.075, out: 0.3, write1h: 0.15,
+    })
+    assert.ok(!('write1h' in offPeakOf(FLASH)))
+  })
+})
+
+describe('routed model ids', () => {
+  // Claude Code names the 1M-context ROUTE `claude-opus-5[1m]` and books its
+  // cost under that exact id; the registry carries only the base id.
+  const OPUS = { hit: 0.5, miss: 5, write: 6.25, out: 25 }
+  const TAGGED: ModelPrices = { anthropic: { 'claude-opus-5': OPUS } }
+
+  test('a tagged id prices off its untagged base id', () => {
+    assert.equal(priceOf(TAGGED, 'anthropic', 'claude-opus-5[1m]'), OPUS)
+    assert.equal(priceOf(TAGGED, 'anthropic', 'claude-opus-5'), OPUS)
+  })
+
+  test('the exact tagged key still wins when the registry carries one', () => {
+    const book: ModelPrices = { anthropic: { 'claude-opus-5': OPUS, 'claude-opus-5[1m]': K3 } }
+    assert.equal(priceOf(book, 'anthropic', 'claude-opus-5[1m]'), K3)
+  })
+
+  test('stripping a tag never reaches a DIFFERENT model', () => {
+    const book: ModelPrices = { anthropic: { 'claude-opus-5-1': OPUS } }
+    assert.equal(priceOf(book, 'anthropic', 'claude-opus-5[1m]'), null)
+    assert.equal(priceOf(book, 'anthropic', 'claude-opus-5'), null)
+  })
+
+  test('the cross-provider fallback untags too, and stays ambiguity-safe', () => {
+    assert.equal(priceOf(TAGGED, 'future-provider', 'claude-opus-5[1m]'), OPUS)
+    const two: ModelPrices = { anthropic: { 'claude-opus-5': OPUS }, mirror: { 'claude-opus-5': K3 } }
+    assert.equal(priceOf(two, 'future-provider', 'claude-opus-5[1m]'), null)
+  })
+})
+
+describe('1h cache writes', () => {
+  const OPUS = { hit: 0.5, miss: 5, write: 6.25, out: 25 }
+  const BOOK_1H: ModelPrices = { anthropic: { 'claude-opus-5': OPUS } }
+
+  test('the derived 1h rate is twice the input rate; a published one wins', () => {
+    assert.equal(write1hOf(OPUS), 10)
+    assert.equal(write1hOf({ ...OPUS, write1h: 9 }), 9)
+  })
+
+  test('the 1h share bills at the 1h rate and the remainder at the 5m rate', () => {
+    const usage = { anthropic: { 'claude-opus-5[1m]': { peak: { ...bucket(0, 0, M, 0), cacheWrite1h: M / 2 } } } }
+    // Half a million at $10/M + half a million at $6.25/M.
+    close(estimateSessionCost(usage, BOOK_1H, 'usd'), 5 + 3.125)
+  })
+
+  test('a write bucket with no 1h share bills entirely at the 5m rate', () => {
+    const usage = { anthropic: { 'claude-opus-5': { peak: bucket(0, 0, M, 0) } } }
+    close(estimateSessionCost(usage, BOOK_1H, 'usd'), 6.25)
+  })
+
+  test('a 1h share beyond the write bucket cannot bill more tokens than were written', () => {
+    const usage = { anthropic: { 'claude-opus-5': { peak: { ...bucket(0, 0, M, 0), cacheWrite1h: 5 * M } } } }
+    close(estimateSessionCost(usage, BOOK_1H, 'usd'), 10)
+  })
+
+  test('a negative 1h share is ignored rather than crediting the write bucket', () => {
+    const usage = { anthropic: { 'claude-opus-5': { peak: { ...bucket(0, 0, M, 0), cacheWrite1h: -5 * M } } } }
+    close(estimateSessionCost(usage, BOOK_1H, 'usd'), 6.25)
+  })
+})
+
+describe('unpricedCostModels', () => {
+  test('names only the billed models the book cannot price', () => {
+    const usage = {
+      deepseek: { 'deepseek-v4-flash': { peak: bucket(0, M, 0, 0) }, 'mystery-model': { peak: bucket(0, M, 0, 0) } },
+    }
+    assert.deepEqual(unpricedCostModels(usage, BOOK), ['mystery-model'])
+  })
+
+  test('a fully priced session names nothing', () => {
+    assert.deepEqual(unpricedCostModels({ deepseek: { 'deepseek-v4-flash': { peak: bucket(0, M, 0, 0) } } }, BOOK), [])
+  })
+
+  test('a routed id counts as priced once its base id resolves', () => {
+    const book: ModelPrices = { anthropic: { 'claude-opus-5': { hit: 0.5, miss: 5, write: 6.25, out: 25 } } }
+    assert.deepEqual(unpricedCostModels({ anthropic: { 'claude-opus-5[1m]': { peak: bucket(0, M, 0, 0) } } }, book), [])
+  })
+
+  test('no book at all means every billed model is unpriced', () => {
+    const usage = { deepseek: { 'deepseek-v4-flash': { peak: bucket(0, M, 0, 0) } } }
+    assert.deepEqual(unpricedCostModels(usage, null), ['deepseek-v4-flash'])
+    assert.deepEqual(unpricedCostModels(null, BOOK), [])
+  })
+
+  test('a multi-provider session qualifies each name with its provider', () => {
+    const usage = {
+      deepseek: { 'mystery-model': { peak: bucket(0, M, 0, 0) } },
+      anthropic: { 'other-model': { peak: bucket(0, M, 0, 0) } },
+    }
+    assert.deepEqual(unpricedCostModels(usage, BOOK), ['mystery-model · deepseek', 'other-model · anthropic'])
   })
 })
 

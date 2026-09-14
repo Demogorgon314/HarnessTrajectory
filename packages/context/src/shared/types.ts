@@ -370,6 +370,16 @@ export interface CostBucketTotals {
   cacheRead: number
   cacheWrite: number
   output: number
+  /**
+   * PORT ADDITION — the 1-HOUR share of `cacheWrite` (a SUBSET of it, never an
+   * extra bucket). Anthropic bills a 1h cache write at 2x the base input rate
+   * where a 5m write bills at 1.25x, so a session that wrote its cache with
+   * the 1h TTL costs materially more than the registry's single `cache_write`
+   * rate implies. Absent when the session wrote no 1h cache entry (the common
+   * case and every non-Anthropic provider), which keeps the bucket's shape
+   * identical to the dsh original.
+   */
+  cacheWrite1h?: number
 }
 
 /**

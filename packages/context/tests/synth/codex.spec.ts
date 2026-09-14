@@ -365,10 +365,24 @@ describe('codex synthesizer', () => {
   })
 
   describe('usage mapping', () => {
-    it('subtracts the cached half from input_tokens', () => {
+    it('subtracts the cached and cache-written shares from input_tokens', () => {
       const { events } = run(TYPICAL_TURN)
+      // input_tokens is the WHOLE prompt, so the three disjoint buckets must
+      // add back up to it (1000) — never past it.
       expect(dataOf(allOf(events, 'assistant/message')[0])['usage']).toEqual({
-        inputTokens: 600, cacheReadTokens: 400, cacheWriteTokens: 50, outputTokens: 120,
+        inputTokens: 550, cacheReadTokens: 400, cacheWriteTokens: 50, outputTokens: 120,
+      })
+    })
+
+    it('keeps the cache-written share whole when the prompt is too small to contain it', () => {
+      const { events } = run([
+        sessionMeta(0), taskStarted(1), turnContext(1, 'm'), assistantMessage(2, 'x'),
+        tokenUsage(3, { input_tokens: 100, cached_input_tokens: 90, cache_write_input_tokens: 40, output_tokens: 5 }),
+      ])
+      // 90 + 40 > 100: the write cannot be a share of this prompt, so it is
+      // billed as its own bucket rather than driving uncached negative.
+      expect(dataOf(firstOf(events, 'assistant/message'))['usage']).toEqual({
+        inputTokens: 10, cacheReadTokens: 90, cacheWriteTokens: 40, outputTokens: 5,
       })
     })
 

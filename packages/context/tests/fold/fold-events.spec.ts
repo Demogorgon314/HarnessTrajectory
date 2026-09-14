@@ -474,6 +474,33 @@ describe('hostile provider usage (issue #44: stats must survive nonconforming fi
       uncached: 0, cacheRead: 300, cacheWrite: 10, output: 0,
     })
   })
+
+  test('the 1h cache-write share accumulates as a subset of the write bucket', () => {
+    const { state } = driveTimeline([
+      header(1, { model: 'm' }),
+      assistantMessage(2, { usage: { cacheWriteTokens: 100, cacheWrite1hTokens: 40 } }),
+      assistantMessage(3, { usage: { cacheWriteTokens: 60, cacheWrite1hTokens: 60 } }),
+    ])
+    assert.deepEqual(state.cost?.['']?.m?.peak, {
+      uncached: 0, cacheRead: 0, cacheWrite: 160, output: 0, cacheWrite1h: 100,
+    })
+  })
+
+  test('a 1h share larger than the write bucket clamps to it', () => {
+    const { state } = driveTimeline([
+      header(1, { model: 'm' }),
+      assistantMessage(2, { usage: { cacheWriteTokens: 10, cacheWrite1hTokens: 999 } }),
+    ])
+    assert.equal(state.cost?.['']?.m?.peak?.cacheWrite1h, 10)
+  })
+
+  test('a bucket that never saw a 1h write keeps the four-key shape', () => {
+    const { state } = driveTimeline([
+      header(1, { model: 'm' }),
+      assistantMessage(2, { usage: { cacheWriteTokens: 10, cacheWrite1hTokens: 0 } }),
+    ])
+    assert.deepEqual(state.cost?.['']?.m?.peak, { uncached: 0, cacheRead: 0, cacheWrite: 10, output: 0 })
+  })
 })
 
 describe('plan/mode', () => {
