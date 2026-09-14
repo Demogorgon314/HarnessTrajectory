@@ -3,6 +3,7 @@ import type { HarnessKind, SessionSummary } from '@harness-trajectory/core'
 import {
   TrajectoryView, useSnapshotSelector, type SnapshotStore, type TrajectoryTranslate,
 } from '@harness-trajectory/ui'
+import { HarnessMark, harnessMeta } from './harnesses.tsx'
 import { SessionRuntime } from './session-runtime.ts'
 import css from './app.module.css'
 
@@ -14,8 +15,6 @@ export interface SessionPaneProps {
   t: TrajectoryTranslate
   durationStore: SnapshotStore<boolean>
 }
-
-const KIND_LABEL: Record<HarnessKind, string> = { claude: 'Claude Code', codex: 'Codex' }
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
@@ -33,11 +32,15 @@ export function SessionPane({ kind, id, summary: listSummary, t, durationStore }
   const summary = state.summary ?? listSummary
   const [copied, setCopied] = useState(false)
   const started = summary?.startedAt ?? null
+  const resumeCommand = harnessMeta(kind).resumeCommand({ id, cwd: summary?.cwd ?? null })
   return (
     <div className={css.pane}>
       <header className={css.paneHeader}>
         <div className={css.paneTitleRow}>
-          <span className={css.badge} data-kind={kind}>{KIND_LABEL[kind]}</span>
+          <span className={css.badge}>
+            <HarnessMark kind={kind} size={14} />
+            {harnessMeta(kind).label}
+          </span>
           <h1 className={css.paneTitle} title={summary?.title ?? id}>{summary?.title ?? id}</h1>
           {summary?.live === true && <span className={css.live}>live</span>}
           <span className={css.paneStatus} data-connected={state.connected || undefined}>
@@ -61,18 +64,20 @@ export function SessionPane({ kind, id, summary: listSummary, t, durationStore }
             </span>
           )}
           <span className={css.paneMetaItem}>{state.lines} lines</span>
+          <span className={css.paneMetaItem} title={id}>{id.slice(0, 8)}</span>
           <button
             type="button"
             className={css.paneCopy}
-            title={id}
+            title={resumeCommand}
+            aria-label={`Copy the command that resumes this session: ${resumeCommand}`}
             onClick={() => {
-              void navigator.clipboard?.writeText(id).then(() => {
+              void navigator.clipboard?.writeText(resumeCommand).then(() => {
                 setCopied(true)
-                setTimeout(() => { setCopied(false) }, 1200)
+                setTimeout(() => { setCopied(false) }, 1500)
               })
             }}
           >
-            {copied ? 'copied' : 'copy id'}
+            {copied ? 'copied' : 'copy resume command'}
           </button>
         </div>
         {state.error !== null && <div className={css.paneError}>{state.error}</div>}

@@ -17,4 +17,5 @@ export {
 export { MarkdownText } from './primitives/markdown/MarkdownText.tsx'
 export { JsonTree } from './primitives/JsonTree.tsx'
 export { Tooltip } from './primitives/Tooltip.tsx'
+export { Menu, type MenuEntry, type MenuItem } from './primitives/Menu.tsx'
 export * as icons from './primitives/icons/index.tsx'

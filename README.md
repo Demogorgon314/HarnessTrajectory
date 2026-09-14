@@ -83,4 +83,6 @@ repository.
 ## License
 
 The vendored `packages/ui` sources derive from deepseek-harness (MIT); see
-`packages/ui/LICENSE.deepseek-harness`. Everything else is MIT as well.
+`packages/ui/LICENSE.deepseek-harness`. Harness brand marks in `apps/web/src/harnesses.tsx`
+use path data from [Simple Icons](https://simpleicons.org) (CC0) and
+[lobe-icons](https://github.com/lobehub/lobe-icons) (MIT); the marks themselves belong to their owners. Everything else is MIT as well.
