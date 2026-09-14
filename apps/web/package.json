@@ -1,0 +1,26 @@
+{
+  "name": "@harness-trajectory/web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Web UI: session picker plus the live trajectory view",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@harness-trajectory/core": "workspace:*",
+    "@harness-trajectory/ui": "workspace:*",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "~18.3.1",
+    "@types/react-dom": "~18.3.0",
+    "@vitejs/plugin-react": "^4.3.0",
+    "typescript": "^6.0.3",
+    "vite": "^6.0.0"
+  }
+}

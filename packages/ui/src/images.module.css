@@ -1,0 +1,45 @@
+.root {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 4px 0;
+}
+
+.root[data-align='end'] {
+  justify-content: flex-end;
+}
+
+.link {
+  display: inline-flex;
+  border-radius: 6px;
+  overflow: hidden;
+  border: 1px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-bg-layer-2);
+  line-height: 0;
+}
+
+.image {
+  max-width: min(100%, 480px);
+  max-height: 320px;
+  object-fit: contain;
+}
+
+.compact {
+  width: 56px;
+  height: 56px;
+  object-fit: cover;
+}
+
+.placeholder {
+  display: inline-block;
+  width: 56px;
+  height: 56px;
+  border-radius: 6px;
+  background: var(--dsw-alias-bg-layer-2);
+  border: 1px dashed var(--dsw-alias-border-l2);
+}
+
+.missing {
+  font: var(--dsw-font-xxs-12);
+  color: var(--dsw-alias-label-tertiary);
+}

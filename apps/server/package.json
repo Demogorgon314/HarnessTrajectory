@@ -1,0 +1,29 @@
+{
+  "name": "@harness-trajectory/server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local server that scans Claude Code and Codex transcripts and streams them to the trajectory web UI",
+  "type": "module",
+  "bin": {
+    "harness-trajectory": "./dist/main.js"
+  },
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "build": "tsdown",
+    "start": "node dist/main.js",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run --project server"
+  },
+  "dependencies": {
+    "@harness-trajectory/core": "workspace:*",
+    "@hono/node-server": "^1.14.0",
+    "hono": "^4.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsdown": "^0.15.0",
+    "tsx": "^4.19.0",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.8"
+  }
+}
