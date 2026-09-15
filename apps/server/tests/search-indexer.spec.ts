@@ -93,7 +93,7 @@ describe('SearchIndexer with SessionIndex', () => {
     })])
     expect(search(store, { q: 'with the server' }).groups[0]?.hits[0])
       .toMatchObject({ line: 1, role: 'assistant' })
-    expect(indexer.stats()).toEqual({ pendingFiles: 0, ready: true })
+    expect(indexer.stats()).toEqual({ pendingFiles: 0, ready: true, filesDone: 1, filesTotal: 1 })
   })
 
   it('indexes only the appended lines and advances the recorded progress', async () => {
@@ -229,6 +229,17 @@ describe('SearchIndexer', () => {
     expect(store.docCount()).toBe(6)
     expect(store.fileState(key.path)).toMatchObject({ indexedLines: 6 })
     expect(indexer.stats().pendingFiles).toBe(0)
+    indexer.stop()
+  })
+
+  it('counts backfill files so the UI can show N / M', () => {
+    const indexer = new SearchIndexer({ store, flushDelayMs: 60_000 })
+    expect(indexer.stats()).toMatchObject({ ready: false, filesDone: 0, filesTotal: 0 })
+    indexer.setBackfillPlan(4)
+    expect(indexer.stats()).toMatchObject({ filesDone: 0, filesTotal: 4, ready: false })
+    indexer.noteBackfillFile()
+    indexer.noteBackfillFile()
+    expect(indexer.stats()).toMatchObject({ filesDone: 2, filesTotal: 4 })
     indexer.stop()
   })
 

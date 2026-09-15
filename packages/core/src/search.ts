@@ -57,11 +57,26 @@ export interface SearchResponse {
   totalHits: number
   /** Whether the hit limit cut the result set short. */
   truncated: boolean
-  indexing: {
-    pendingFiles: number
-    /** False while the startup backfill is still running. */
-    ready: boolean
-  }
+  indexing: SearchIndexing
+}
+
+/** Startup backfill progress, reported on every search (and health) response. */
+export interface SearchIndexing {
+  /** Files with uncommitted documents in the current batch. */
+  pendingFiles: number
+  /** False while the startup backfill is still running. */
+  ready: boolean
+  /** Transcript files finished in this sweep. */
+  filesDone: number
+  /** Transcript files this sweep will visit. 0 until the directory walk finishes. */
+  filesTotal: number
+}
+
+export const SEARCH_INDEXING_IDLE: SearchIndexing = {
+  pendingFiles: 0,
+  ready: true,
+  filesDone: 0,
+  filesTotal: 0,
 }
 
 /** Hits returned per session group. */

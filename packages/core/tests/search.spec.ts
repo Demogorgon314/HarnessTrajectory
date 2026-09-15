@@ -22,7 +22,7 @@ describe('search contract', () => {
       minLength: SEARCH_MIN_QUERY_LENGTH,
       totalHits: 1,
       truncated: false,
-      indexing: { pendingFiles: 0, ready: true },
+      indexing: { pendingFiles: 0, ready: true, filesDone: 0, filesTotal: 0 },
       groups: [{
         kind: 'claude',
         sessionId: 'main-1',

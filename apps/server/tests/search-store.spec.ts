@@ -196,11 +196,11 @@ describe('search', () => {
 
   it('reports whether the startup backfill is still running', () => {
     const store = open()
-    expect(search(store, { q: 'anything', indexing: { pendingFiles: 3, ready: false } }).indexing)
-      .toEqual({ pendingFiles: 3, ready: false })
+    expect(search(store, { q: 'anything', indexing: { pendingFiles: 3, ready: false, filesDone: 2, filesTotal: 9 } }).indexing)
+      .toEqual({ pendingFiles: 3, ready: false, filesDone: 2, filesTotal: 9 })
     // Even a query that is answered without touching the index carries the state.
-    expect(search(store, { q: 'ab', indexing: { pendingFiles: 1, ready: false } }).indexing)
-      .toEqual({ pendingFiles: 1, ready: false })
+    expect(search(store, { q: 'ab', indexing: { pendingFiles: 1, ready: false, filesDone: 0, filesTotal: 4 } }).indexing)
+      .toEqual({ pendingFiles: 1, ready: false, filesDone: 0, filesTotal: 4 })
   })
 })
 

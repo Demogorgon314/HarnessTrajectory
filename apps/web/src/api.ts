@@ -1,8 +1,9 @@
 /** Browser client for the local server API. */
 
 import {
-  SEARCH_MIN_QUERY_LENGTH,
-  type HarnessKind, type SearchResponse, type SessionDetail, type SessionLiveEvent, type SessionSummary,
+  SEARCH_INDEXING_IDLE, SEARCH_MIN_QUERY_LENGTH,
+  type HarnessKind, type SearchIndexing, type SearchResponse, type SessionDetail, type SessionLiveEvent,
+  type SessionSummary,
 } from '@harness-trajectory/core'
 
 /** A non-2xx answer, carrying the status so callers can act on it. */
@@ -51,8 +52,20 @@ function searchDisabled(query: string): SearchResponse {
     groups: [],
     totalHits: 0,
     truncated: false,
-    indexing: { pendingFiles: 0, ready: true },
+    indexing: SEARCH_INDEXING_IDLE,
   }
+}
+
+export interface HealthResponse {
+  ok: boolean
+  search?: {
+    enabled: boolean
+    indexing: SearchIndexing
+  }
+}
+
+export function fetchHealth(signal?: AbortSignal): Promise<HealthResponse> {
+  return getJson('/api/health', signal)
 }
 
 /**

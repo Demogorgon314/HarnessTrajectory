@@ -9,7 +9,7 @@ import { DragHandle } from './DragHandle.tsx'
 import { HarnessFilter } from './HarnessFilter.tsx'
 import { SessionList } from './SessionList.tsx'
 import { SessionPane } from './SessionPane.tsx'
-import { SessionSearch } from './SessionSearch.tsx'
+import { IndexProgress, SessionSearch } from './SessionSearch.tsx'
 import {
   SIDEBAR_AUTO_COLLAPSE, SIDEBAR_COLLAPSED, clampSidebarWidth, setSidebarCollapsed, setSidebarWidth,
   sidebarStore, toggleGroupFold,
@@ -331,6 +331,7 @@ export function App() {
                 onChange={(event) => { setQuery(event.currentTarget.value) }}
               />
             </div>
+            <IndexProgress />
             {listError !== null && <div className={css.listError}>{listError}</div>}
             <SessionList
               sessions={filtered}

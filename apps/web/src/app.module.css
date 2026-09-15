@@ -565,6 +565,14 @@
   color: var(--dsw-alias-label-tertiary);
 }
 
+.indexStatus {
+  padding: 0 8px 8px;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
 .matchesState[data-tone='error'] {
   color: var(--dsw-alias-state-error-primary);
 }

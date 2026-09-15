@@ -78,7 +78,7 @@ function body(over: Partial<SearchResponse> = {}): SearchResponse {
     groups: [],
     totalHits: 0,
     truncated: false,
-    indexing: { pendingFiles: 0, ready: true },
+    indexing: { pendingFiles: 0, ready: true, filesDone: 0, filesTotal: 0 },
     ...over,
   }
 }
@@ -261,9 +261,12 @@ describe('states', () => {
   test('an index still building says so above whatever it already has', async () => {
     const { container } = mount('needle')
     await tick(DEBOUNCE)
-    await answer(body({ groups: [group()], totalHits: 1, indexing: { pendingFiles: 7, ready: false } }))
-    expect(container.textContent).toContain('Index building…')
-    expect(container.textContent).toContain('7 files left')
+    await answer(body({
+      groups: [group()],
+      totalHits: 1,
+      indexing: { pendingFiles: 7, ready: false, filesDone: 3, filesTotal: 10 },
+    }))
+    expect(container.textContent).toContain('Indexing 3 / 10')
     expect(screen.getByText('Port the Context tab')).toBeDefined()
   })
 

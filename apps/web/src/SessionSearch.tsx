@@ -11,9 +11,10 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
   SEARCH_MIN_QUERY_LENGTH,
-  type HarnessKind, type SearchHit, type SearchMatchRange, type SearchResponse, type SearchSessionGroup,
+  type HarnessKind, type SearchHit, type SearchIndexing, type SearchMatchRange, type SearchResponse,
+  type SearchSessionGroup,
 } from '@harness-trajectory/core'
-import { searchSessions } from './api.ts'
+import { fetchHealth, searchSessions } from './api.ts'
 import type { Route } from './App.tsx'
 import { HarnessMark, harnessMeta } from './harnesses.tsx'
 import { relativeTime } from './SessionList.tsx'
@@ -40,6 +41,50 @@ interface ContentSearchResult {
 }
 
 const IDLE: ContentSearchResult = { status: 'idle', response: null, error: null }
+
+const INDEXING_POLL_ACTIVE_MS = 500
+const INDEXING_POLL_IDLE_MS = 5_000
+
+export function indexingLabel(indexing: SearchIndexing): string {
+  if (indexing.filesTotal > 0) return `Indexing ${indexing.filesDone} / ${indexing.filesTotal}`
+  return 'Indexing…'
+}
+
+/** Poll `/api/health` so the sidebar can show backfill progress without a query. */
+export function useSearchIndexing(): { enabled: boolean; indexing: SearchIndexing } | null {
+  const [state, setState] = useState<{ enabled: boolean; indexing: SearchIndexing } | null>(null)
+  const ready = state?.indexing.ready ?? true
+  const enabled = state?.enabled ?? false
+
+  useEffect(() => {
+    let live = true
+    const controller = new AbortController()
+    const tick = async () => {
+      try {
+        const health = await fetchHealth(controller.signal)
+        if (!live || health.search === undefined) return
+        setState({ enabled: health.search.enabled, indexing: health.search.indexing })
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') return
+      }
+    }
+    void tick()
+    const timer = setInterval(() => { void tick() }, enabled && !ready ? INDEXING_POLL_ACTIVE_MS : INDEXING_POLL_IDLE_MS)
+    return () => {
+      live = false
+      controller.abort()
+      clearInterval(timer)
+    }
+  }, [enabled, ready])
+
+  return state
+}
+
+export function IndexProgress() {
+  const state = useSearchIndexing()
+  if (state === null || !state.enabled || state.indexing.ready) return null
+  return <div className={css.indexStatus}>{indexingLabel(state.indexing)}</div>
+}
 
 export interface ContentSearchOptions {
   debounceMs?: number | undefined
@@ -259,10 +304,7 @@ export function SessionSearch({ query, kinds, selected, onSelect, debounceMs, li
       {error !== null && <div className={css.matchesState} data-tone="error">{error}</div>}
       {disabled && <div className={css.matchesState}>Search index disabled</div>}
       {indexing && (
-        <div className={css.matchesState}>
-          Index building…
-          {response.indexing.pendingFiles > 0 && ` ${response.indexing.pendingFiles} files left`}
-        </div>
+        <div className={css.matchesState}>{indexingLabel(response.indexing)}</div>
       )}
       {groups.map(group => (
         <MatchGroup

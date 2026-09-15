@@ -13,8 +13,8 @@
  */
 
 import {
-  SEARCH_DEFAULT_LIMIT, SEARCH_GROUP_HIT_LIMIT, SEARCH_MAX_LIMIT, SEARCH_MIN_QUERY_LENGTH,
-  type HarnessKind, type SearchHit, type SearchMatchRange, type SearchResponse,
+  SEARCH_DEFAULT_LIMIT, SEARCH_GROUP_HIT_LIMIT, SEARCH_INDEXING_IDLE, SEARCH_MAX_LIMIT, SEARCH_MIN_QUERY_LENGTH,
+  type HarnessKind, type SearchHit, type SearchIndexing, type SearchMatchRange, type SearchResponse,
   type SearchRole, type SearchSessionGroup,
 } from '@harness-trajectory/core'
 import type { SearchStore } from './store.ts'
@@ -45,7 +45,7 @@ export interface SearchOptions {
   limit?: number
   /** Session title/cwd/updatedAt lookup, normally `SessionIndex.get`. */
   describe?: (kind: HarnessKind, sessionId: string) => SearchSessionFacts | undefined
-  indexing?: { pendingFiles: number; ready: boolean }
+  indexing?: SearchIndexing
 }
 
 const ROLES: ReadonlySet<string> = new Set(['human', 'assistant', 'tool', 'other'])
@@ -128,7 +128,7 @@ function countSql(byKind: boolean): string {
 export function search(store: SearchStore, options: SearchOptions): SearchResponse {
   const q = options.q.trim()
   const limit = Math.max(1, Math.min(options.limit ?? SEARCH_DEFAULT_LIMIT, SEARCH_MAX_LIMIT))
-  const indexing = options.indexing ?? { pendingFiles: 0, ready: true }
+  const indexing = options.indexing ?? SEARCH_INDEXING_IDLE
   const empty: SearchResponse = {
     enabled: true,
     query: q,

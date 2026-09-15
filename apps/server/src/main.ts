@@ -79,10 +79,24 @@ Harness roots are never written to.`)
     console.log(`[harness-trajectory] search index ${dbPath} (building in the background)`)
   }
   const started = Date.now()
+  let lastProgress = ''
+  const logSearchProgress = (): void => {
+    if (search === undefined) return
+    const stats = search.indexer.stats()
+    if (stats.filesTotal === 0 && !stats.ready) return
+    const line = `[harness-trajectory] search backfill ${stats.filesDone}/${stats.filesTotal} files, `
+      + `${search.store.docCount()} docs`
+    if (line === lastProgress) return
+    lastProgress = line
+    console.log(line)
+  }
+  const progressTimer = search === undefined ? null : setInterval(logSearchProgress, 1000)
   index.start().then(() => {
+    if (progressTimer !== null) clearInterval(progressTimer)
     const sessions = index.list()
     console.log(`[harness-trajectory] indexed ${sessions.length} sessions in ${Date.now() - started}ms`)
     if (search === undefined) return
+    logSearchProgress()
     let bytes = 0
     try {
       bytes = statSync(dbPath).size
@@ -92,10 +106,12 @@ Harness roots are never written to.`)
     console.log(`[harness-trajectory] search backfill: ${search.store.fileCount()} files, `
       + `${search.store.docCount()} docs, ${Date.now() - started}ms, ${(bytes / 1e6).toFixed(1)} MB`)
   }, (error: unknown) => {
+    if (progressTimer !== null) clearInterval(progressTimer)
     console.error('[harness-trajectory] startup scan failed:', error)
     process.exit(1)
   })
   const shutdown = () => {
+    if (progressTimer !== null) clearInterval(progressTimer)
     index.stop()
     search?.close()
     process.exit(0)

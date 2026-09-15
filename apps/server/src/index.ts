@@ -191,10 +191,23 @@ export class SessionIndex extends EventEmitter {
 
   async start(): Promise<void> {
     this.stopped = false
+    // Walk every root first so the search UI can show N/M from the first file,
+    // instead of a total that jumps each time a harness directory is entered.
+    const planned: { root: HarnessRoot; paths: string[] }[] = []
     for (const root of this.roots) {
       if (this.stopped) return
-      await this.scanRoot(root)
+      const paths = (await walk(root.dir)).filter(path => classifyPath(root.kind, root.dir, path) !== null)
+      planned.push({ root, paths })
+    }
+    this.search?.setBackfillPlan(planned.reduce((count, item) => count + item.paths.length, 0))
+    for (const { root, paths } of planned) {
       if (this.stopped) return
+      for (const path of paths) {
+        if (this.stopped) return
+        await this.register(root, path, true)
+        this.search?.noteBackfillFile()
+        await yieldTurn()
+      }
       if (this.watchEnabled) this.watchRoot(root)
     }
     if (this.stopped) return
@@ -319,15 +332,6 @@ export class SessionIndex extends EventEmitter {
   }
 
   // -- discovery -----------------------------------------------------------
-
-  private async scanRoot(root: HarnessRoot): Promise<void> {
-    const paths = await walk(root.dir)
-    for (const path of paths) {
-      if (this.stopped) return
-      await this.register(root, path, true)
-      await yieldTurn()
-    }
-  }
 
   /**
    * Add a transcript to the index. During the initial scan its content only

@@ -18,7 +18,7 @@
  * and not re-inserted.
  */
 
-import type { HarnessKind } from '@harness-trajectory/core'
+import type { HarnessKind, SearchIndexing } from '@harness-trajectory/core'
 import { extractSearchDocs, type SearchDocDraft } from './extract.ts'
 import type { SearchDoc, SearchFileKey, SearchStore } from './store.ts'
 
@@ -60,6 +60,8 @@ export class SearchIndexer {
   private readonly resets = new Set<string>()
   private timer: NodeJS.Timeout | null = null
   private backfilling = true
+  private backfillDone = 0
+  private backfillTotal = 0
 
   constructor(options: SearchIndexerOptions) {
     this.store = options.store
@@ -224,11 +226,27 @@ export class SearchIndexer {
     this.backfilling = false
   }
 
-  stats(): { pendingFiles: number; ready: boolean } {
+  /** How many transcript files the startup sweep will visit. */
+  setBackfillPlan(total: number): void {
+    this.backfillTotal = total
+    this.backfillDone = 0
+  }
+
+  /** One file from the plan has been consumed (indexed or skipped). */
+  noteBackfillFile(): void {
+    this.backfillDone += 1
+  }
+
+  stats(): SearchIndexing {
     const pending = new Set<string>(this.resets)
     for (const doc of this.batch) pending.add(doc.path)
     for (const path of this.progress.keys()) pending.add(path)
-    return { pendingFiles: pending.size, ready: !this.backfilling }
+    return {
+      pendingFiles: pending.size,
+      ready: !this.backfilling,
+      filesDone: this.backfillDone,
+      filesTotal: this.backfillTotal,
+    }
   }
 
   /** Flush and release the timer; the store is closed by its owner. */

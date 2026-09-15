@@ -6,7 +6,7 @@ import { extname, join, normalize } from 'node:path'
 import { Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import {
-  HARNESS_KINDS, SEARCH_DEFAULT_LIMIT, SEARCH_MAX_LIMIT, SEARCH_MIN_QUERY_LENGTH,
+  HARNESS_KINDS, SEARCH_DEFAULT_LIMIT, SEARCH_INDEXING_IDLE, SEARCH_MAX_LIMIT, SEARCH_MIN_QUERY_LENGTH,
   type HarnessKind, type SearchResponse, type SessionLiveEvent,
 } from '@harness-trajectory/core'
 import { scopeToFile, type SessionIndex } from './index.ts'
@@ -47,14 +47,20 @@ function searchDisabled(query: string): SearchResponse {
     groups: [],
     totalHits: 0,
     truncated: false,
-    indexing: { pendingFiles: 0, ready: true },
+    indexing: SEARCH_INDEXING_IDLE,
   }
 }
 
 export function createApp({ index, staticDir, search: searchService }: AppOptions): Hono {
   const app = new Hono()
 
-  app.get('/api/health', c => c.json({ ok: true }))
+  app.get('/api/health', (c) => {
+    const indexing = searchService === undefined ? SEARCH_INDEXING_IDLE : searchService.indexer.stats()
+    return c.json({
+      ok: true,
+      search: { enabled: searchService !== undefined, indexing },
+    })
+  })
 
   app.get('/api/sessions', (c) => {
     const kind = c.req.query('kind')

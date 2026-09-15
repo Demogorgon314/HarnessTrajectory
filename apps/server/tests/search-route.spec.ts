@@ -139,9 +139,28 @@ describe('GET /api/search', () => {
       groups: [],
       totalHits: 0,
       truncated: false,
-      indexing: { pendingFiles: 0, ready: true },
+      indexing: { pendingFiles: 0, ready: true, filesDone: 0, filesTotal: 0 },
     })
     // The rest of the API is unaffected.
     expect((await app.request('/api/sessions')).status).toBe(200)
+  })
+
+  it('reports backfill progress on /api/health', async () => {
+    const withSearch = createApp({ index, search: service })
+    expect(await (await withSearch.request('/api/health')).json()).toEqual({
+      ok: true,
+      search: {
+        enabled: true,
+        indexing: { pendingFiles: 0, ready: true, filesDone: 2, filesTotal: 2 },
+      },
+    })
+    const without = createApp({ index })
+    expect(await (await without.request('/api/health')).json()).toEqual({
+      ok: true,
+      search: {
+        enabled: false,
+        indexing: { pendingFiles: 0, ready: true, filesDone: 0, filesTotal: 0 },
+      },
+    })
   })
 })
