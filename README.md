@@ -124,13 +124,9 @@ Tests use hand-written synthetic records only. Never commit real transcript cont
 - **Per-call tokens.** Grok Build reports usage per turn; the per-call split is an estimate
   weighted by each call's own total. Codex compaction summaries are encrypted in the rollout.
 - **Large sessions** load fully into the browser. A 60 MB rollout takes a few seconds.
-- **The search index is big.** It is the one thing the server writes: a single
-  `search.sqlite` under the cache directory. A trigram index is roughly three times the
-  text it covers, and the text itself is a fraction of the transcripts. On a 730 MB corpus
-  (193 files across the four harnesses) the first scan indexed 149 files and 48k records in
-  about 10 s and left a **254 MB** database; a `-wal` sidecar adds up to ~80 MB while the
-  backfill runs, and is folded back in when it finishes. Delete the file to reclaim the
-  space, or set `HARNESS_TRAJECTORY_SEARCH=0`.
+- **The search index is big.** The server writes one `search.sqlite` under the cache
+  directory; the first build runs in the background after listen. Delete the file to
+  reclaim the space, or set `HARNESS_TRAJECTORY_SEARCH=0`.
 - **Search granularity.** Queries shorter than three characters return nothing: the trigram
   tokenizer cannot index them. Each record is indexed up to 16 KB, so a match past that
   point in a very large tool output is not found. Compaction summaries, system reminders,

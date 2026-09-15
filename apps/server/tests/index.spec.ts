@@ -797,3 +797,24 @@ describe('SessionIndex — Grok Build', () => {
     unsubscribe()
   })
 })
+
+describe('SessionIndex start can be cancelled', () => {
+  it('stop() during start() returns and does not hang', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'harness-trajectory-stop-'))
+    try {
+      await mkdir(join(dir, 'claude', '-slug'), { recursive: true })
+      await writeFile(join(dir, 'claude', '-slug', 'main-1.jsonl'), jsonl([
+        claudeUser('A prompt', 'main-1', 0),
+      ]))
+      const index = new SessionIndex({
+        roots: [{ kind: 'claude', dir: join(dir, 'claude') }],
+        watch: false,
+      })
+      const running = index.start()
+      index.stop()
+      await running
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})

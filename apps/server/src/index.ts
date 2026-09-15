@@ -30,6 +30,11 @@ const CHUNK_LINES = 400
  */
 const INITIAL_CHUNK_BYTES = 8 * 1024 * 1024
 
+/** Let the HTTP server run during the startup sweep (SQLite writes are sync). */
+function yieldTurn(): Promise<void> {
+  return new Promise(resolve => setImmediate(resolve))
+}
+
 interface FileEntry {
   kind: HarnessKind
   path: string
@@ -174,6 +179,7 @@ export class SessionIndex extends EventEmitter {
   private readonly watchEnabled: boolean
   private readonly now: () => number
   private readonly search: SearchIndexer | undefined
+  private stopped = false
 
   constructor(options: SessionIndexOptions) {
     super()
@@ -184,10 +190,14 @@ export class SessionIndex extends EventEmitter {
   }
 
   async start(): Promise<void> {
+    this.stopped = false
     for (const root of this.roots) {
+      if (this.stopped) return
       await this.scanRoot(root)
+      if (this.stopped) return
       if (this.watchEnabled) this.watchRoot(root)
     }
+    if (this.stopped) return
     // Everything on disk has been seen: commit the backfill and forget the
     // files that are gone. Only now does search report itself as ready.
     this.search?.finishBackfill(this.files.keys())
@@ -198,6 +208,7 @@ export class SessionIndex extends EventEmitter {
   }
 
   stop(): void {
+    this.stopped = true
     for (const watcher of this.watchers) watcher.close()
     this.watchers.length = 0
     if (this.poll !== null) clearInterval(this.poll)
@@ -312,7 +323,9 @@ export class SessionIndex extends EventEmitter {
   private async scanRoot(root: HarnessRoot): Promise<void> {
     const paths = await walk(root.dir)
     for (const path of paths) {
+      if (this.stopped) return
       await this.register(root, path, true)
+      await yieldTurn()
     }
   }
 
@@ -629,9 +642,11 @@ export class SessionIndex extends EventEmitter {
   private async consumeInitial(entry: FileEntry, size: number, mtimeMs: number, initial: boolean): Promise<void> {
     let end = Math.min(INITIAL_CHUNK_BYTES, size)
     for (;;) {
+      if (this.stopped) return
       await this.consume(entry, end, mtimeMs, initial)
       if (end >= size) return
       end = Math.min(end + INITIAL_CHUNK_BYTES, size)
+      await yieldTurn()
     }
   }
 

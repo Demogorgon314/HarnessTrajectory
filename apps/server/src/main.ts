@@ -64,24 +64,6 @@ Harness roots are never written to.`)
   index.on('error', (error: unknown) => {
     console.error('[harness-trajectory] watcher error:', error)
   })
-  const started = Date.now()
-  await index.start()
-  const sessions = index.list()
-  console.log(`[harness-trajectory] indexed ${sessions.length} sessions in ${Date.now() - started}ms`)
-  for (const root of roots) console.log(`  ${root.kind}: ${root.dir}`)
-  if (search === undefined) {
-    console.log('[harness-trajectory] search disabled (HARNESS_TRAJECTORY_SEARCH=0)')
-  } else {
-    let bytes = 0
-    try {
-      bytes = statSync(dbPath).size
-    } catch {
-      // In-memory or not yet flushed to disk.
-    }
-    console.log(`[harness-trajectory] search index ${dbPath}`)
-    console.log(`[harness-trajectory] search backfill: ${search.store.fileCount()} files, `
-      + `${search.store.docCount()} docs, ${Date.now() - started}ms, ${(bytes / 1e6).toFixed(1)} MB`)
-  }
   const staticDir = findStaticDir()
   const app = createApp({ index, staticDir, search })
   serve({ fetch: app.fetch, port, hostname }, (info) => {
@@ -89,6 +71,29 @@ Harness roots are never written to.`)
     if (staticDir === undefined) {
       console.log('[harness-trajectory] no built web UI found; run `pnpm --filter @harness-trajectory/web dev` for the dev server')
     }
+  })
+  for (const root of roots) console.log(`  ${root.kind}: ${root.dir}`)
+  if (search === undefined) {
+    console.log('[harness-trajectory] search disabled (HARNESS_TRAJECTORY_SEARCH=0)')
+  } else {
+    console.log(`[harness-trajectory] search index ${dbPath} (building in the background)`)
+  }
+  const started = Date.now()
+  index.start().then(() => {
+    const sessions = index.list()
+    console.log(`[harness-trajectory] indexed ${sessions.length} sessions in ${Date.now() - started}ms`)
+    if (search === undefined) return
+    let bytes = 0
+    try {
+      bytes = statSync(dbPath).size
+    } catch {
+      // In-memory or not yet flushed to disk.
+    }
+    console.log(`[harness-trajectory] search backfill: ${search.store.fileCount()} files, `
+      + `${search.store.docCount()} docs, ${Date.now() - started}ms, ${(bytes / 1e6).toFixed(1)} MB`)
+  }, (error: unknown) => {
+    console.error('[harness-trajectory] startup scan failed:', error)
+    process.exit(1)
   })
   const shutdown = () => {
     index.stop()
