@@ -1,45 +1,81 @@
-.root {
+/*
+ * Ported from deepseek-harness packages/client/ui-attachment/src/MessageImage.module.css
+ * (MIT, © DeepSeek — see packages/ui/LICENSE.deepseek-harness). Verbatim apart from the
+ * :focus-visible rings, which this app draws on every interactive surface.
+ */
+
+.gallery {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
-  padding: 4px 0;
+  gap: 10px;
+  max-width: 100%;
 }
 
-.root[data-align='end'] {
+.gallery[data-align='end'] {
   justify-content: flex-end;
+  align-self: flex-end;
 }
 
-.link {
-  display: inline-flex;
-  border-radius: 6px;
+.gallery[data-align='start'] {
+  justify-content: flex-start;
+  align-self: flex-start;
+}
+
+.frame {
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0;
   overflow: hidden;
-  border: 1px solid var(--dsw-alias-border-l2);
-  background: var(--dsw-alias-bg-layer-2);
-  line-height: 0;
+  border: 0.5px solid var(--dsw-alias-border-l2-darkmode-thin);
+  border-radius: 16px;
+  background: var(--dsw-alias-interactive-bg-hover);
+  cursor: zoom-in;
 }
 
-.image {
-  max-width: min(100%, 480px);
-  max-height: 320px;
-  object-fit: contain;
+.frame[data-variant='tile'] {
+  width: 64px;
+  height: 64px;
+  min-width: 64px;
+  min-height: 64px;
 }
 
-.compact {
-  width: 56px;
-  height: 56px;
+.frame img {
+  display: block;
+  width: 100%;
+  height: 100%;
   object-fit: cover;
 }
 
-.placeholder {
-  display: inline-block;
-  width: 56px;
-  height: 56px;
-  border-radius: 6px;
-  background: var(--dsw-alias-bg-layer-2);
-  border: 1px dashed var(--dsw-alias-border-l2);
+.loading,
+.error {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+  line-height: 18px;
 }
 
-.missing {
-  font: var(--dsw-font-xxs-12);
-  color: var(--dsw-alias-label-tertiary);
+.error {
+  max-width: 240px;
+  padding: 10px 12px;
+  border: 0.5px solid var(--dsw-alias-border-l2-darkmode-thin);
+  border-radius: 10px;
+  background: var(--dsw-alias-interactive-bg-hover-danger);
+  cursor: pointer;
+}
+
+/* A failed tile keeps the 64px grid cell instead of growing to its copy. */
+.error[data-variant='tile'] {
+  width: 64px;
+  height: 64px;
+  padding: 4px;
+  overflow: hidden;
+  border-radius: 16px;
+}
+
+.frame:focus-visible,
+.error:focus-visible {
+  outline: 1px solid var(--dsw-alias-state-business-primary);
+  outline-offset: 2px;
 }

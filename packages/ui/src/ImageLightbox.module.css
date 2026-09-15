@@ -1,0 +1,91 @@
+/*
+ * Ported from deepseek-harness packages/client/ui-attachment/src/ImageLightbox.module.css
+ * (MIT, © DeepSeek — see packages/ui/LICENSE.deepseek-harness).
+ *
+ * Adapted: z-index 2000 instead of dsh's 1000 — this app portals its Menu list at
+ * 1100 (primitives/Menu.module.css), above Tooltip/Menu popovers at 100-101 and the
+ * context dashboard's modal at 200, so the preview has to clear 1100 to cover an open
+ * menu. `--dsw-mask-blur` and `--dsw-shadow-lv3` are not in theme/design-platform.css
+ * (only the alias layer was vendored), so both carry a literal fallback. The caption
+ * and the :focus-visible rings are this app's additions.
+ */
+
+.backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  display: grid;
+  place-items: center;
+  padding: 40px;
+}
+
+/* Same mask recipe as the Modal primitive and the settings dialog. A separate
+   layer, not a background on .backdrop: backdrop-filter there would blur the
+   previewed image and the close control along with the page. */
+.mask {
+  position: absolute;
+  inset: 0;
+  background: var(--dsw-alias-bg-mask-1, rgba(0, 0, 0, 0.45));
+  backdrop-filter: var(--dsw-mask-blur, blur(2px));
+}
+
+.image {
+  position: relative;
+  max-width: min(100%, 1600px);
+  max-height: calc(100vh - 80px);
+  object-fit: contain;
+  border-radius: 12px;
+  background: var(--dsw-specific-input-major);
+  box-shadow: var(--dsw-shadow-lv3, 0 12px 32px rgba(0, 0, 0, 0.4));
+}
+
+/* Rides in the backdrop's padding band rather than in the grid cell, so the
+   image keeps dsh's exact `calc(100vh - 80px)` box whether or not it is captioned. */
+.caption {
+  position: fixed;
+  right: 40px;
+  bottom: 12px;
+  left: 40px;
+  z-index: 1;
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  margin: 0;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.captionName {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.captionSize {
+  color: var(--dsw-alias-label-tertiary);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.close {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border: 0.5px solid var(--dsw-alias-border-l2-darkmode-thin);
+  border-radius: 999px;
+  corner-shape: round;
+  background: var(--dsw-specific-input-major);
+  color: var(--dsw-alias-label-primary);
+  cursor: pointer;
+}
+
+.close:focus-visible {
+  outline: 1px solid var(--dsw-alias-state-business-primary);
+  outline-offset: 2px;
+}

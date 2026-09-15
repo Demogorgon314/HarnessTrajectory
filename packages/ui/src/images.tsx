@@ -1,14 +1,29 @@
-/** Durable image rendering for trajectory records (replaces the dsh image slot). */
+/**
+ * Message image gallery, ported from deepseek-harness (MIT, © DeepSeek — see
+ * packages/ui/LICENSE.deepseek-harness):
+ *   packages/client/ui-attachment/src/MessageImage.tsx
+ *   packages/client/ui-attachment/src/MessageImage.module.css
+ *   packages/client/ui-attachment/src/client/labels.ts (label shape only)
+ *
+ * Ported verbatim except: `ImageGallery` is exported as `TrajectoryImages` with the
+ * owner prop names the trajectory table already passes (`loadImage`), labels default
+ * to English constants (this package carries no i18n), the thumbnail announces
+ * `aria-haspopup="dialog"`, the opened preview gets a caption, and dimensions of 0
+ * count as unknown — dsh's intake probe guaranteed real pixels, harness transcripts
+ * do not.
+ */
 
-import { useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useState, type ReactElement, type ReactNode } from 'react'
 import type { ImageAttachmentRef } from '@harness-trajectory/core'
+import { ImageLightbox, DEFAULT_IMAGE_LIGHTBOX_LABELS, type ImageLightboxLabels } from './ImageLightbox.tsx'
 import css from './images.module.css'
 
-/** Resolve an image reference to a URL, with an optional synchronous cache probe. */
+/** Loads a session-authorized durable image URL and may expose a cached URL synchronously. */
 export type MessageImageLoader = ((attachment: ImageAttachmentRef) => Promise<string>) & {
   peek?: (attachment: ImageAttachmentRef) => string | undefined
 }
 
+/** One gallery entry: a durable admitted reference, or a submission echo's local preview. */
 export type MessageImageSource =
   | { readonly attachment: ImageAttachmentRef }
   | {
@@ -20,77 +35,179 @@ export type MessageImageSource =
     }
   }
 
+/** Message-image strings; dsh resolved these from the conversation namespace. */
+export interface MessageImageLabels {
+  /** Fallback display name for an unnamed image. */
+  image: string
+  /** Thumbnail tooltip inviting the original-image preview. */
+  open: string
+  /** Accessible thumbnail label; receives the image's display name. */
+  openNamed: (label: string) => string
+  /** Loading placeholder shown until bytes resolve. */
+  loading: string
+  /** Retry-control label shown when the load fails. */
+  loadFailed: string
+  /** Lightbox strings forwarded to the opened preview. */
+  lightbox: ImageLightboxLabels
+}
+
+/** English defaults standing in for dsh's injected translations. */
+export const DEFAULT_MESSAGE_IMAGE_LABELS: MessageImageLabels = {
+  image: 'Image',
+  open: 'View original',
+  openNamed: label => `${label}, click to view the original`,
+  loading: 'Loading image…',
+  loadFailed: 'Image failed to load, click to retry',
+  lightbox: DEFAULT_IMAGE_LIGHTBOX_LABELS,
+}
+
 export interface MessageImagesOwnerProps {
   images: readonly MessageImageSource[]
   loadImage: MessageImageLoader
   align: 'start' | 'end'
   compact?: boolean
+  labels?: MessageImageLabels
 }
 
 export type RenderMessageImages = (owner: Omit<MessageImagesOwnerProps, 'loadImage'>) => ReactNode
 
-function AttachmentImage({ attachment, loadImage, compact }: {
-  attachment: ImageAttachmentRef
-  loadImage: MessageImageLoader
-  compact: boolean
-}) {
-  const [url, setUrl] = useState<string | undefined>(() => loadImage.peek?.(attachment))
-  const [failed, setFailed] = useState(false)
+/** Display box for a lone image (DeepSeek Chat rule): long edge 240px with
+ * the rendered aspect ratio clamped to [0.25, 4] — the overflow is cropped by
+ * `object-fit: cover` — and never upscaled past the image's natural size. The
+ * crop anchor keeps the top of very tall images and the left of very wide
+ * ones, where the informative content usually starts. */
+function singleFit(
+  dimensions: { readonly width: number; readonly height: number },
+): { width: number; height: number; objectPosition: string } {
+  const natural = dimensions.width / dimensions.height
+  const ratio = Math.min(4, Math.max(0.25, natural))
+  const box = ratio >= 1 ? { width: 240, height: 240 / ratio } : { width: 240 * ratio, height: 240 }
+  const scale = Math.min(1, dimensions.width / box.width, dimensions.height / box.height)
+  return {
+    width: Math.max(1, Math.round(box.width * scale)),
+    height: Math.max(1, Math.round(box.height * scale)),
+    objectPosition: natural < 0.25 ? 'center top' : natural > 4 ? 'left center' : 'center',
+  }
+}
+
+/**
+ * Intrinsic dimensions of one gallery entry; unknown until a preview's intake probe
+ * resolved. Unlike dsh, a recorded 0 counts as unknown: harness references carry
+ * whatever the transcript wrote, and 0 would divide `singleFit` into NaN.
+ */
+function dimensionsOf(image: MessageImageSource): { readonly width: number; readonly height: number } | undefined {
+  const source = 'attachment' in image ? image.attachment : image.preview
+  const { width, height } = source
+  return width !== undefined && height !== undefined && width > 0 && height > 0
+    ? { width, height }
+    : undefined
+}
+
+/**
+ * Compact history renderer with retryable loading and click-to-open original
+ * preview. A lone image renders at its `singleFit` size; an image among
+ * several renders as a fixed 64px square tile. The preview arm displays its
+ * local URL directly — no loader round-trip, no failure/retry surface.
+ *
+ * @param props.image - the durable reference to load, or the local preview to display.
+ * @param props.load - session-authorized URL loader for the durable arm.
+ * @param props.variant - `single` for a message's lone image, `tile` otherwise.
+ * @param props.labels - resolved strings (tooltip, loading, retry, lightbox).
+ * @returns the bounded thumbnail button, or the retry control on failure.
+ */
+export function MessageImage({ image, load, variant, labels = DEFAULT_MESSAGE_IMAGE_LABELS }: {
+  image: MessageImageSource
+  load: MessageImageLoader
+  variant: 'single' | 'tile'
+  labels?: MessageImageLabels
+}): ReactElement {
+  const preview = 'preview' in image ? image.preview : undefined
+  const attachment = 'attachment' in image ? image.attachment : undefined
+  const [loaded, setLoaded] = useState<string | null>(() =>
+    attachment === undefined ? null : (load.peek?.(attachment) ?? null))
+  const [error, setError] = useState(false)
+  const [open, setOpen] = useState(false)
+  // Retry re-arms the one load effect below, so every attempt — first load or
+  // retry — runs under the same liveness guard and the same reset.
+  const [attempt, setAttempt] = useState(0)
+  const request = useCallback(() => { setAttempt(a => a + 1) }, [])
+  const close = useCallback(() => { setOpen(false) }, [])
+  const dimensions = useMemo(() => dimensionsOf(image), [image])
+  const fit = useMemo(
+    () => {
+      if (variant !== 'single') return undefined
+      // A preview whose intake probe has not resolved sizes as a square crop;
+      // the durable replacement restores the exact fit.
+      return dimensions === undefined
+        ? { width: 240, height: 240, objectPosition: 'center' }
+        : singleFit(dimensions)
+    },
+    [dimensions, variant],
+  )
+
   useEffect(() => {
-    if (url !== undefined) return
-    let cancelled = false
-    loadImage(attachment).then((resolved) => {
-      if (!cancelled) setUrl(resolved)
-    }, () => {
-      if (!cancelled) setFailed(true)
-    })
-    return () => { cancelled = true }
-  }, [attachment, loadImage, url])
-  const label = attachment.name ?? attachment.attachmentId
-  if (failed) {
-    return <span className={css.missing} title={label}>{label}</span>
-  }
-  if (url === undefined) {
-    return <span className={css.placeholder} aria-busy="true" title={label} />
-  }
+    if (attachment === undefined) return
+    let live = true
+    setError(false)
+    setLoaded(load.peek?.(attachment) ?? null)
+    void load(attachment).then((url) => { if (live) setLoaded(url) }).catch(() => { if (live) setError(true) })
+    return () => { live = false }
+  }, [attachment, load, attempt])
+
+  const src = preview?.url ?? loaded
+  const label = (preview?.name ?? attachment?.name) ?? labels.image
+  if (error) return <button type="button" className={css.error} data-variant={variant} onClick={request}>{labels.loadFailed}</button>
   return (
-    <a className={css.link} href={url} target="_blank" rel="noreferrer" title={label}>
-      <img className={compact ? css.compact : css.image} src={url} alt={label} loading="lazy" />
-    </a>
+    <>
+      <button
+        type="button"
+        className={css.frame}
+        data-variant={variant}
+        style={fit === undefined ? undefined : { width: fit.width, height: fit.height }}
+        title={labels.open}
+        aria-label={labels.openNamed(label)}
+        aria-haspopup="dialog"
+        onClick={() => { if (src !== null) setOpen(true) }}
+      >
+        {src === null
+          ? <span className={css.loading}>{labels.loading}</span>
+          : <img src={src} alt={label} style={fit === undefined ? undefined : { objectPosition: fit.objectPosition }} />}
+      </button>
+      {open && src !== null && (
+        <ImageLightbox
+          src={src}
+          alt={label}
+          labels={labels.lightbox}
+          caption={{ name: label, ...(dimensions ?? {}) }}
+          onClose={close}
+        />
+      )}
+    </>
   )
 }
 
-/** Default gallery: one row of thumbnails that open the full image in a new tab. */
-export function TrajectoryImages({ images, loadImage, align, compact = false }: MessageImagesOwnerProps) {
+/** Wrapping image group shared by user and assistant history: a lone image
+ * renders large unless its owning mixed-attachment row requests compact tiles. */
+export function TrajectoryImages({
+  images,
+  loadImage,
+  align,
+  compact = false,
+  labels = DEFAULT_MESSAGE_IMAGE_LABELS,
+}: MessageImagesOwnerProps): ReactElement | null {
   if (images.length === 0) return null
+  const variant = compact || images.length > 1 ? 'tile' : 'single'
   return (
-    <div className={css.root} data-align={align}>
-      {images.map((source, index) => ('attachment' in source
-        ? (
-          <AttachmentImage
-            key={source.attachment.attachmentId}
-            attachment={source.attachment}
-            loadImage={loadImage}
-            compact={compact}
-          />
-        )
-        : (
-          <a
-            key={`${source.preview.url}-${index}`}
-            className={css.link}
-            href={source.preview.url}
-            target="_blank"
-            rel="noreferrer"
-            title={source.preview.name}
-          >
-            <img
-              className={compact ? css.compact : css.image}
-              src={source.preview.url}
-              alt={source.preview.name ?? ''}
-              loading="lazy"
-            />
-          </a>
-        )))}
+    <div className={css.gallery} data-align={align}>
+      {images.map((image, index) => (
+        <MessageImage
+          key={`${'attachment' in image ? image.attachment.attachmentId : image.preview.url}:${index}`}
+          image={image}
+          load={loadImage}
+          variant={variant}
+          labels={labels}
+        />
+      ))}
     </div>
   )
 }

@@ -7,9 +7,14 @@ export {
 export { deriveTrajectoryLayout, type TrajectoryTurnModel, type TrajectoryGroupModel } from './trajectory/layout.ts'
 export type { TrajectoryCellProps, TrajectoryCellKind } from './trajectory/trajectory-record.ts'
 export {
-  TrajectoryImages, type MessageImageLoader, type MessageImageSource, type MessageImagesOwnerProps,
-  type RenderMessageImages,
+  TrajectoryImages, MessageImage, DEFAULT_MESSAGE_IMAGE_LABELS,
+  type MessageImageLoader, type MessageImageSource, type MessageImagesOwnerProps,
+  type MessageImageLabels, type RenderMessageImages,
 } from './images.tsx'
+export {
+  ImageLightbox, DEFAULT_IMAGE_LIGHTBOX_LABELS,
+  type ImageLightboxProps, type ImageLightboxLabels, type ImageLightboxCaption,
+} from './ImageLightbox.tsx'
 export {
   createSnapshotStore, useSnapshotSelector, selectorHook,
   type ObservableSnapshot, type SnapshotStore, type SnapshotSelectorHook,
