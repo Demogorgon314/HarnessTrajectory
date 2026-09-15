@@ -55,8 +55,9 @@ Both parsers are incremental and must never throw on a malformed or unknown reco
   (`apps/server/src/cache.ts`). Harness roots stay read-only. The index is a cache:
   bump `SEARCH_SCHEMA_VERSION` instead of migrating. A search hit addresses a record by
   `(kind, sessionId, fileId, line)`, where `line` is the 0-based index of the record among
-  the file's non-blank lines — the same numbering `readLines` produces, so it matches the
-  SSE replay. Grok's synthetic sidecar line is not in the file and shifts nothing.
+  the file's non-blank lines — the same numbering `readLines` produces. SSE replay uses
+  that index as `startLine`. Grok's synthetic sidecar is emitted with `startLine: -1` and
+  is not a search hit, so it shifts nothing.
 - `snapshot()` returns the same object when nothing changed; touch the assembler only on
   real changes (the UI re-renders on identity).
 - Tests: no fixture files. Each spec hand-writes synthetic records with the real field

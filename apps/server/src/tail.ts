@@ -12,6 +12,34 @@ export interface ReadResult {
 }
 
 /**
+ * How many trailing bytes of `buffer` are an incomplete UTF-8 sequence.
+ *
+ * `Buffer.toString('utf8')` replaces a split multi-byte character with U+FFFD
+ * on both sides of a chunk boundary, which would silently corrupt a JSONL
+ * record. Callers that know more bytes follow (`to` is short of the file)
+ * withhold these bytes so the next read can decode the character whole.
+ */
+export function utf8IncompleteTail(buffer: Uint8Array): number {
+  const n = buffer.length
+  if (n === 0) return 0
+  let index = n - 1
+  let cont = 0
+  while (index >= 0 && cont < 3 && ((buffer[index] ?? 0) & 0xC0) === 0x80) {
+    cont += 1
+    index -= 1
+  }
+  if (index < 0) return n
+  const lead = buffer[index] ?? 0
+  const need = lead < 0x80 ? 0
+    : (lead & 0xE0) === 0xC0 ? 1
+    : (lead & 0xF0) === 0xE0 ? 2
+    : (lead & 0xF8) === 0xF0 ? 3
+    : 0
+  if (need === 0) return 0
+  return cont < need ? cont + 1 : 0
+}
+
+/**
  * Read every complete line between `from` and the end of the file (or `to`).
  * `rest` is prepended so a line split across reads reassembles.
  */
@@ -34,11 +62,16 @@ export async function readLines(
       if (bytesRead === 0) break
       filled += bytesRead
     }
-    const text = rest + buffer.subarray(0, filled).toString('utf8')
+    const slice = buffer.subarray(0, filled)
+    // A chunk that is not the current end of the file must not decode a
+    // character that continues in the next slice. At EOF, replacement is fine.
+    const hold = end < stat.size ? utf8IncompleteTail(slice) : 0
+    const usable = hold > 0 && hold < filled ? filled - hold : filled
+    const text = rest + slice.subarray(0, usable).toString('utf8')
     const split = splitLines(text)
     return {
       lines: split.lines.filter(line => line.trim() !== ''),
-      offset: from + filled,
+      offset: from + usable,
       rest: split.rest,
     }
   } finally {

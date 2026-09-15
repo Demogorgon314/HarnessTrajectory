@@ -219,13 +219,35 @@ describe('SearchIndexer', () => {
       indexer.queue(key, line, JSON.stringify(claudeUser(`prompt number ${line}`, 'm', line)))
     }
     expect(store.docCount()).toBe(5)
+    // The files row lands in the same transaction, so a crash here would not
+    // make the next start re-insert the same five documents.
+    expect(store.fileState(key.path)).toMatchObject({ indexedLines: 5 })
     indexer.queue(key, 5, JSON.stringify(claudeUser('prompt number 5', 'm', 5)))
     expect(store.docCount()).toBe(5)
     expect(indexer.stats().pendingFiles).toBe(1)
     indexer.flush()
     expect(store.docCount()).toBe(6)
+    expect(store.fileState(key.path)).toMatchObject({ indexedLines: 6 })
     expect(indexer.stats().pendingFiles).toBe(0)
     indexer.stop()
+  })
+
+  it('does not duplicate documents when a size flush is followed by a restart', () => {
+    const indexer = new SearchIndexer({ store, flushDelayMs: 60_000, maxBatchDocs: 3 })
+    const key = { path: '/r/c/main.jsonl', kind: 'claude' as const, sessionId: 'm', fileId: 'm' }
+    for (let line = 0; line < 3; line += 1) {
+      indexer.queue(key, line, JSON.stringify(claudeUser(`prompt number ${line}`, 'm', line)))
+    }
+    expect(store.docCount()).toBe(3)
+    indexer.stop()
+
+    const again = new SearchIndexer({ store, flushDelayMs: 60_000, maxBatchDocs: 3 })
+    expect(again.beginFile(key, { size: 4_000, mtimeMs: 2_000 })).toBe(3)
+    again.queue(key, 3, JSON.stringify(claudeUser('prompt number 3', 'm', 3)))
+    again.flush()
+    expect(store.docCount()).toBe(4)
+    expect(search(store, { q: 'prompt number 0' }).totalHits).toBe(1)
+    again.stop()
   })
 
   it('reports itself unready until the startup sweep finishes', () => {

@@ -171,11 +171,26 @@ export class SearchIndexer {
     try {
       this.store.transaction(() => {
         for (const path of resets) this.store.clearDocs(path)
+        const progressMap = new Map(progress)
+        // A size-triggered flush can land documents before `noteProgress` runs.
+        // The `files` row must go in the same transaction: without it, the next
+        // start sees no bookkeeping, re-extracts from line 0, and duplicates.
         for (const [path, list] of grouped) {
           const key = this.keys.get(path)
-          if (key !== undefined) this.store.insertDocs(key, list)
+          if (key === undefined) continue
+          this.store.insertDocs(key, list)
+          if (progressMap.has(path)) continue
+          const prev = this.store.fileState(path)
+          let maxLine = -1
+          for (const doc of list) if (doc.line > maxLine) maxLine = doc.line
+          progressMap.set(path, {
+            size: prev?.size ?? 0,
+            mtimeMs: prev?.mtimeMs ?? 0,
+            indexedBytes: prev?.indexedBytes ?? 0,
+            indexedLines: Math.max(prev?.indexedLines ?? 0, maxLine + 1),
+          })
         }
-        for (const [path, state] of progress) {
+        for (const [path, state] of progressMap) {
           const key = this.keys.get(path)
           if (key !== undefined) this.store.setFileState(key, state)
         }

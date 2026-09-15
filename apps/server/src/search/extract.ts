@@ -38,9 +38,10 @@
  *   server's own synthetic sidecar line is skipped.
  *
  * The rules that are the same everywhere: the human/injected split reuses the
- * classifier the meta scanner and the adapters use, image blocks and anything
- * that looks like embedded base64 are dropped, and each document is capped at
- * 16 KB so one `Write` of a large file cannot dominate the index.
+ * classifier the meta scanner and the adapters use, image blocks are skipped,
+ * embedded base64 runs are stripped (the surrounding prose is kept), and each
+ * document is capped at 16 KB so one `Write` of a large file cannot dominate
+ * the index.
  *
  * Never throws: an unknown or malformed record yields no documents.
  */
@@ -70,9 +71,16 @@ const CONTROL = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g
  * would inflate the trigram index by megabytes and can never be searched for.
  */
 const BASE64_RUN = /[A-Za-z0-9+/]{256,}={0,2}/
+/** A data-URL prefix; the payload itself is eaten by {@link BASE64_RUN}. */
+const DATA_URL_PREFIX = /data:[a-zA-Z0-9.+/-]*;base64,/gi
 
-function looksBinary(text: string): boolean {
-  return BASE64_RUN.test(text) || text.startsWith('data:')
+/** Strip embedded payloads; empty afterwards means the document was only payload. */
+function scrub(text: string): string {
+  return text
+    .replace(BASE64_RUN, ' ')
+    .replace(DATA_URL_PREFIX, ' ')
+    .replace(CONTROL, ' ')
+    .trim()
 }
 
 /** Collect the parts of a document, then hand back the trimmed, capped text. */
@@ -82,8 +90,8 @@ class DocBuilder {
   constructor(private readonly timeMs: number | null) {}
 
   add(role: SearchRole, text: string): void {
-    const cleaned = text.replace(CONTROL, ' ').trim()
-    if (cleaned === '' || looksBinary(cleaned)) return
+    const cleaned = scrub(text)
+    if (cleaned === '') return
     this.drafts.push({
       role,
       text: cleaned.length > MAX_DOC_CHARS ? cleaned.slice(0, MAX_DOC_CHARS) : cleaned,

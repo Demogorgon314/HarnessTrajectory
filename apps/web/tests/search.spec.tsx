@@ -54,7 +54,7 @@ function stubFetch(): void {
         },
         fail: (status, statusText, contentType = 'application/json') => {
           resolve({
-            ok: false,
+            ok: status >= 200 && status < 300,
             status,
             statusText,
             headers: new Headers({ 'content-type': contentType }),
@@ -298,6 +298,14 @@ describe('states', () => {
     expect(container.textContent).toContain('500 Internal Server Error')
   })
 
+  test('a Hono 500 (text/plain) is an error, not a disabled index', async () => {
+    const { container } = mount('needle')
+    await tick(DEBOUNCE)
+    await act(async () => { calls[0]?.fail(500, 'Internal Server Error', 'text/plain; charset=UTF-8') })
+    expect(container.textContent).toContain('500 Internal Server Error')
+    expect(screen.queryByText('Search index disabled')).toBeNull()
+  })
+
   test('a failed request shows its message', async () => {
     const { container } = mount('needle')
     await tick(DEBOUNCE)
@@ -415,6 +423,23 @@ describe('clicking', () => {
     expect(onSelect).toHaveBeenLastCalledWith({
       kind: 'claude', id: 'sess-1', file: 'sess-1/agent-a1b2', line: 40,
     })
+  })
+
+  test('two hits on the same record (text + tool) both render', async () => {
+    mount('needle')
+    await tick(DEBOUNCE)
+    await answer(body({
+      totalHits: 2,
+      groups: [group({
+        hitCount: 2,
+        hits: [
+          hit({ role: 'assistant', snippet: 'I will start with the server', matches: [] }),
+          hit({ role: 'tool', snippet: 'pnpm vitest run --project server', matches: [] }),
+        ],
+      })],
+    }))
+    expect(screen.getByText('I will start with the server')).toBeDefined()
+    expect(screen.getByText('pnpm vitest run --project server')).toBeDefined()
   })
 
   test('every row is a button, so the section is keyboard-reachable', async () => {

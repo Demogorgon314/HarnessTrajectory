@@ -198,9 +198,9 @@ function MatchGroup({ group, selected, onSelect }: {
         {project !== null && <span className={css.matchProject}>{project}</span>}
         <span className={css.matchCount}>{group.hitCount}</span>
       </button>
-      {group.hits.map(hit => (
+      {group.hits.map((hit, index) => (
         <button
-          key={`${hit.fileId}:${hit.line}`}
+          key={`${hit.fileId}:${hit.line}:${hit.role}:${index}`}
           type="button"
           className={css.matchHitRow}
           title={hit.snippet}

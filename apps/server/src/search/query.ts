@@ -113,6 +113,17 @@ function sql(byKind: boolean): string {
   `
 }
 
+/** Per-session totals, so a group's badge is not the page slice. */
+function countSql(byKind: boolean): string {
+  return `
+    select d.kind as kind, d.session_id as session_id, count(*) as n
+    from docs_fts
+    join docs d on d.id = docs_fts.rowid
+    where docs_fts match ?${byKind ? ' and d.kind = ?' : ''}
+    group by d.kind, d.session_id
+  `
+}
+
 /** Run one search over the index. Never throws: a broken query returns no groups. */
 export function search(store: SearchStore, options: SearchOptions): SearchResponse {
   const q = options.q.trim()
@@ -177,6 +188,24 @@ export function search(store: SearchStore, options: SearchOptions): SearchRespon
     }
     group.hitCount += 1
     if (group.hits.length < SEARCH_GROUP_HIT_LIMIT) group.hits.push(hit)
+  }
+
+  if (groups.size > 0) {
+    try {
+      const phrase = toPhraseQuery(q)
+      const countRows = options.kind === undefined
+        ? store.db.prepare(countSql(false)).all(phrase)
+        : store.db.prepare(countSql(true)).all(phrase, options.kind)
+      const totals = new Map<string, number>()
+      for (const row of countRows) {
+        totals.set(`${asText(row['kind'])} ${asText(row['session_id'])}`, asInt(row['n']))
+      }
+      for (const group of groups.values()) {
+        group.hitCount = totals.get(`${group.kind} ${group.sessionId}`) ?? group.hitCount
+      }
+    } catch {
+      // Keep the in-page counts; the ranked query already succeeded.
+    }
   }
 
   return {

@@ -69,13 +69,13 @@ export async function searchSessions(request: SearchRequest): Promise<SearchResp
     // `exactOptionalPropertyTypes`: never hand `fetch` an explicit undefined signal.
     ...(request.signal === undefined ? {} : { signal: request.signal }),
   })
-  // A build that serves no search route either 404s or falls through to the
-  // app's own HTML. Both mean "this server has no index", not a failure worth
-  // painting red in the sidebar.
-  if (response.status === 404 || !(response.headers.get('content-type') ?? '').includes('json')) {
-    return searchDisabled(request.q)
-  }
+  // A build that serves no search route 404s. An older bundle falls through to
+  // the app shell (200 HTML). Both mean "this server has no index". A 500 is
+  // a real failure — Hono answers those as `text/plain`, so content-type is
+  // not the discriminator.
+  if (response.status === 404) return searchDisabled(request.q)
   if (!response.ok) throw new HttpError(response.status, `${response.status} ${response.statusText} for ${url}`)
+  if (!(response.headers.get('content-type') ?? '').includes('json')) return searchDisabled(request.q)
   return await response.json() as SearchResponse
 }
 

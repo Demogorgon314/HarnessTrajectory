@@ -182,6 +182,18 @@ describe('search', () => {
     expect(search(store, { q: 'shared needle', limit: 10_000 }).totalHits).toBe(4)
   })
 
+  it('reports the session hit total, not the page slice, on the group badge', () => {
+    const store = open()
+    add(store, key(), Array.from({ length: 8 }, (_unused, index) => ({
+      line: index, role: 'assistant' as const, text: `needle in record number ${index}`,
+    })))
+    const limited = search(store, { q: 'needle', limit: 3 })
+    expect(limited).toMatchObject({ totalHits: 3, truncated: true })
+    expect(limited.groups).toHaveLength(1)
+    expect(limited.groups[0]).toMatchObject({ sessionId: 'main-1', hitCount: 8 })
+    expect(limited.groups[0]?.hits).toHaveLength(3)
+  })
+
   it('reports whether the startup backfill is still running', () => {
     const store = open()
     expect(search(store, { q: 'anything', indexing: { pendingFiles: 3, ready: false } }).indexing)

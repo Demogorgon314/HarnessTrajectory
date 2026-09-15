@@ -324,12 +324,22 @@ describe('extractSearchDocs — shared rules', () => {
     expect(doc?.text).toBe(long.slice(0, MAX_DOC_CHARS))
   })
 
-  it('drops embedded base64 payloads, which can never be searched for anyway', () => {
+  it('strips embedded base64 payloads and keeps the surrounding prose', () => {
     const base64 = `${'QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVph'.repeat(20)}==`
     expect(docs('claude', {
       type: 'user', timestamp: iso(0),
       message: { role: 'user', content: [{ tool_use_id: 't1', type: 'tool_result', content: base64 }] },
     })).toEqual([])
+    const [mixed] = docs('claude', {
+      type: 'user', timestamp: iso(0),
+      message: {
+        role: 'user',
+        content: [{ tool_use_id: 't1', type: 'tool_result', content: `tests passed\n${base64}\nexit 0` }],
+      },
+    })
+    expect(mixed?.text).toContain('tests passed')
+    expect(mixed?.text).toContain('exit 0')
+    expect(mixed?.text).not.toContain('QUJDREVGR0hJ')
     expect(docs('kimi', {
       type: 'context.append_loop_event', time: T0,
       event: { type: 'tool.result', toolCallId: 'k1', result: { output: `data:image/png;base64,${base64}` } },
