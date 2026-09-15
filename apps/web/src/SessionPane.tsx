@@ -3,7 +3,8 @@ import type {
   HarnessKind, SessionChildSummary, SessionSummary, SubagentRun, SubagentStatus,
 } from '@harness-trajectory/core'
 import {
-  Menu, TrajectoryView, Tooltip, useSnapshotSelector, type MenuEntry, type SnapshotStore, type TrajectoryTranslate,
+  Menu, TrajectoryView, Tooltip, useSnapshotSelector,
+  type MenuEntry, type SnapshotStore, type TrajectoryInspectLine, type TrajectoryTranslate,
 } from '@harness-trajectory/ui'
 import type { Route, SessionTab } from './App.tsx'
 import { ContextPane } from './ContextPane.tsx'
@@ -212,6 +213,21 @@ export function SessionPane({ route, summary: listSummary, onNavigate, t, locale
     return () => { runtime.close() }
   }, [runtime])
   const state = useSnapshotSelector(runtime.store, value => value)
+  /*
+   * The record anchor a content-search hit aimed at (`?line=N`). It is armed
+   * per ROUTE OBJECT, not per line number, so re-selecting the same hit scrolls
+   * again; the view holds it until the fold reaches that line and then clears
+   * it, so a reader who scrolls away is not pulled back.
+   *
+   * It waits for the replay to finish. A long transcript reaches the wanted
+   * line early and then keeps growing under it for tens of seconds, which would
+   * leave the scroll stranded far from the record it aimed at.
+   */
+  const [inspectLine, setInspectLine] = useState<TrajectoryInspectLine | null>(null)
+  useEffect(() => {
+    if (route.line === undefined || state.loading) return
+    setInspectLine({ line: route.line, fileId: route.file ?? route.id })
+  }, [route, state.loading])
   const summary = state.summary ?? listSummary
   const [copied, setCopied] = useState(false)
   const started = summary?.startedAt ?? null
@@ -367,6 +383,8 @@ export function SessionPane({ route, summary: listSummary, onNavigate, t, locale
               loading={state.loading && state.snapshot.eventNodes.length === 0}
               loadImage={runtime.loadImage}
               durationStore={durationStore}
+              inspectLine={inspectLine}
+              onInspectApplied={() => { setInspectLine(null) }}
               t={t}
             />
           )}

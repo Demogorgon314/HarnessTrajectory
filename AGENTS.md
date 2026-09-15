@@ -28,6 +28,9 @@ packages/context  dsh-context port (Apache-2.0; keep LICENSE + NOTICE):
                   src/fold = vendored fold (do not change its event vocabulary),
                   src/synth/<kind>.ts = transcript → fold events, src/client = dashboard.
 apps/server       Hono API: scans harness roots, classifies files, replays + tails JSONL over SSE.
+                  src/search = SQLite FTS5 (node:sqlite, trigram) full-text index:
+                  store.ts schema, extract.ts record → docs, indexer.ts batched writes,
+                  query.ts the /api/search read. Contract types live in core/src/search.ts.
 apps/web          Vite/React shell: sidebar, routes, harness registry (src/harnesses.tsx).
 ```
 
@@ -45,7 +48,15 @@ Both parsers are incremental and must never throw on a malformed or unknown reco
   human-vs-injected by a structural field, never by matching text.
 - Human prompt counting must agree across three places: the core adapter, the context
   synthesizer, and the server meta scanner (`apps/server/src/meta.ts`). Share one
-  exported classifier per harness.
+  exported classifier per harness. The search extractor
+  (`apps/server/src/search/extract.ts`) is the fourth caller and must reuse the same
+  classifiers — never re-derive human-vs-injected from the text.
+- The server writes exactly one file, `search.sqlite` under the cache dir
+  (`apps/server/src/cache.ts`). Harness roots stay read-only. The index is a cache:
+  bump `SEARCH_SCHEMA_VERSION` instead of migrating. A search hit addresses a record by
+  `(kind, sessionId, fileId, line)`, where `line` is the 0-based index of the record among
+  the file's non-blank lines — the same numbering `readLines` produces, so it matches the
+  SSE replay. Grok's synthetic sidecar line is not in the file and shifts nothing.
 - `snapshot()` returns the same object when nothing changed; touch the assembler only on
   real changes (the UI re-renders on identity).
 - Tests: no fixture files. Each spec hand-writes synthetic records with the real field
@@ -60,8 +71,8 @@ Both parsers are incremental and must never throw on a malformed or unknown reco
 Mirror the most recent one (`git show --stat` of the Kimi or Grok commit lists every
 touchpoint): `HarnessKind` + `HARNESS_KINDS`, `adapters/<kind>.ts` + registry,
 `synth/<kind>.ts` + registry, server `roots.ts` / `classifyPath` / meta scanner /
-child binding, web registry entry with logo + resume command, README roots and limits,
-and specs in core, context, server, and web.
+child binding / `search/extract.ts` branch, web registry entry with logo + resume command,
+README roots and limits, and specs in core, context, server, and web.
 
 ## Harness facts that are easy to get wrong
 

@@ -9,6 +9,7 @@ import { DragHandle } from './DragHandle.tsx'
 import { HarnessFilter } from './HarnessFilter.tsx'
 import { SessionList } from './SessionList.tsx'
 import { SessionPane } from './SessionPane.tsx'
+import { SessionSearch } from './SessionSearch.tsx'
 import {
   SIDEBAR_AUTO_COLLAPSE, SIDEBAR_COLLAPSED, clampSidebarWidth, setSidebarCollapsed, setSidebarWidth,
   sidebarStore, toggleGroupFold,
@@ -43,17 +44,43 @@ export interface Route {
    * the Context tab folds every file of the session at once.
    */
   agent?: string
+  /**
+   * Record anchor a content-search hit aimed at: the 0-based JSONL line index
+   * inside the addressed transcript, carried as `?line=N` so the address stays
+   * shareable. `SessionPane` hands it to the trajectory, which resolves it
+   * through the fold's line index and scrolls to the record it produced.
+   * It is deliberately NOT part of `runtimeKey`: moving the anchor inside an
+   * open session must not reopen its stream.
+   */
+  line?: number
 }
 
 // Kinds are lowercase words, so no escaping is needed to join them into an alternation.
-const ROUTE_KIND_PATTERN = new RegExp(`^#/(${HARNESS_KINDS.join('|')})/([^/]+)(?:/(agent|context)(?:/([^/]+))?)?$`)
+// Ids are percent-encoded, so `?` only ever starts the query tail.
+const ROUTE_KIND_PATTERN = new RegExp(`^#/(${HARNESS_KINDS.join('|')})/([^/?]+)(?:/(agent|context)(?:/([^/?]+))?)?$`)
+
+/** `?line=N`: a 0-based record anchor. Anything else is no anchor at all. */
+function parseLine(search: string): number | undefined {
+  const raw = new URLSearchParams(search).get('line')
+  // `Number('')` is 0, so an empty value must not read as line zero.
+  if (raw === null || raw === '') return undefined
+  const value = Number(raw)
+  return Number.isInteger(value) && value >= 0 ? value : undefined
+}
 
 export function parseHash(hash: string): Route | null {
-  const match = ROUTE_KIND_PATTERN.exec(hash)
+  const queryAt = hash.indexOf('?')
+  const path = queryAt < 0 ? hash : hash.slice(0, queryAt)
+  const line = queryAt < 0 ? undefined : parseLine(hash.slice(queryAt + 1))
+  const match = ROUTE_KIND_PATTERN.exec(path)
   if (match === null) return null
   const section = match[3]
   const tail = match[4]
-  const base = { kind: match[1] as HarnessKind, id: decodeURIComponent(match[2] ?? '') }
+  const base = {
+    kind: match[1] as HarnessKind,
+    id: decodeURIComponent(match[2] ?? ''),
+    ...(line === undefined ? {} : { line }),
+  }
   if (section === 'agent') {
     // `/agent` with no id is not an address of its own.
     if (tail === undefined) return base
@@ -68,10 +95,10 @@ export function parseHash(hash: string): Route | null {
 /** Hash for a route; both tail segments keep the parent session as the address root. */
 export function routeHash(route: Route): string {
   const base = `#/${route.kind}/${encodeURIComponent(route.id)}`
-  if (route.tab === 'context') {
-    return route.agent === undefined ? `${base}/context` : `${base}/context/${encodeURIComponent(route.agent)}`
-  }
-  return route.file === undefined ? base : `${base}/agent/${encodeURIComponent(route.file)}`
+  const path = route.tab === 'context'
+    ? (route.agent === undefined ? `${base}/context` : `${base}/context/${encodeURIComponent(route.agent)}`)
+    : (route.file === undefined ? base : `${base}/agent/${encodeURIComponent(route.file)}`)
+  return route.line === undefined ? path : `${path}?line=${route.line}`
 }
 
 /**
@@ -91,7 +118,16 @@ function useHashRoute(): [Route | null, (route: Route | null) => void] {
     return () => { window.removeEventListener('hashchange', onChange) }
   }, [])
   const navigate = useCallback((next: Route | null) => {
-    window.location.hash = next === null ? '' : routeHash(next)
+    const hash = next === null ? '' : routeHash(next)
+    // Re-selecting the SAME address fires no `hashchange`, so a search hit that
+    // is already open would never re-arm its record anchor. Publish a fresh
+    // route object instead; the pane's stream identity (`runtimeKey`) is
+    // unchanged, so nothing reopens.
+    if (hash !== '' && window.location.hash === hash) {
+      setRoute(next)
+      return
+    }
+    window.location.hash = hash
   }, [])
   return [route, navigate]
 }
@@ -290,7 +326,7 @@ export function App() {
               <input
                 type="search"
                 className={css.search}
-                placeholder="Search title, project, id"
+                placeholder="Search title, project, id, content"
                 value={query}
                 onChange={(event) => { setQuery(event.currentTarget.value) }}
               />
@@ -303,6 +339,8 @@ export function App() {
               folded={folded}
               onToggleGroup={toggleGroupFold}
             />
+            {/* The slow half of the same query: hits from the server's index. */}
+            <SessionSearch query={query} kinds={kinds} selected={route} onSelect={navigate} />
           </>
         )}
       </aside>

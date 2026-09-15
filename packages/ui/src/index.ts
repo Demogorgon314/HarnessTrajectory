@@ -1,4 +1,6 @@
-export { TrajectoryView, type TrajectoryViewProps } from './trajectory/TrajectoryView.tsx'
+export {
+  TrajectoryView, type TrajectoryInspectLine, type TrajectoryViewProps,
+} from './trajectory/TrajectoryView.tsx'
 export { createTrajectoryDurationStore } from './trajectory/duration-store.ts'
 export {
   createTrajectoryTranslate, en as trajectoryEn, zh as trajectoryZh,

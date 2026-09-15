@@ -496,3 +496,100 @@ describe('isCodexHumanPrompt', () => {
     expect(isCodexHumanPrompt('## AGENTS.md section')).toBe(true)
   })
 })
+
+describe('codex source lines', () => {
+  /** Feed a rollout the way the server's replay numbers it: 0-based, no gaps. */
+  function feedNumbered(lines: readonly string[], file: SessionFileRef = MAIN) {
+    const parser = createCodexParser()
+    for (const [index, item] of lines.entries()) parser.push(item, file, index)
+    return parser
+  }
+
+  it('resolves a prompt line to the record it folded into', () => {
+    const lines = twoTurnFixture()
+    const parser = feedNumbered(lines)
+    const index = parser.snapshot().sourceLines
+    const prompt = lines.indexOf(userMessage(2_000, 'Please list the files'))
+    const target = index?.targetAt(prompt, MAIN.id)
+    expect(target?.kind).toBe('seq')
+    const seq = target?.kind === 'seq' ? target.seq : -1
+    const node = parser.snapshot().eventNodes.find(item => item.seq === seq)
+    expect(node?.kind).toBe('user')
+  })
+
+  it('binds a call and its output to the same record, in either direction', () => {
+    const lines = twoTurnFixture()
+    const index = feedNumbered(lines).snapshot().sourceLines
+    // The call line folds into no node of its own — the tool record only exists
+    // once the output lands — and the output line's node IS that record, so
+    // both name the call.
+    const call = lines.indexOf(customToolCall(3_500, 'call-1', 'ls -la'))
+    const output = lines.indexOf(customToolOutput(5_000, 'call-1', 'a.ts\nb.ts'))
+    expect(index?.targetAt(call, MAIN.id)).toEqual({ kind: 'call', callId: 'call-1' })
+    expect(index?.targetAt(output, MAIN.id)).toEqual({ kind: 'call', callId: 'call-1' })
+  })
+
+  it('gives a line that opened an assistant step to that step, not to its call', () => {
+    // `call-2` arrives with no step open, so its line creates the assistant
+    // record first: a line resolves to the FIRST record it created, and the
+    // tool row sits one row below it in the same step.
+    const lines = twoTurnFixture()
+    const parser = feedNumbered(lines)
+    const call = lines.indexOf(functionCall(6_000, 'call-2', 'read_file', '{"path":"a.ts"}'))
+    const target = parser.snapshot().sourceLines?.targetAt(call, MAIN.id)
+    expect(target?.kind).toBe('seq')
+    const node = parser.snapshot().eventNodes.find(item =>
+      target?.kind === 'seq' && item.seq === target.seq)
+    expect(node?.kind).toBe('assistant')
+    // Its output line still resolves to the tool record itself.
+    const output = lines.indexOf(functionOutput(7_000, 'call-2', 'export const a = 1'))
+    expect(parser.snapshot().sourceLines?.targetAt(output, MAIN.id))
+      .toEqual({ kind: 'call', callId: 'call-2' })
+  })
+
+  it('folds a reasoning line into the assistant record its step opened', () => {
+    const lines = twoTurnFixture()
+    const parser = feedNumbered(lines)
+    const first = lines.indexOf(reasoning(3_000, '**Planning**', 'Look at the tree'))
+    const target = parser.snapshot().sourceLines?.targetAt(first, MAIN.id)
+    expect(target?.kind).toBe('seq')
+    const node = parser.snapshot().eventNodes.find(item =>
+      target?.kind === 'seq' && item.seq === target.seq)
+    expect(node?.kind).toBe('assistant')
+  })
+
+  it('answers a skipped line with the nearest preceding record and an unread one with nothing', () => {
+    const lines = twoTurnFixture()
+    const index = feedNumbered(lines).snapshot().sourceLines
+    const prompt = lines.indexOf(userMessage(2_000, 'Please list the files'))
+    // `turn_context` (the line after the prompt in turn 2) folds into nothing.
+    const context = lines.indexOf(turnContext(20_100, 'turn-2'))
+    const skipped = index?.targetAt(context, MAIN.id)
+    expect(skipped).toEqual(index?.targetAt(context - 1, MAIN.id))
+    // Past the end of what has been folded: still unknown, never the tail.
+    expect(index?.targetAt(lines.length + 10, MAIN.id)).toBeUndefined()
+    expect(index?.targetAt(prompt, 'another-file')).toBeUndefined()
+  })
+
+  it('records nothing for a parser that is not told where its lines are', () => {
+    const index = feed(twoTurnFixture()).snapshot().sourceLines
+    expect(index?.targetAt(0, MAIN.id)).toBeUndefined()
+  })
+
+  it('keeps each file of a session on its own line numbering', () => {
+    const parser = createCodexParser()
+    for (const [index, item] of twoTurnFixture().entries()) parser.push(item, MAIN, index)
+    const child = [
+      line('session_meta', { id: 'thread-child', parent_thread_id: 'thread-main', thread_source: 'subagent' }, 30_000),
+      line('response_item', {
+        type: 'function_call', id: 'fc-c', call_id: 'child-call', name: 'grep', arguments: '{}',
+      }, 30_100),
+      line('response_item', { type: 'function_call_output', id: 'fco-c', call_id: 'child-call', output: 'hit' }, 30_200),
+    ]
+    for (const [index, item] of child.entries()) parser.push(item, CHILD, index)
+    const index = parser.snapshot().sourceLines
+    expect(index?.targetAt(1, CHILD.id)).toEqual({ kind: 'call', callId: 'child-call' })
+    // Line 1 of the MAIN file is a different record entirely.
+    expect(index?.targetAt(1, MAIN.id)).not.toEqual({ kind: 'call', callId: 'child-call' })
+  })
+})

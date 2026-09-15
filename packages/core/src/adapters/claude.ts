@@ -164,7 +164,8 @@ class ClaudeParser implements SessionParser {
   private startedAt: number | null = null
   private promptCount = 0
 
-  push(line: string, file: SessionFileRef): void {
+  push(line: string, file: SessionFileRef, lineIndex?: number): void {
+    this.assembler.beginLine(file.id, lineIndex)
     const record = parseJsonLine(line)
     if (!isRecord(record)) return
     const type = asString(record.type)

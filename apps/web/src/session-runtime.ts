@@ -111,8 +111,12 @@ export class SessionRuntime {
         else this.noteFile(event.file)
         break
       case 'lines':
-        for (const line of event.lines) {
-          this.parser.push(line, event.file)
+        // The trajectory parser is told where each line sits in its file, so a
+        // content-search hit can be resolved back to the record it folded into.
+        // A negative `startLine` marks synthetic lines (grok's sidecar) that
+        // belong to no line of the file; they stay negative and bind nothing.
+        for (const [at, line] of event.lines.entries()) {
+          this.parser.push(line, event.file, event.startLine < 0 ? -1 : event.startLine + at)
           this.context.push(line, event.file)
         }
         this.lineCount += event.lines.length

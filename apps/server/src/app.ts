@@ -5,8 +5,12 @@ import { readFile } from 'node:fs/promises'
 import { extname, join, normalize } from 'node:path'
 import { Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
-import { HARNESS_KINDS, type HarnessKind, type SessionLiveEvent } from '@harness-trajectory/core'
+import {
+  HARNESS_KINDS, SEARCH_DEFAULT_LIMIT, SEARCH_MAX_LIMIT, SEARCH_MIN_QUERY_LENGTH,
+  type HarnessKind, type SearchResponse, type SessionLiveEvent,
+} from '@harness-trajectory/core'
 import { scopeToFile, type SessionIndex } from './index.ts'
+import { search, type SearchService } from './search/index.ts'
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -30,9 +34,24 @@ export interface AppOptions {
   index: SessionIndex
   /** Directory holding the built web UI; omitted or missing disables static serving. */
   staticDir?: string | undefined
+  /** Full-text index; omitted (or `HARNESS_TRAJECTORY_SEARCH=0`) disables `/api/search`. */
+  search?: SearchService | undefined
 }
 
-export function createApp({ index, staticDir }: AppOptions): Hono {
+/** The shape `/api/search` answers with when nothing is indexed. */
+function searchDisabled(query: string): SearchResponse {
+  return {
+    enabled: false,
+    query,
+    minLength: SEARCH_MIN_QUERY_LENGTH,
+    groups: [],
+    totalHits: 0,
+    truncated: false,
+    indexing: { pendingFiles: 0, ready: true },
+  }
+}
+
+export function createApp({ index, staticDir, search: searchService }: AppOptions): Hono {
   const app = new Hono()
 
   app.get('/api/health', c => c.json({ ok: true }))
@@ -49,6 +68,29 @@ export function createApp({ index, staticDir }: AppOptions): Hono {
         || session.id.toLowerCase().includes(query))
     }
     return c.json(sessions)
+  })
+
+  /**
+   * Full-text search across every indexed transcript. Hits are grouped by
+   * session and addressed by `(kind, sessionId, fileId, line)`, so the UI can
+   * open the session, select the right transcript and scroll to the record.
+   */
+  app.get('/api/search', (c) => {
+    const query = (c.req.query('q') ?? '').trim()
+    if (searchService === undefined) return c.json(searchDisabled(query))
+    const kind = c.req.query('kind')
+    const requested = Number(c.req.query('limit') ?? SEARCH_DEFAULT_LIMIT)
+    const limit = Number.isFinite(requested)
+      ? Math.max(1, Math.min(Math.floor(requested), SEARCH_MAX_LIMIT))
+      : SEARCH_DEFAULT_LIMIT
+    return c.json(search(searchService.store, {
+      q: query,
+      ...(kind !== undefined && isKind(kind) ? { kind } : {}),
+      limit,
+      // Title, cwd and last activity live in the session index, not in SQLite.
+      describe: (hitKind, sessionId) => index.facts(hitKind, sessionId),
+      indexing: searchService.indexer.stats(),
+    }))
   })
 
   app.get('/api/sessions/:kind/:id', (c) => {

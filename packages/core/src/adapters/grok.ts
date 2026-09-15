@@ -452,7 +452,8 @@ class GrokParser implements SessionParser {
   private promptCount = 0
   private lastPlanText: string | null = null
 
-  push(line: string, file: SessionFileRef): void {
+  push(line: string, file: SessionFileRef, lineIndex?: number): void {
+    this.assembler.beginLine(file.id, lineIndex)
     const record = parseGrokLine(line)
     if (record === null) return
     const time = record.time ?? this.lastTime

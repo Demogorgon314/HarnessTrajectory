@@ -278,7 +278,8 @@ class KimiParser implements SessionParser {
   private title: string | null = null
   private promptCount = 0
 
-  push(line: string, file: SessionFileRef): void {
+  push(line: string, file: SessionFileRef, lineIndex?: number): void {
+    this.assembler.beginLine(file.id, lineIndex)
     const record = parseJsonLine(line)
     if (!isRecord(record)) return
     // `metadata` carries `created_at` instead of `time`; everything else is ms.

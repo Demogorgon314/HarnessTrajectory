@@ -210,6 +210,23 @@ describe('chronological merge', () => {
       { ref: child, lines: childLines, times: lineTimes(childLines) },
     ])]
     expect(chunks.map(chunk => `${chunk.ref.id}:${chunk.lines.length}`)).toEqual(['m:2', 'c:2', 'm:1'])
+    // Each file keeps its own numbering across the interleaving.
+    expect(chunks.map(chunk => `${chunk.ref.id}@${chunk.startLine}`)).toEqual(['m@0', 'c@0', 'm@2'])
+  })
+
+  it('numbers chunks per file and keeps a synthetic line out of the count', () => {
+    const main = { id: 'm', role: 'main' as const, path: '/m' }
+    const lines = Array.from({ length: 900 }, (_, index) => JSON.stringify({ timestamp: iso(index), n: index }))
+    // Grok's sidecar rides in front of the file's own lines (`synthetic: 1`).
+    const all = [JSON.stringify({ timestamp: iso(0), sidecar: true }), ...lines]
+    const chunks = [...mergeChronologically([
+      { ref: main, lines: all, times: lineTimes(all), synthetic: 1 },
+    ])]
+    // The sidecar never shares a chunk with real lines, and line 0 of the file
+    // is the first real one.
+    expect(chunks.map(chunk => [chunk.startLine, chunk.lines.length])).toEqual([[-1, 1], [0, 400], [400, 400], [800, 100]])
+    expect(JSON.parse(chunks[1]?.lines[0] ?? '{}')).toMatchObject({ n: 0 })
+    expect(JSON.parse(chunks[2]?.lines[0] ?? '{}')).toMatchObject({ n: 400 })
   })
 
   it('reads Kimi epoch-millisecond "time" fields and still prefers "timestamp"', () => {
@@ -484,6 +501,8 @@ describe('SessionIndex', () => {
     const appended = events.filter(event => event.type === 'lines')
     expect(appended).toHaveLength(1)
     expect(appended[0]?.type === 'lines' && appended[0].lines).toHaveLength(1)
+    // The replay ended at line 1 of the main file, so the append is line 2.
+    expect(appended[0]?.type === 'lines' && appended[0].startLine).toBe(2)
     expect(index.get('claude', 'main-1')?.promptCount).toBe(2)
     unsubscribe()
   })
@@ -573,10 +592,19 @@ describe('SessionIndex live children', () => {
     expect(lines?.type === 'lines' && lines.file.role).toBe('main')
     expect(lines?.type === 'lines' && lines.lines).toHaveLength(1)
 
-    const main: SessionLiveEvent = { type: 'lines', file: { id: 'main-1', role: 'main', path: '/m' }, lines: ['{}'] }
-    const child: SessionLiveEvent = { type: 'lines', file: { id: 'main-1/agent-a1', role: 'child', path, parentId: 'main-1' }, lines: ['{}'] }
+    const main: SessionLiveEvent = {
+      type: 'lines', file: { id: 'main-1', role: 'main', path: '/m' }, lines: ['{}'], startLine: 0,
+    }
+    const child: SessionLiveEvent = {
+      type: 'lines',
+      file: { id: 'main-1/agent-a1', role: 'child', path, parentId: 'main-1' },
+      lines: ['{}'],
+      startLine: 7,
+    }
     expect(scopeToFile(main, 'main-1/agent-a1')).toBeNull()
-    expect(scopeToFile(child, 'main-1/agent-a1')).toMatchObject({ file: { id: 'main-1/agent-a1', role: 'main' } })
+    // Narrowing a child to its own view keeps the line numbering of the file.
+    expect(scopeToFile(child, 'main-1/agent-a1'))
+      .toMatchObject({ file: { id: 'main-1/agent-a1', role: 'main' }, startLine: 7 })
     expect(scopeToFile({ type: 'ready' }, 'main-1/agent-a1')).toEqual({ type: 'ready' })
   })
 })
@@ -719,6 +747,13 @@ describe('SessionIndex — Grok Build', () => {
     await index.readAll('grok', GROK_MAIN, event => replay.push(event))
     const first = replay.find(event => event.type === 'lines')
     expect(first?.type === 'lines' && first.file.id).toBe(GROK_MAIN)
+    // The sidecar is in no file: it rides its own event with a negative
+    // `startLine`, so `updates.jsonl` still starts at line 0.
+    const mainChunks = replay.filter(event => event.type === 'lines' && event.file.id === GROK_MAIN)
+    // The child's own line falls between the parent's two by time, so the main
+    // file arrives in two chunks — still numbered 0 and 1.
+    expect(mainChunks.map(event => (event.type === 'lines' ? [event.startLine, event.lines.length] : [])))
+      .toEqual([[-1, 1], [0, 1], [1, 1]])
     const line: unknown = JSON.parse((first?.type === 'lines' && first.lines[0]) || '{}')
     expect(line).toMatchObject({
       timestamp: Math.floor(T0 / 1000),
@@ -745,6 +780,7 @@ describe('SessionIndex — Grok Build', () => {
     expect(events.map(event => event.type)).toEqual(['lines', 'meta'])
     const [lines] = events
     expect(lines?.type === 'lines' && lines.lines).toHaveLength(1)
+    expect(lines?.type === 'lines' && lines.startLine).toBe(-1)
     const sidecar: unknown = JSON.parse((lines?.type === 'lines' && lines.lines[0]) || '{}')
     expect(sidecar).toMatchObject({ method: GROK_SIDECAR_METHOD, params: { summary: { session_summary: 'Renamed mid-session' } } })
     expect(index.get('grok', GROK_MAIN)?.title).toBe('Renamed mid-session')

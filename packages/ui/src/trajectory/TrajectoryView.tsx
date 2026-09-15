@@ -31,6 +31,9 @@ import css from './views.module.css'
 const EMPTY_TURN_IDS: ReadonlySet<number> = new Set()
 const EMPTY_RECORD_IDS: ReadonlySet<string> = new Set()
 const SEARCH_INDEX_THROTTLE_MS = 3_000
+/** How often an unresolved line anchor re-asks the fold, and for how long. */
+const INSPECT_LINE_RETRY_MS = 500
+const INSPECT_LINE_ATTEMPTS = 240
 const HISTORY_PAGE_NODES = 50
 
 function containsCall(calls: readonly ToolCallBlock[], callId: string): boolean {
@@ -72,6 +75,20 @@ function partialStructureSignature(partial: TrajectorySnapshot['partial']): stri
     : block.kind).join('\u0000')
 }
 
+/**
+ * A request to scroll to the record one raw transcript line folded into.
+ *
+ * Its IDENTITY is the trigger, like `recordSelection` in the ledger: clicking
+ * the same search hit twice must scroll again, and the line number alone does
+ * not change between those two clicks.
+ */
+export interface TrajectoryInspectLine {
+  /** 0-based index among the file's non-blank JSONL lines. */
+  readonly line: number
+  /** Transcript the line belongs to; omitted, the fold's main file. */
+  readonly fileId?: string
+}
+
 /** Session-bound controls not already supplied by the conversation view slot. */
 /** Props of the standalone trajectory view. */
 export interface TrajectoryViewProps {
@@ -93,6 +110,12 @@ export interface TrajectoryViewProps {
   durationStore: SnapshotStore<boolean>
   /** One-shot request to open and scroll to the record owning this tool call. */
   inspectCallId?: string | null
+  /**
+   * One-shot request to open and scroll to the record a transcript line folded
+   * into (a content-search hit). Held until the fold contains that line, so a
+   * hit in a session still replaying lands as soon as its record exists.
+   */
+  inspectLine?: TrajectoryInspectLine | null
   /** Acknowledge a consumed (or unresolvable) inspect request. */
   onInspectApplied?: () => void
   /** Trajectory translator. */
@@ -148,7 +171,7 @@ function addUsage(
 export function TrajectoryView({
   snapshot, loading = false, loadingOlder = false, hasMoreHistory = false,
   loadOlder = NO_OLDER_HISTORY, loadImage, renderImages: renderImagesProp, durationStore,
-  inspectCallId = null, onInspectApplied, t,
+  inspectCallId = null, inspectLine = null, onInspectApplied, t,
 }: TrajectoryViewProps) {
   const [collapsedTurns, setCollapsedTurns] = useState<ReadonlySet<number>>(EMPTY_TURN_IDS)
   const renderImages = useCallback<RenderMessageImages>(
@@ -216,12 +239,54 @@ export function TrajectoryView({
   const runningCalls = inspection.runningCalls
   const requests = inspection.requests
   const callSchemas = inspection.callSchemas
-  const inspectNodeIndex = useMemo(() => inspectCallId === null
-    ? -1
-    : completeInspection.eventNodes.findIndex(node => node.kind === 'assistant'
-      ? node.blocks.some(block => block.kind === 'tool-call' && block.callId === inspectCallId)
-      : node.kind === 'tool-result' && containsCall([node], inspectCallId)),
-  [completeInspection.eventNodes, inspectCallId])
+  // A line request stays pending until the fold reaches it; its identity is
+  // what re-arms it, so the same hit clicked twice scrolls twice.
+  const [pendingLine, setPendingLine] = useState<TrajectoryInspectLine | null>(inspectLine)
+  const [lineAttempt, setLineAttempt] = useState(0)
+  const appliedInspectLine = useRef<TrajectoryInspectLine | null>(inspectLine)
+  useEffect(() => {
+    if (inspectLine === null || appliedInspectLine.current === inspectLine) return
+    appliedInspectLine.current = inspectLine
+    setPendingLine(inspectLine)
+    setLineAttempt(0)
+  }, [inspectLine])
+  const lineTarget = useMemo(() => {
+    if (pendingLine === null) return null
+    return completeInspection.sourceLines?.targetAt(pendingLine.line, pendingLine.fileId) ?? null
+  }, [completeInspection, lineAttempt, pendingLine])
+  const inspectLineCallId = lineTarget?.kind === 'call' ? lineTarget.callId : null
+  const inspectLineSeq = lineTarget?.kind === 'seq' ? lineTarget.seq : null
+  const inspectTargetCallId = inspectCallId ?? inspectLineCallId
+  const handleInspectApplied = useCallback(() => {
+    setPendingLine(null)
+    onInspectApplied?.()
+  }, [onInspectApplied])
+  /*
+   * A line the fold has not reached yet resolves to nothing, and the lines that
+   * carry it may fold into no node at all — so the snapshot can stay identical
+   * while the replay walks past it. Retry on a slow tick until the record
+   * exists, and give up long after any replay would have finished rather than
+   * leaving a timer running forever on a line that is not in the file.
+   */
+  useEffect(() => {
+    if (pendingLine === null || lineTarget !== null) return
+    if (lineAttempt >= INSPECT_LINE_ATTEMPTS) {
+      handleInspectApplied()
+      return
+    }
+    const timer = setTimeout(() => { setLineAttempt(attempt => attempt + 1) }, INSPECT_LINE_RETRY_MS)
+    return () => { clearTimeout(timer) }
+  }, [handleInspectApplied, lineAttempt, lineTarget, pendingLine])
+  const inspectNodeIndex = useMemo(() => {
+    if (inspectLineSeq !== null) {
+      return completeInspection.eventNodes.findIndex(node => node.seq === inspectLineSeq)
+    }
+    return inspectTargetCallId === null
+      ? -1
+      : completeInspection.eventNodes.findIndex(node => node.kind === 'assistant'
+        ? node.blocks.some(block => block.kind === 'tool-call' && block.callId === inspectTargetCallId)
+        : node.kind === 'tool-result' && containsCall([node], inspectTargetCallId))
+  }, [completeInspection.eventNodes, inspectLineSeq, inspectTargetCallId])
   useEffect(() => {
     if (inspectNodeIndex < 0 || inspectNodeIndex >= historyStartIndex) return
     setHistoryNodeLimit(limit => limit + historyStartIndex - inspectNodeIndex)
@@ -580,8 +645,9 @@ export function TrajectoryView({
           onToggleTurn={toggleTurn}
           collapsedAssistants={collapsedAssistants}
           onToggleAssistant={toggleAssistant}
-          inspectCallId={inspectCallId}
-          onInspectApplied={onInspectApplied}
+          inspectCallId={inspectTargetCallId}
+          inspectSeq={inspectLineSeq}
+          onInspectApplied={handleInspectApplied}
         />
       </div>
     </div>

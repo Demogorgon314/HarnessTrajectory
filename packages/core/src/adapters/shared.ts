@@ -2,20 +2,135 @@
 
 import type {
   AssistantBlock, ContentBlock, ConversationLocation, ConversationNode, ImageAttachmentRef,
-  ImageMediaType, PartialAssistant, RequestView, RunningToolCall, SystemPromptNode, ToolCallBlock,
-  ToolResultNode, ToolSchema, TrajectorySnapshot,
+  ImageMediaType, PartialAssistant, RequestView, RunningToolCall, SourceLineIndex, SourceLineTarget,
+  SystemPromptNode, ToolCallBlock, ToolResultNode, ToolSchema, TrajectorySnapshot,
 } from '../contract.ts'
 import type { ImageStore } from '../session.ts'
 
 /** Monotonic event sequence shared by every record an adapter emits. */
 export class SequenceCounter {
   private value = 0
+  /** @param onNext - notified for every allocated seq, to bind it to its source line. */
+  constructor(private readonly onNext?: (seq: number) => void) {}
   next(): number {
     this.value += 1
+    this.onNext?.(this.value)
     return this.value
   }
   get current(): number {
     return this.value
+  }
+}
+
+/**
+ * How far `targetAt` walks back for the nearest preceding record. A run of
+ * lines that folds into nothing is a handful long in every harness (grok's
+ * stream deltas are the longest), so a wider gap than this is a line that does
+ * not belong to the visible trajectory at all.
+ */
+const LINE_FALLBACK_WINDOW = 4096
+
+interface FileLines {
+  readonly targets: Map<number, SourceLineTarget>
+  /** Highest line of this file the parser has been fed. */
+  max: number
+}
+
+/**
+ * Line bookkeeping for one fold, maintained by {@link TrajectoryAssembler}.
+ *
+ * Adapters do not talk to it: it listens to the three moments that already run
+ * through the assembler — a seq is allocated, a node is pushed, a tool call
+ * starts or completes — so a record is bound to the line that CREATED it even
+ * when the node is emitted several lines later (Claude closes an assistant step
+ * on the following record; Kimi flushes its loop events after the response).
+ *
+ * One line maps to at most one record: the first one it produced. A tool call
+ * wins over a plain node on the same line, because `complete()` runs before the
+ * result node is pushed.
+ */
+export class SourceLineTable implements SourceLineIndex {
+  private readonly files = new Map<string, FileLines>()
+  /** The first file fed, which is the main transcript of the view. */
+  private primary: string | undefined
+  private currentFile: string | undefined
+  private currentLine = -1
+  /** Line each allocated seq was created on. */
+  private readonly seqOrigin = new Map<number, { file: string; line: number }>()
+  /** Lines of calls still waiting for their result, by call id. */
+  private readonly callLines = new Map<string, { file: string; line: number }[]>()
+
+  /** Start folding one raw line; a negative index means "not a line of the file". */
+  begin(fileId: string, line: number): void {
+    this.currentFile = fileId
+    this.currentLine = line
+    if (line < 0) return
+    this.primary ??= fileId
+    const state = this.fileState(fileId)
+    if (line > state.max) state.max = line
+  }
+
+  /** A seq was allocated while folding the current line. */
+  noteSeq(seq: number): void {
+    const file = this.currentFile
+    if (file === undefined || this.currentLine < 0) return
+    this.seqOrigin.set(seq, { file, line: this.currentLine })
+  }
+
+  /** A node was pushed: its line is the one its seq was allocated on. */
+  noteNode(seq: number): void {
+    const origin = this.seqOrigin.get(seq)
+    if (origin === undefined) return
+    this.claim(origin.file, origin.line, { kind: 'seq', seq })
+  }
+
+  /** A tool call was emitted on the current line; it resolves when the result lands. */
+  noteCallStart(callId: string): void {
+    const file = this.currentFile
+    if (file === undefined || this.currentLine < 0) return
+    const lines = this.callLines.get(callId) ?? []
+    lines.push({ file, line: this.currentLine })
+    this.callLines.set(callId, lines)
+  }
+
+  /** The result landed on the current line: both it and the call's lines name the call. */
+  noteCallComplete(callId: string): void {
+    const target: SourceLineTarget = { kind: 'call', callId }
+    for (const origin of this.callLines.get(callId) ?? []) this.claim(origin.file, origin.line, target)
+    this.callLines.delete(callId)
+    if (this.currentFile !== undefined && this.currentLine >= 0) {
+      this.claim(this.currentFile, this.currentLine, target)
+    }
+  }
+
+  targetAt(line: number, fileId?: string): SourceLineTarget | undefined {
+    const key = fileId ?? this.primary
+    if (key === undefined || line < 0) return undefined
+    const state = this.files.get(key)
+    // Past the fold: the caller keeps waiting instead of landing on the tail.
+    if (state === undefined || line > state.max) return undefined
+    const exact = state.targets.get(line)
+    if (exact !== undefined) return exact
+    const floor = Math.max(0, line - LINE_FALLBACK_WINDOW)
+    for (let at = line - 1; at >= floor; at -= 1) {
+      const target = state.targets.get(at)
+      if (target !== undefined) return target
+    }
+    return undefined
+  }
+
+  private claim(file: string, line: number, target: SourceLineTarget): void {
+    const state = this.fileState(file)
+    if (!state.targets.has(line)) state.targets.set(line, target)
+  }
+
+  private fileState(fileId: string): FileLines {
+    let state = this.files.get(fileId)
+    if (state === undefined) {
+      state = { targets: new Map(), max: -1 }
+      this.files.set(fileId, state)
+    }
+    return state
   }
 }
 
@@ -84,8 +199,12 @@ export class ToolCallTracker {
   /** Parents with at least one child still running: their nested view must be recomputed per snapshot. */
   private readonly pendingChildren = new Map<string, number>()
 
+  /** @param lines - line bookkeeping, notified when a call starts and when it completes. */
+  constructor(private readonly lines?: SourceLineTable) {}
+
   /** Register an emitted call. */
   start(call: RunningToolCall): void {
+    this.lines?.noteCallStart(call.callId)
     this.pending.set(call.callId, { call })
     this.order.push(call.callId)
     if (call.parentCallId !== undefined && call.parentCallId !== call.callId) {
@@ -128,6 +247,7 @@ export class ToolCallTracker {
       meta?: unknown
     },
   ): { node: ToolResultNode; topLevel: boolean } {
+    this.lines?.noteCallComplete(callId)
     const pending = this.pending.get(callId)
     const call = pending?.call
     this.pending.delete(callId)
@@ -223,13 +343,15 @@ function blockTime(block: ToolCallBlock): number {
  * object only when the revision moved.
  */
 export class TrajectoryAssembler {
-  readonly seq = new SequenceCounter()
+  /** Declared first: the counter and the tracker report into it. */
+  readonly lines = new SourceLineTable()
+  readonly seq = new SequenceCounter((seq) => { this.lines.noteSeq(seq) })
   readonly nodes: ConversationNode[] = []
   readonly requests: RequestView[] = []
   readonly locations = new Map<number, ConversationLocation>()
   readonly callSchemas = new Map<string, ToolSchema>()
   readonly systemPrompts: SystemPromptNode[] = []
-  readonly tools = new ToolCallTracker()
+  readonly tools = new ToolCallTracker(this.lines)
   partial: PartialAssistant | null = null
   private revision = 0
   private cached: { revision: number; snapshot: TrajectorySnapshot } | undefined
@@ -238,8 +360,19 @@ export class TrajectoryAssembler {
     this.revision += 1
   }
 
+  /**
+   * Begin folding one raw line of one file. `lineIndex` is the 0-based index
+   * among that file's non-blank lines, or `undefined` for a caller that does
+   * not number its input (and negative for a synthetic line the server injects,
+   * such as grok's sidecar, which is in no file).
+   */
+  beginLine(fileId: string, lineIndex: number | undefined): void {
+    this.lines.begin(fileId, lineIndex ?? -1)
+  }
+
   pushNode(node: ConversationNode): void {
     this.nodes.push(node)
+    this.lines.noteNode(node.seq)
     this.touch()
   }
 
@@ -282,6 +415,9 @@ export class TrajectoryAssembler {
       callSchemas: new Map(this.callSchemas),
       partial: this.partial,
       runningCalls: this.tools.runningCalls(),
+      // A live view, not a copy: its identity is stable, so it costs nothing per
+      // snapshot and never makes an unchanged fold look changed.
+      sourceLines: this.lines,
     }
     this.cached = { revision: this.revision, snapshot }
     return snapshot

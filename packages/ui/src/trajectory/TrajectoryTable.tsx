@@ -34,6 +34,15 @@ const HISTORY_LOAD_ROW_HEIGHT_PX = 30
 const VIRTUALIZATION_THRESHOLD = 100
 const VIRTUAL_OVERSCAN_ROWS = 12
 const VIRTUAL_INITIAL_VIEWPORT_HEIGHT_PX = 600
+/** Re-assert a virtualized jump this many times, this far apart, while rows measure. */
+const SCROLL_SETTLE_PASSES = 10
+const SCROLL_SETTLE_MS = 200
+/**
+ * How long a scroll target keeps being re-asserted as the ledger changes under
+ * it. A replay that is still streaming adds records above and below the target,
+ * which moves it away from a scroll offset that was correct when it was set.
+ */
+const SCROLL_FOLLOW_MS = 3_000
 
 const KIND_LABEL_KEY: Record<TrajectoryCellKind, TrajectoryKey> = {
   system: 'kind.system',
@@ -416,6 +425,8 @@ export interface TrajectoryTableProps {
   onToggleAssistant: (id: string) => void
   /** One-shot cross-view inspect: open and scroll to this call's record. */
   inspectCallId?: string | null
+  /** One-shot cross-view inspect by source event: open and scroll to this seq's record. */
+  inspectSeq?: number | null
   /** Acknowledge a consumed (or unresolvable) inspect request. */
   onInspectApplied?: (() => void) | undefined
 }
@@ -1819,6 +1830,7 @@ export function TrajectoryTable({
   collapsedAssistants,
   onToggleAssistant,
   inspectCallId = null,
+  inspectSeq = null,
   onInspectApplied,
 }: TrajectoryTableProps) {
   const [selectedRecordId, setSelectedRecordId] = useState<string | null>(null)
@@ -1837,6 +1849,18 @@ export function TrajectoryTable({
   const tableScrollInitialized = useRef(false)
   const [tableScrollReady, setTableScrollReady] = useState(false)
   const pendingScrollRecordId = useRef<string | null>(null)
+  /** While this instant has not passed, the target survives each scroll and is re-asserted. */
+  const pendingScrollDeadline = useRef(0)
+  /** Follow-up passes of a virtualized jump, so an unmount cancels them. */
+  const scrollSettleTimer = useRef<number | null>(null)
+  useEffect(() => () => {
+    if (scrollSettleTimer.current !== null) window.clearTimeout(scrollSettleTimer.current)
+  }, [])
+  /** Aim the ledger at one record; `null` drops the pending aim. */
+  const queueScrollTo = useCallback((id: string | null) => {
+    pendingScrollRecordId.current = id
+    pendingScrollDeadline.current = id === null ? 0 : Date.now() + SCROLL_FOLLOW_MS
+  }, [])
   const loadingOlder = useRef(false)
   const [olderLoading, setOlderLoading] = useState(false)
   const olderLoadAnchor = useRef<OlderLoadAnchor | null>(null)
@@ -1921,6 +1945,11 @@ export function TrajectoryTable({
     }
     return indexes
   }, [projectedVirtualRows])
+  // Read by the settling passes of a scroll, which outlive the render that
+  // started them: a ledger that grew (an older page paged in) moves every row
+  // below the addition, so the index has to be looked up again each pass.
+  const virtualIndexRef = useRef(virtualIndexByRecordId)
+  virtualIndexRef.current = virtualIndexByRecordId
   const virtualItems = virtualizationEnabled ? rowVirtualizer.getVirtualItems() : []
   const virtualTop = Math.max(0, (virtualItems[0]?.start ?? 0) - virtualScrollMargin)
   const virtualBottom = virtualItems.length === 0
@@ -2090,18 +2119,14 @@ export function TrajectoryTable({
     appliedRecordSelection.current = recordSelection
     selectRecord(recordSelection.index)
     const record = allRecords.find(candidate => candidate.cell.index === recordSelection.index)
-    pendingScrollRecordId.current = record === undefined
-      ? null
-      : trajectoryRecordId(record.cell)
-  }, [allRecords, recordSelection, selectRecord])
+    queueScrollTo(record === undefined ? null : trajectoryRecordId(record.cell))
+  }, [allRecords, queueScrollTo, recordSelection, selectRecord])
   useEffect(() => {
     if (recordFocus === null || appliedRecordFocus.current === recordFocus) return
     appliedRecordFocus.current = recordFocus
     const record = allRecords.find(candidate => candidate.cell.index === recordFocus.index)
-    pendingScrollRecordId.current = record === undefined
-      ? null
-      : trajectoryRecordId(record.cell)
-  }, [allRecords, recordFocus])
+    queueScrollTo(record === undefined ? null : trajectoryRecordId(record.cell))
+  }, [allRecords, queueScrollTo, recordFocus])
 
   const selectRequest = (
     request: SelectedRequest,
@@ -2146,24 +2171,67 @@ export function TrajectoryTable({
     const target = flattenRecords(turns).find(record => record.cell.callId === inspectCallId)
     if (target === undefined) return
     openRecordSummaryRef.current(target)
-    pendingScrollRecordId.current = trajectoryRecordId(target.cell)
+    queueScrollTo(trajectoryRecordId(target.cell))
     onInspectApplied?.()
-  }, [inspectCallId, turns, onInspectApplied])
+  }, [inspectCallId, queueScrollTo, turns, onInspectApplied])
+  // The same handoff addressed by the source event instead of a call: a record
+  // a transcript LINE folded into (a content-search hit). A few event kinds
+  // (compaction, turn errors) carry no row of their own, so the nearest earlier
+  // row takes the handoff — but only once the loaded window is known to reach
+  // back past the target (`historyStartSeq`), never for an event that is merely
+  // older than what the ledger holds, which stays pending until it pages in.
+  useEffect(() => {
+    if (inspectSeq === null) return
+    const candidates = flattenRecords(turns)
+    let target = candidates.find(record => record.cell.sourceSeq === inspectSeq)
+    if (target === undefined) {
+      if (historyStartSeq === undefined || historyStartSeq > inspectSeq) return
+      const seqOf = (record: TableRecord): number => record.cell.sourceSeq ?? -1
+      if (!candidates.some(record => seqOf(record) > inspectSeq)) return
+      target = candidates.filter(record =>
+        seqOf(record) >= historyStartSeq && seqOf(record) < inspectSeq).at(-1)
+    }
+    if (target === undefined) return
+    openRecordSummaryRef.current(target)
+    queueScrollTo(trajectoryRecordId(target.cell))
+    onInspectApplied?.()
+  }, [historyStartSeq, inspectSeq, queueScrollTo, turns, onInspectApplied])
   useEffect(() => {
     const id = pendingScrollRecordId.current
     if (id === null) return
+    // A new target cancels the previous one's settling passes.
+    if (scrollSettleTimer.current !== null) window.clearTimeout(scrollSettleTimer.current)
     const position = records.findIndex(record =>
       trajectoryRecordId(record.cell) === id && record.collapsedSummary === undefined)
     if (position === -1) return
+    const log = ((window as unknown as { __htLog?: unknown[] }).__htLog ??= [])
+    log.push({ id, records: records.length, pos: records.findIndex(r => trajectoryRecordId(r.cell) === id),
+      vIndex: virtualIndexByRecordId.get(id), virtualizationEnabled, keepFor: pendingScrollDeadline.current - Date.now() })
+    // The target is kept for a moment, so a ledger that is still growing does
+    // not leave the scroll behind; the deadline is what ends the pursuit.
+    const keep = Date.now() < pendingScrollDeadline.current
     if (virtualizationEnabled) {
       const virtualIndex = virtualIndexByRecordId.get(id)
       if (virtualIndex === undefined) return
-      pendingScrollRecordId.current = null
+      if (!keep) pendingScrollRecordId.current = null
       followsTableTail.current = false
-      rowVirtualizer.scrollToIndex(virtualIndex, { behavior: 'smooth', align: 'center' })
+      /*
+       * A long jump over dynamically measured rows lands short: the virtualizer
+       * can only correct the offset once the rows it skipped have been measured,
+       * and a running SMOOTH animation swallows that correction — a hit a
+       * thousand records back would stop tens of rows above its own row. Jump at
+       * once and re-assert the target while the measurements settle.
+       */
+      const settle = (remaining: number): void => {
+        const at = virtualIndexRef.current.get(id)
+        if (at !== undefined) rowVirtualizer.scrollToIndex(at, { align: 'center' })
+        if (remaining <= 0) return
+        scrollSettleTimer.current = window.setTimeout(() => { settle(remaining - 1) }, SCROLL_SETTLE_MS)
+      }
+      settle(SCROLL_SETTLE_PASSES)
       return
     }
-    pendingScrollRecordId.current = null
+    if (!keep) pendingScrollRecordId.current = null
     followsTableTail.current = false
     const recordIndex = records[position]?.cell.index
     const row = recordIndex === undefined

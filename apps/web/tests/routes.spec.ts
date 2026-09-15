@@ -49,6 +49,24 @@ describe('parseHash / routeHash', () => {
       .toBe('#/claude/sess%201/context/sess%201%2Fagent-a1b2')
   })
 
+  test('a record anchor rides every address as a query tail', () => {
+    const routes: Route[] = [
+      { kind: K, id: ID, line: 0 },
+      { kind: K, id: ID, file: FILE, line: 412 },
+      { kind: K, id: ID, tab: 'context', line: 3 },
+      { kind: K, id: ID, tab: 'context', agent: FILE, line: 3 },
+    ]
+    for (const route of routes) expect(parseHash(routeHash(route))).toStrictEqual(route)
+    expect(routeHash({ kind: K, id: 'x', file: 'x/agent-a', line: 9 }))
+      .toBe('#/claude/x/agent/x%2Fagent-a?line=9')
+  })
+
+  test('a nonsense anchor is simply no anchor', () => {
+    for (const tail of ['?line=', '?line=-1', '?line=abc', '?line=1.5', '?other=2']) {
+      expect(parseHash(`#/claude/x${tail}`), tail).toStrictEqual({ kind: K, id: 'x' })
+    }
+  })
+
   test('unknown and partial addresses degrade instead of throwing', () => {
     expect(parseHash('')).toBeNull()
     expect(parseHash('#/')).toBeNull()
@@ -74,6 +92,14 @@ describe('runtimeKey', () => {
     // reopen the stream — an accepted cost of the two framings.
     expect(runtimeKey({ kind: K, id: ID, file: FILE }))
       .not.toBe(runtimeKey({ kind: K, id: ID, tab: 'context', agent: FILE }))
+  })
+
+  test('moving the record anchor keeps the same stream', () => {
+    // A content-search hit inside the open session must not reopen it: the
+    // anchor is an address detail, not a stream identity.
+    expect(runtimeKey({ kind: K, id: ID, line: 412 })).toBe(runtimeKey({ kind: K, id: ID }))
+    expect(runtimeKey({ kind: K, id: ID, file: FILE, line: 1 }))
+      .toBe(runtimeKey({ kind: K, id: ID, file: FILE, line: 2 }))
   })
 
   test('different sessions never share a stream', () => {

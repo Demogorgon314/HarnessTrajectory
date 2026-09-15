@@ -520,6 +520,187 @@
   }
 }
 
+/* -- content matches (full-text hits, pinned under the session tree) ------------ */
+
+.matches {
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: 55%;
+  overflow-y: auto;
+  margin: 0 calc(-1 * var(--sidebar-inline-padding)) 0 0;
+  padding: 8px var(--sidebar-inline-padding) 12px 0;
+  border-top: 0.5px solid var(--dsw-alias-border-l3, var(--dsw-alias-border-l1));
+  animation: wide-in 200ms var(--ds-ease-in-out);
+}
+
+.matchesHeader {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px 4px;
+}
+
+.matchesTitle {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  line-height: 16px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--dsw-alias-label-caption);
+}
+
+.matchesNote {
+  flex: none;
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--dsw-alias-label-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.matchesState {
+  padding: 6px 8px;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.matchesState[data-tone='error'] {
+  color: var(--dsw-alias-state-error-primary);
+}
+
+.matchGroup {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.matchGroup + .matchGroup {
+  margin-top: 4px;
+}
+
+.matchSessionRow,
+.matchHitRow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  box-sizing: border-box;
+  border: none;
+  background: transparent;
+  text-align: left;
+  font-family: inherit;
+  color: var(--dsw-alias-label-primary);
+  border-radius: 8px;
+  padding: 0 8px;
+  cursor: pointer;
+}
+
+.matchSessionRow {
+  height: 32px;
+}
+
+.matchSessionRow:hover,
+.matchHitRow:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.matchSessionRow[data-active] {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.matchSessionRow:focus-visible,
+.matchHitRow:focus-visible {
+  outline: 1px solid var(--dsw-alias-state-business-primary);
+  outline-offset: -1px;
+}
+
+.matchSessionRow .title {
+  margin: 0 4px;
+}
+
+/* The project gives up width long before the title does. */
+.matchProject {
+  flex: 0 20 auto;
+  min-width: 0;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  line-height: 20px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.matchCount {
+  flex: none;
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-secondary, var(--dsw-alias-label-tertiary));
+  font-size: 11px;
+  line-height: 18px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Hit rows sit one step in from their session, like the tree's session rows. */
+.matchHitRow {
+  align-items: flex-start;
+  padding: 3px 8px 3px 24px;
+}
+
+.matchRole {
+  flex: none;
+  margin-top: 1px;
+  font-size: 10px;
+  line-height: 16px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.matchRole[data-role='human'] {
+  color: var(--dsw-alias-state-business-primary);
+}
+
+.matchRole[data-role='tool'] {
+  color: var(--dsw-alias-state-warning-primary, var(--dsw-alias-label-tertiary));
+}
+
+.matchSnippet {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  font-size: 12px;
+  line-height: 17px;
+  color: var(--dsw-alias-label-secondary, var(--dsw-alias-label-tertiary));
+  word-break: break-word;
+}
+
+.matchMark {
+  border-radius: 2px;
+  padding: 0 1px;
+  background: color-mix(in srgb, var(--dsw-alias-state-business-primary) 28%, transparent);
+  color: var(--dsw-alias-label-primary);
+}
+
+.matchHitRow .time {
+  margin-top: 1px;
+  line-height: 17px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .matches {
+    animation: none;
+  }
+}
+
 /* -- main column ----------------------------------------------------------------- */
 
 .main {

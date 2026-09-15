@@ -15,12 +15,20 @@ import {
 } from '@harness-trajectory/core'
 import { createMetaScanner, readHead, type MetaScanner } from './meta.ts'
 import type { HarnessRoot } from './roots.ts'
+import type { SearchIndexer } from './search/indexer.ts'
+import type { SearchFileKey } from './search/store.ts'
 import { readFirstLine, readLines } from './tail.ts'
 
 const LIVE_WINDOW_MS = 2 * 60_000
 const WATCH_DEBOUNCE_MS = 120
 const POLL_INTERVAL_MS = 1_500
 const CHUNK_LINES = 400
+/**
+ * Bytes the first pass over a transcript reads at a time. The local corpus holds
+ * rollouts of well over 100 MB and `readLines` allocates one buffer per call, so
+ * the initial scan walks a large file in slices instead of materializing it whole.
+ */
+const INITIAL_CHUNK_BYTES = 8 * 1024 * 1024
 
 interface FileEntry {
   kind: HarnessKind
@@ -33,6 +41,14 @@ interface FileEntry {
   /** Byte offset up to which lines have been consumed. */
   offset: number
   rest: string
+  /**
+   * Non-blank lines consumed so far, which is also the 0-based index the next
+   * one gets in the search index. Blank lines are dropped by `readLines`, so
+   * this counts records, exactly like the replay a viewer receives.
+   */
+  lines: number
+  /** First line index the search index still wants; everything below it is already stored. */
+  searchFrom: number
   meta: MetaScanner | null
   /** Grok only: mtime of the `summary.json` last read for this file. */
   summaryMtimeMs?: number
@@ -66,6 +82,11 @@ export interface SessionIndexOptions {
   /** Disable filesystem watching and polling (tests). */
   watch?: boolean
   now?: () => number
+  /**
+   * Full-text index fed from the same byte stream the meta scanner reads.
+   * Omitted (tests, `HARNESS_TRAJECTORY_SEARCH=0`) means nothing is indexed.
+   */
+  search?: SearchIndexer
 }
 
 type Subscriber = (event: SessionLiveEvent) => void
@@ -152,12 +173,14 @@ export class SessionIndex extends EventEmitter {
   private poll: NodeJS.Timeout | null = null
   private readonly watchEnabled: boolean
   private readonly now: () => number
+  private readonly search: SearchIndexer | undefined
 
   constructor(options: SessionIndexOptions) {
     super()
     this.roots = options.roots
     this.watchEnabled = options.watch ?? true
     this.now = options.now ?? Date.now
+    this.search = options.search
   }
 
   async start(): Promise<void> {
@@ -165,6 +188,9 @@ export class SessionIndex extends EventEmitter {
       await this.scanRoot(root)
       if (this.watchEnabled) this.watchRoot(root)
     }
+    // Everything on disk has been seen: commit the backfill and forget the
+    // files that are gone. Only now does search report itself as ready.
+    this.search?.finishBackfill(this.files.keys())
     if (this.watchEnabled) {
       this.poll = setInterval(() => { void this.pollSubscribed() }, POLL_INTERVAL_MS)
       this.poll.unref()
@@ -177,6 +203,7 @@ export class SessionIndex extends EventEmitter {
     if (this.poll !== null) clearInterval(this.poll)
     for (const timer of this.pending.values()) clearTimeout(timer)
     this.pending.clear()
+    this.search?.stop()
   }
 
   /** Re-stat one path (tests and manual refresh). */
@@ -249,10 +276,17 @@ export class SessionIndex extends EventEmitter {
       // they actually differ from what this view already folded.
       if (sidecar !== undefined) entry.sidecarKey = sidecar.key
       const all = sidecar === undefined ? lines : [sidecar.line, ...lines]
-      return { ref: refOf(entry), lines: all, times: lineTimes(all) }
+      // The sidecar is in no file, so it takes no line index: the merge keeps it
+      // in its own chunk and the first real line of the file is still line 0.
+      return {
+        ref: refOf(entry),
+        lines: all,
+        times: lineTimes(all),
+        ...(sidecar === undefined ? {} : { synthetic: 1 }),
+      }
     }))
     for (const chunk of mergeChronologically(sources)) {
-      emit({ type: 'lines', file: chunk.ref, lines: chunk.lines })
+      emit({ type: 'lines', file: chunk.ref, lines: chunk.lines, startLine: chunk.startLine })
     }
     emit({ type: 'meta', summary: this.summarize(session), children: this.childSummaries(session) })
   }
@@ -267,7 +301,9 @@ export class SessionIndex extends EventEmitter {
     set.add(subscriber)
     return () => {
       set.delete(subscriber)
-      if (set.size === 0) this.subscribers.delete(key)
+      // Only ever drop the set this key still holds: a stream that closes after
+      // a later one opened would otherwise unregister the new viewer with it.
+      if (set.size === 0 && this.subscribers.get(key) === set) this.subscribers.delete(key)
     }
   }
 
@@ -348,6 +384,8 @@ export class SessionIndex extends EventEmitter {
       mtimeMs: info.mtimeMs,
       offset: 0,
       rest: '',
+      lines: 0,
+      searchFrom: 0,
       meta: role === 'main' ? createMetaScanner(root.kind, grokSummary) : null,
       ...(root.kind === 'grok' ? { summaryTitle: grokSummaryTitle(grokSummary) } : {}),
       ...(grokUnresolved && role === 'main' ? { grokUnresolved: true } : {}),
@@ -358,7 +396,10 @@ export class SessionIndex extends EventEmitter {
     if (role === 'main') session.main = entry
     else session.children.set(id, entry)
     if (role === 'child' && !initial) this.emitTo(session, { type: 'file', file: ref })
-    await this.consume(entry, info.size, info.mtimeMs, initial)
+    // The meta scanner always replays from byte 0 (its state is in memory only);
+    // the search index answers with the first line it has not stored yet.
+    entry.searchFrom = this.search?.beginFile(searchKeyOf(entry), { size: info.size, mtimeMs: info.mtimeMs }) ?? 0
+    await this.consumeInitial(entry, info.size, info.mtimeMs, initial)
     await this.syncKimiTitle(entry)
     await this.syncGrokSummary(entry, true)
     return entry
@@ -489,6 +530,9 @@ export class SessionIndex extends EventEmitter {
     // its parent (and standalone from its lines) from here on.
     entry.meta = null
     entry.grokUnresolved = false
+    // Its lines were indexed under its own id; move them to the parent so a hit
+    // opens the parent session with this transcript selected.
+    this.search?.rebind(searchKeyOf(entry))
     const parent = this.sessionFor(entry.kind, parentId)
     parent.children.set(entry.ref.id, entry)
     this.emitTo(parent, { type: 'file', file: entry.ref })
@@ -560,7 +604,8 @@ export class SessionIndex extends EventEmitter {
     const sidecar = await buildGrokSidecar(dir, entry.ref.id, summary)
     if (sidecar !== undefined && sidecar.key !== entry.sidecarKey) {
       entry.sidecarKey = sidecar.key
-      this.emitTo(session, { type: 'lines', file: entry.ref, lines: [sidecar.line] })
+      // Synthetic: it belongs to no line of `updates.jsonl` (see `startLine`).
+      this.emitTo(session, { type: 'lines', file: entry.ref, lines: [sidecar.line], startLine: -1 })
     } else if (!titleChanged) {
       return
     }
@@ -577,6 +622,19 @@ export class SessionIndex extends EventEmitter {
     return session
   }
 
+  /**
+   * First pass over a file, in bounded slices. `consume` allocates one buffer
+   * per call, so a multi-hundred-megabyte rollout is walked rather than loaded.
+   */
+  private async consumeInitial(entry: FileEntry, size: number, mtimeMs: number, initial: boolean): Promise<void> {
+    let end = Math.min(INITIAL_CHUNK_BYTES, size)
+    for (;;) {
+      await this.consume(entry, end, mtimeMs, initial)
+      if (end >= size) return
+      end = Math.min(end + INITIAL_CHUNK_BYTES, size)
+    }
+  }
+
   /** Consume appended bytes: update metadata and forward new lines to subscribers. */
   private async consume(entry: FileEntry, size: number, mtimeMs: number, initial = false): Promise<void> {
     const session = this.sessions.get(sessionKey(entry.kind, entry.sessionId))
@@ -584,6 +642,9 @@ export class SessionIndex extends EventEmitter {
       // Truncated or rewritten: start over and tell subscribers to reset the file.
       entry.offset = 0
       entry.rest = ''
+      entry.lines = 0
+      entry.searchFrom = 0
+      this.search?.reset(entry.path)
       entry.meta = entry.ref.role === 'main'
         // Grok's listing facts come from `summary.json`, not from the lines.
         ? createMetaScanner(entry.kind, entry.kind === 'grok'
@@ -601,12 +662,52 @@ export class SessionIndex extends EventEmitter {
     if (entry.meta !== null) {
       for (const line of result.lines) entry.meta.push(line)
     }
+    // `index` advances `entry.lines`, so the first appended line's index is the
+    // count as it stands here — the same one the search index gives the record.
+    const startLine = entry.lines
+    this.index(entry, result.lines)
     if (result.lines.length === 0 || session === undefined) return
     if (!initial) {
-      this.emitTo(session, { type: 'lines', file: entry.ref, lines: result.lines })
+      this.emitTo(session, { type: 'lines', file: entry.ref, lines: result.lines, startLine })
       this.emitTo(session, { type: 'meta', summary: this.summarize(session), children: this.childSummaries(session) })
     }
     this.emit('change', entry.kind, entry.sessionId)
+  }
+
+  /**
+   * Hand freshly consumed lines to the search index. Lines below `searchFrom`
+   * were stored by an earlier run of the server and are only replayed here for
+   * the meta scanner's benefit.
+   */
+  private index(entry: FileEntry, lines: readonly string[]): void {
+    const search = this.search
+    if (search === undefined) {
+      entry.lines += lines.length
+      return
+    }
+    const key = searchKeyOf(entry)
+    for (const line of lines) {
+      if (entry.lines >= entry.searchFrom) search.queue(key, entry.lines, line)
+      entry.lines += 1
+    }
+    search.noteProgress(key, {
+      size: entry.size,
+      mtimeMs: entry.mtimeMs,
+      indexedBytes: entry.offset,
+      indexedLines: entry.lines,
+    })
+  }
+
+  /** Listing facts for one session, for search result grouping. */
+  facts(kind: HarnessKind, id: string): { title: string; cwd?: string; updatedAt?: number } | undefined {
+    const session = this.sessions.get(sessionKey(kind, id))
+    if (session === undefined || session.main === null) return undefined
+    const summary = this.summarize(session)
+    return {
+      title: summary.title,
+      ...(summary.cwd === null ? {} : { cwd: summary.cwd }),
+      updatedAt: summary.updatedAt,
+    }
   }
 
   private emitTo(session: SessionRecord, event: SessionLiveEvent): void {
@@ -761,6 +862,15 @@ export class SessionIndex extends EventEmitter {
     }
     return undefined
   }
+}
+
+/**
+ * How the search index addresses one transcript: the session a hit opens and
+ * the `?file=` id that selects this file inside it. For a main file both are the
+ * session id; for a child, `fileId` is the child's own ref id.
+ */
+function searchKeyOf(entry: FileEntry): SearchFileKey {
+  return { path: entry.path, kind: entry.kind, sessionId: entry.sessionId, fileId: entry.ref.id }
 }
 
 /** The ref a child transcript is served with when it is viewed as a session of its own. */
@@ -1107,18 +1217,32 @@ export interface LineSource {
   ref: SessionFileRef
   lines: readonly string[]
   times: readonly number[]
+  /**
+   * Leading entries of `lines` the server synthesized rather than read (grok's
+   * sidecar). They are in no file, so they take no line index and the entry
+   * after them is line 0.
+   */
+  synthetic?: number
+}
+
+/** One replayed run of lines, addressed the way live appends are. */
+export interface LineChunk {
+  ref: SessionFileRef
+  lines: string[]
+  /** 0-based index of `lines[0]` among the file's non-blank lines; negative when synthetic. */
+  startLine: number
 }
 
 /**
  * Stable k-way merge of per-file line sequences by time; earlier sources win
  * ties, so the main transcript precedes children at equal timestamps. Emits
- * runs of consecutive lines from one file, capped at `CHUNK_LINES`.
+ * runs of consecutive lines from one file, capped at `CHUNK_LINES`; synthetic
+ * lines never share a chunk with real ones, so one `startLine` addresses the
+ * whole run.
  */
-export function* mergeChronologically(
-  sources: readonly LineSource[],
-): Generator<{ ref: SessionFileRef; lines: string[] }> {
+export function* mergeChronologically(sources: readonly LineSource[]): Generator<LineChunk> {
   const cursors = sources.map(() => 0)
-  let current: { ref: SessionFileRef; lines: string[]; source: number } | null = null
+  let current: (LineChunk & { source: number; synthetic: boolean }) | null = null
   for (;;) {
     let best = -1
     let bestTime = Number.POSITIVE_INFINITY
@@ -1138,13 +1262,26 @@ export function* mergeChronologically(
     const line = source.lines[cursor]
     cursors[best] = cursor + 1
     if (line === undefined) continue
-    if (current === null || current.source !== best || current.lines.length >= CHUNK_LINES) {
-      if (current !== null) yield { ref: current.ref, lines: current.lines }
-      current = { ref: source.ref, lines: [], source: best }
+    const skipped = source.synthetic ?? 0
+    const synthetic = cursor < skipped
+    if (
+      current === null || current.source !== best
+      || current.synthetic !== synthetic || current.lines.length >= CHUNK_LINES
+    ) {
+      if (current !== null) yield { ref: current.ref, lines: current.lines, startLine: current.startLine }
+      current = {
+        ref: source.ref,
+        lines: [],
+        startLine: synthetic ? -1 : cursor - skipped,
+        source: best,
+        synthetic,
+      }
     }
     current.lines.push(line)
   }
-  if (current !== null && current.lines.length > 0) yield { ref: current.ref, lines: current.lines }
+  if (current !== null && current.lines.length > 0) {
+    yield { ref: current.ref, lines: current.lines, startLine: current.startLine }
+  }
 }
 
 /** Recursively list `.jsonl` files under a directory; missing directories yield nothing. */

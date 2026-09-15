@@ -165,7 +165,8 @@ class CodexParser implements SessionParser {
     return this.images
   }
 
-  push(line: string, file: SessionFileRef): void {
+  push(line: string, file: SessionFileRef, lineIndex?: number): void {
+    this.assembler.beginLine(file.id, lineIndex)
     const record = parseJsonLine(line)
     if (!isRecord(record)) return
     const time = parseTime(record['timestamp']) ?? this.lastTime

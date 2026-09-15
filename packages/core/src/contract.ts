@@ -389,6 +389,51 @@ export type ConversationLocation =
 // Trajectory snapshot: everything the ledger and timeline fold over
 // ---------------------------------------------------------------------------
 
+/**
+ * Which folded record one transcript line produced.
+ *
+ * A tool call is addressed by its call id rather than by an event seq, because
+ * a call and its result fold into ONE record (and a nested call has no
+ * top-level node at all): both the line that emitted the call and the line that
+ * carried its result point at the same `call` target.
+ */
+export type SourceLineTarget =
+  | { readonly kind: 'seq'; readonly seq: number }
+  | { readonly kind: 'call'; readonly callId: string }
+
+/**
+ * Where a record came from: resolves a raw transcript line back to the record
+ * the fold built from it, so a full-text hit (`SearchHit.line`) can be scrolled
+ * to. Lines are 0-based indexes among a file's NON-BLANK lines — the numbering
+ * the server's replay and its search index share.
+ *
+ * The index is a live view of the parser, not a copied snapshot field: its
+ * identity never changes, and it only ever grows.
+ */
+export interface SourceLineIndex {
+  /**
+   * The record a line produced. The rule, in order:
+   *
+   * 1. the FIRST record the line created — for a record whose node is emitted
+   *    later (an assistant step closed by the following line) this is still the
+   *    line that opened it;
+   * 2. else the tool record the line belongs to, which binds both the line that
+   *    emitted a call and the line that carried its result (and is the only way
+   *    a call line resolves at all, since the record exists only once the
+   *    result lands);
+   * 3. else the nearest preceding record of the same file, which is where the
+   *    stream chunks and housekeeping records that fold into nothing land;
+   * 4. else nothing. A line the fold has not reached yet always answers
+   *    `undefined`, never the tail, so a caller can keep waiting while a replay
+   *    streams in.
+   *
+   * @param line - 0-based index among the file's non-blank lines.
+   * @param fileId - transcript the line belongs to; omitted, the first file the
+   * parser saw (the main transcript of the view).
+   */
+  targetAt(line: number, fileId?: string): SourceLineTarget | undefined
+}
+
 export interface TrajectorySnapshot {
   /** Complete loaded prompt text whose request header is outside the window. */
   readonly systemPrompts?: readonly SystemPromptNode[]
@@ -398,6 +443,8 @@ export interface TrajectorySnapshot {
   readonly callSchemas: ReadonlyMap<string, ToolSchema>
   readonly partial: PartialAssistant | null
   readonly runningCalls: readonly RunningToolCall[]
+  /** Line → record map, when the parser was fed line numbers. */
+  readonly sourceLines?: SourceLineIndex
 }
 
 export const EMPTY_TRAJECTORY_SNAPSHOT: TrajectorySnapshot = Object.freeze({

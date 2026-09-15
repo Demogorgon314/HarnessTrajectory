@@ -1132,6 +1132,34 @@ describe('TrajectoryTable', () => {
     expect(onInspectApplied).toHaveBeenCalledOnce()
   })
 
+  const SEQ_TURNS: readonly TrajectoryTurnModel[] = [{
+    turn: 1,
+    groups: [{
+      title: 'Step 1',
+      cells: [
+        { index: 1, kind: 'user', text: 'Fix the build', sourceSeq: 1, timeSeconds: null },
+        // Seq 2 is deliberately absent: not every event folds into a row.
+        { index: 2, kind: 'message', text: 'Running it', sourceSeq: 3, timeSeconds: 0.5 },
+      ],
+    }],
+  }]
+
+  it('an inspect target addressed by source event opens that record', () => {
+    const onInspectApplied = vi.fn()
+    render(
+      <TrajectoryTable
+        turns={SEQ_TURNS}
+        {...FOLD_PROPS}
+        inspectSeq={1}
+        onInspectApplied={onInspectApplied}
+      />,
+    )
+
+    const selected = screen.getAllByRole('row').filter(row => row.getAttribute('aria-selected') === 'true')
+    expect(selected.map(row => row.getAttribute('data-record-index'))).toEqual(['1'])
+    expect(onInspectApplied).toHaveBeenCalledOnce()
+  })
+
   it('an unmatched inspect target stays pending without acknowledgement', () => {
     const onInspectApplied = vi.fn()
     render(
@@ -1139,6 +1167,57 @@ describe('TrajectoryTable', () => {
         turns={CALL_TURNS}
         {...FOLD_PROPS}
         inspectCallId="call-missing"
+        onInspectApplied={onInspectApplied}
+      />,
+    )
+
+    expect(screen.getByRole('row', { name: /TOOL/ }).getAttribute('aria-selected')).toBe('false')
+    expect(onInspectApplied).not.toHaveBeenCalled()
+  })
+
+  it('gives an event with no row of its own to the nearest earlier row', () => {
+    const onInspectApplied = vi.fn()
+    // Seq 2 is a compaction: real in the loaded window, but it contributes no row.
+    render(
+      <TrajectoryTable
+        turns={SEQ_TURNS}
+        {...FOLD_PROPS}
+        historyStartSeq={1}
+        inspectSeq={2}
+        onInspectApplied={onInspectApplied}
+      />,
+    )
+
+    const selected = screen.getAllByRole('row').filter(row => row.getAttribute('aria-selected') === 'true')
+    expect(selected.map(row => row.getAttribute('data-record-index'))).toEqual(['1'])
+    expect(onInspectApplied).toHaveBeenCalledOnce()
+  })
+
+  it('leaves an event older than the loaded window pending instead of guessing', () => {
+    const onInspectApplied = vi.fn()
+    // The window starts at seq 1, so seq 0 is history that has not paged in;
+    // landing on the first loaded row would be a wrong answer, not an early one.
+    render(
+      <TrajectoryTable
+        turns={SEQ_TURNS}
+        {...FOLD_PROPS}
+        historyStartSeq={1}
+        inspectSeq={0}
+        onInspectApplied={onInspectApplied}
+      />,
+    )
+
+    expect(screen.getAllByRole('row').filter(row => row.getAttribute('aria-selected') === 'true')).toEqual([])
+    expect(onInspectApplied).not.toHaveBeenCalled()
+  })
+
+  it('an unmatched source event target stays pending too', () => {
+    const onInspectApplied = vi.fn()
+    render(
+      <TrajectoryTable
+        turns={CALL_TURNS}
+        {...FOLD_PROPS}
+        inspectSeq={999}
         onInspectApplied={onInspectApplied}
       />,
     )

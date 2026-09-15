@@ -669,3 +669,77 @@ describe('kimiMessageClass', () => {
     expect(kimiMessageClass({ kind: 'future_kind' })).toEqual({ kind: 'injection', name: 'future_kind' })
   })
 })
+
+describe('kimi source lines', () => {
+  /** Feed a wire file the way the server's replay numbers it: 0-based, no gaps. */
+  function feedNumbered(lines: readonly string[], file: SessionFileRef = MAIN) {
+    const parser = createKimiParser()
+    for (const [index, item] of lines.entries()) parser.push(item, file, index)
+    return parser
+  }
+
+  it('resolves the prompt line and the tool call and result lines', () => {
+    const lines = twoStepFixture()
+    const parser = feedNumbered(lines)
+    const snapshot = parser.snapshot()
+    const prompt = snapshot.sourceLines?.targetAt(lines.indexOf(appendMessage(110, 'read a.ts', { kind: 'user' })), MAIN.id)
+    expect(snapshot.eventNodes.find(node => prompt?.kind === 'seq' && node.seq === prompt.seq)?.kind).toBe('user')
+    const call = lines.indexOf(toolCall(1_010, '0', 1, 'call-1', 'Read', { path: '/tmp/a.ts' }))
+    const result = lines.indexOf(toolResult(1_100, 'call-1', { output: 'export const a = 1' }))
+    expect(snapshot.sourceLines?.targetAt(call, MAIN.id)).toEqual({ kind: 'call', callId: 'call-1' })
+    expect(snapshot.sourceLines?.targetAt(result, MAIN.id)).toEqual({ kind: 'call', callId: 'call-1' })
+  })
+
+  it('binds a text part to the assistant record its step flushed', () => {
+    const lines = twoStepFixture()
+    const parser = feedNumbered(lines)
+    const snapshot = parser.snapshot()
+    // Kimi flushes a step only at `step.end`, a line later: the record still
+    // belongs to the line that opened the step it was assembled from.
+    const text = lines.indexOf(textPart(2_000, '0', 2, 'It exports a.'))
+    const target = snapshot.sourceLines?.targetAt(text, MAIN.id)
+    const node = snapshot.eventNodes.find(item => target?.kind === 'seq' && item.seq === target.seq)
+    expect(node?.kind).toBe('assistant')
+    expect((node as AssistantMessageNode).step).toBe(2)
+  })
+
+  it('answers an unread line with nothing and an unnumbered fold with nothing', () => {
+    const lines = twoStepFixture()
+    expect(feedNumbered(lines).snapshot().sourceLines?.targetAt(lines.length + 5, MAIN.id)).toBeUndefined()
+    expect(feed(lines).snapshot().sourceLines?.targetAt(2, MAIN.id)).toBeUndefined()
+  })
+
+  it('numbers a subagent wire file on its own', () => {
+    const parser = createKimiParser()
+    const main = [
+      metadata(),
+      profileBind(10),
+      turnPrompt(100, 'fix the bug'),
+      appendMessage(110, 'fix the bug', { kind: 'user' }),
+      stepBegin(200, '0', 1),
+      toolCall(300, '0', 1, 'call-agent', 'Agent', {
+        subagent_type: 'coder', prompt: 'fix the bug in a.ts', description: 'Fix the bug',
+      }),
+      stepEnd(310, '0', 1, { finishReason: 'tool_use', usage: usage(10, 0, 0, 5) }),
+      line('task.started', {
+        info: {
+          kind: 'agent', taskId: 'task-1', agentId: CHILD_ID, parentToolCallId: 'call-agent',
+          description: 'Fix the bug', subagentType: 'coder', model: 'k3', status: 'running',
+          startedAt: at(400), detached: false,
+        },
+      }, 400),
+    ]
+    for (const [index, item] of main.entries()) parser.push(item, MAIN, index)
+    const child = [
+      JSON.stringify({ type: 'metadata', created_at: at(410), protocol_version: '1.5' }),
+      stepBegin(500, '0', 1, CHILD_ID),
+      toolCall(600, '0', 1, 'child-call', 'Read', { path: '/tmp/b.ts' }, CHILD_ID),
+      toolResult(700, 'child-call', { output: 'export const b = 2' }, CHILD_ID),
+    ]
+    for (const [index, item] of child.entries()) parser.push(item, CHILD, index)
+    const index = parser.snapshot().sourceLines
+    expect(index?.targetAt(2, CHILD.id)).toEqual({ kind: 'call', callId: 'child-call' })
+    // The same line number in the MAIN file is a different record entirely.
+    expect(index?.targetAt(2, MAIN.id)).not.toEqual({ kind: 'call', callId: 'child-call' })
+  })
+})

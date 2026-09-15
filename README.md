@@ -16,6 +16,11 @@ both ported to run on top of plain transcript files instead of a runtime.
 ## Features
 
 - **Session picker** grouped by project, filterable by harness, searchable by title, path, or id.
+- **Full-text search** across every transcript on the machine: prompts, assistant replies,
+  tool calls, and tool output. Substring matching (so `--project serv` or `packages/co` find
+  something), case-insensitive, grouped by session, and each hit opens the exact record —
+  including inside a subagent transcript. Built on SQLite FTS5 with the trigram tokenizer,
+  updated incrementally as sessions run.
 - **Trajectory ledger**: turns, steps, user / assistant / tool records, token usage, durations,
   a record inspector (payload, result, schema, timing), fold controls, and live search.
 - **Timing overview**: drag to focus an interval, wheel to zoom, recorded or equal widths.
@@ -31,7 +36,8 @@ both ported to run on top of plain transcript files instead of a runtime.
 
 ## Quick start
 
-Requires Node 22+ and pnpm 12.
+Requires Node 22.13+ and pnpm 12. (22.13 is where `node:sqlite`, which backs the search
+index, stopped needing a flag. There is no native dependency to build.)
 
 ```sh
 pnpm install
@@ -59,6 +65,11 @@ environment variable; the server also accepts `--port`, `--host`, and `--static`
 | `KIMI_CODE_HOME` | `~/.kimi-code` | Kimi Code home (`<home>/sessions`) |
 | `GROK_HOME` | `~/.grok` | Grok Build home (`<home>/sessions`) |
 | `HARNESS_TRAJECTORY_{CLAUDE,CODEX,KIMI,GROK}_ROOT` | derived | Point one harness at an arbitrary directory |
+| `HARNESS_TRAJECTORY_CACHE_DIR` | `$XDG_CACHE_HOME/harness-trajectory`, else `~/.cache/harness-trajectory` | Holds `search.sqlite`, the only file the server writes |
+| `HARNESS_TRAJECTORY_SEARCH` | `1` | `0`, `false`, or `off` disables indexing; `/api/search` then answers `{ "enabled": false }` |
+
+Transcript roots are only ever read. The search index is a cache: delete
+`search.sqlite` and the next start rebuilds it.
 
 ## Architecture
 
@@ -67,6 +78,7 @@ packages/core     Contract types + one incremental adapter per harness. Pure TS;
 packages/ui       Trajectory view: ledger, timeline, inspector. Vendored dsh primitives and theme.
 packages/context  dsh-context port: fold engine (src/fold), transcript → fold-event synthesizers (src/synth), dashboard (src/client).
 apps/server       Hono API: scans harness roots, classifies files, replays and tails JSONL over SSE.
+                  src/search = SQLite FTS5 full-text index over the same lines.
 apps/web          Vite + React shell: sidebar, routes, harness registry, live session runtime.
 ```
 
@@ -105,6 +117,17 @@ Tests use hand-written synthetic records only. Never commit real transcript cont
 - **Per-call tokens.** Grok Build reports usage per turn; the per-call split is an estimate
   weighted by each call's own total. Codex compaction summaries are encrypted in the rollout.
 - **Large sessions** load fully into the browser. A 60 MB rollout takes a few seconds.
+- **The search index is big.** It is the one thing the server writes: a single
+  `search.sqlite` under the cache directory. A trigram index is roughly three times the
+  text it covers, and the text itself is a fraction of the transcripts. On a 730 MB corpus
+  (193 files across the four harnesses) the first scan indexed 149 files and 48k records in
+  about 10 s and left a **254 MB** database; a `-wal` sidecar adds up to ~80 MB while the
+  backfill runs, and is folded back in when it finishes. Delete the file to reclaim the
+  space, or set `HARNESS_TRAJECTORY_SEARCH=0`.
+- **Search granularity.** Queries shorter than three characters return nothing: the trigram
+  tokenizer cannot index them. Each record is indexed up to 16 KB, so a match past that
+  point in a very large tool output is not found. Compaction summaries, system reminders,
+  images, and base64 payloads are deliberately not indexed.
 
 ## Acknowledgements and license
 

@@ -996,3 +996,53 @@ describe('grok helpers', () => {
     expect(grokContextWindow(undefined)).toBe(GROK_DEFAULT_CONTEXT_WINDOW)
   })
 })
+
+describe('grok source lines', () => {
+  /**
+   * Feed a session the way the server replays one: the sidecar first, in no
+   * file and with no line index, then `updates.jsonl` numbered from zero.
+   */
+  function feedNumbered(lines: readonly string[], file: SessionFileRef = MAIN) {
+    const parser = createGrokParser()
+    const [first, ...rest] = lines
+    if (first !== undefined) parser.push(first, file, -1)
+    for (const [index, item] of rest.entries()) parser.push(item, file, index)
+    return parser
+  }
+
+  it('leaves the sidecar out of the numbering', () => {
+    const lines = twoStepFixture()
+    const parser = feedNumbered(lines)
+    const snapshot = parser.snapshot()
+    // Line 0 of the file is the prompt, which is the SECOND line replayed.
+    const target = snapshot.sourceLines?.targetAt(0, MAIN.id)
+    expect(snapshot.eventNodes.find(node => target?.kind === 'seq' && node.seq === target.seq)?.kind).toBe('user')
+    // The sidecar carries the system prompt and claims no line of its own.
+    expect(snapshot.systemPrompts?.[0]?.text).toBe('You are Grok Build.')
+    expect(snapshot.sourceLines?.targetAt(-1, MAIN.id)).toBeUndefined()
+    expect(snapshot.sourceLines?.targetAt(lines.length, MAIN.id)).toBeUndefined()
+  })
+
+  it('binds a tool call, its identity update, and its completion to one record', () => {
+    const parser = feedNumbered(twoStepFixture())
+    const index = parser.snapshot().sourceLines
+    // Lines 3, 4 and 5 of the file: `tool_call`, the identity update, the result.
+    expect(index?.targetAt(3, MAIN.id)).toEqual({ kind: 'call', callId: 'call-1' })
+    expect(index?.targetAt(4, MAIN.id)).toEqual({ kind: 'call', callId: 'call-1' })
+    expect(index?.targetAt(5, MAIN.id)).toEqual({ kind: 'call', callId: 'call-1' })
+  })
+
+  it('binds a thought chunk to the assistant record it streamed into', () => {
+    const parser = feedNumbered(twoStepFixture())
+    const snapshot = parser.snapshot()
+    const target = snapshot.sourceLines?.targetAt(1, MAIN.id)
+    const node = snapshot.eventNodes.find(item => target?.kind === 'seq' && item.seq === target.seq)
+    expect(node?.kind).toBe('assistant')
+    // The continuation chunk on the next line folds into the same record.
+    expect(snapshot.sourceLines?.targetAt(2, MAIN.id)).toEqual(target)
+  })
+
+  it('records nothing for a parser that is not told where its lines are', () => {
+    expect(feed(twoStepFixture()).snapshot().sourceLines?.targetAt(0, MAIN.id)).toBeUndefined()
+  })
+})

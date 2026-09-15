@@ -644,3 +644,105 @@ describe('claude adapter subagents', () => {
     expect(parser.subagents()).toEqual([])
   })
 })
+
+describe('claude source lines', () => {
+  /** Feed a transcript the way the server's replay numbers it: 0-based, no gaps. */
+  function feedNumbered(parser: SessionParser, records: readonly unknown[], file: SessionFileRef = MAIN): void {
+    for (const [index, record] of records.entries()) {
+      parser.push(typeof record === 'string' ? record : JSON.stringify(record), file, index)
+    }
+  }
+
+  const RECORDS: readonly unknown[] = [
+    user('Fix the build', 0),
+    assistantLine('req-1', { type: 'thinking', thinking: 'Looking at it' }, 1_000),
+    assistantLine('req-1', { type: 'text', text: 'Running the build.' }, 2_000),
+    assistantLine('req-1', toolUse('call-1', 'Bash', { command: 'make' }), 3_000, { stop: 'tool_use' }),
+    toolResult('call-1', 'ok', 4_000),
+    assistantLine('req-2', { type: 'text', text: 'Done.' }, 5_000, { stop: 'end_turn' }),
+  ]
+
+  it('binds an assistant step to the line that opened it, not to the one that closed it', () => {
+    const parser = createClaudeParser()
+    feedNumbered(parser, RECORDS)
+    const snapshot = parser.snapshot()
+    // The step's node is only pushed when the following record closes it, but
+    // its seq was allocated on line 1 — that is where the record came from.
+    const target = snapshot.sourceLines?.targetAt(1, MAIN.id)
+    expect(target?.kind).toBe('seq')
+    const node = snapshot.eventNodes.find(item => target?.kind === 'seq' && item.seq === target.seq)
+    expect(node?.kind).toBe('assistant')
+    expect((node as AssistantMessageNode).step).toBe(1)
+    // A further record of the same step folds into it through the fallback.
+    expect(snapshot.sourceLines?.targetAt(2, MAIN.id)).toEqual(target)
+  })
+
+  it('binds the tool_use line and its tool_result line to the same tool record', () => {
+    const parser = createClaudeParser()
+    feedNumbered(parser, RECORDS)
+    const index = parser.snapshot().sourceLines
+    expect(index?.targetAt(3, MAIN.id)).toEqual({ kind: 'call', callId: 'call-1' })
+    expect(index?.targetAt(4, MAIN.id)).toEqual({ kind: 'call', callId: 'call-1' })
+  })
+
+  it('gives a record that folds into several nodes to the first of them', () => {
+    const parser = createClaudeParser()
+    feedNumbered(parser, [
+      user('Fix the build', 0),
+      assistantLine('req-1', toolUse('call-1', 'Bash', { command: 'make' }), 1_000),
+      assistantLine('req-1', toolUse('call-2', 'Bash', { command: 'test' }), 2_000, { stop: 'tool_use' }),
+      // One record carrying both results: two tool nodes from one line.
+      {
+        type: 'user',
+        uuid: 'r-both',
+        sessionId: 'session-1',
+        cwd: CWD,
+        timestamp: at(3_000),
+        message: {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'call-1', content: 'first' },
+            { type: 'tool_result', tool_use_id: 'call-2', content: 'second' },
+          ],
+        },
+      },
+    ])
+    expect(parser.snapshot().sourceLines?.targetAt(3, MAIN.id)).toEqual({ kind: 'call', callId: 'call-1' })
+  })
+
+  it('resolves the prompt line, an unread line, and an unnumbered fold', () => {
+    const parser = createClaudeParser()
+    feedNumbered(parser, RECORDS)
+    const snapshot = parser.snapshot()
+    const target = snapshot.sourceLines?.targetAt(0, MAIN.id)
+    expect(snapshot.eventNodes.find(node => target?.kind === 'seq' && node.seq === target.seq)?.kind).toBe('user')
+    expect(snapshot.sourceLines?.targetAt(RECORDS.length, MAIN.id)).toBeUndefined()
+
+    const unnumbered = createClaudeParser()
+    feed(unnumbered, RECORDS)
+    expect(unnumbered.snapshot().sourceLines?.targetAt(0, MAIN.id)).toBeUndefined()
+  })
+
+  it('numbers a subagent transcript on its own', () => {
+    const parser = createClaudeParser()
+    feedNumbered(parser, [
+      user('Delegate this', 0),
+      assistantLine('req-1', toolUse('call-agent', 'Task', { description: 'dig' }), 1_000, { stop: 'tool_use' }),
+    ])
+    feedNumbered(parser, [
+      { ...user('dig', 2_000), isSidechain: true, agentId: 'a1', promptId: 'p-1' },
+      {
+        ...assistantLine('req-c', toolUse('call-child', 'Bash', { command: 'ls' }), 2_500, { stop: 'tool_use' }),
+        isSidechain: true,
+        agentId: 'a1',
+      },
+      { ...toolResult('call-child', 'a.ts', 3_000), isSidechain: true, agentId: 'a1' },
+    ], CHILD)
+    const index = parser.snapshot().sourceLines
+    // A child's assistant records nest into the parent's call and push no node
+    // of their own, so the child's line 1 belongs to the call it emitted.
+    expect(index?.targetAt(1, CHILD.id)).toEqual({ kind: 'call', callId: 'call-child' })
+    // Line 1 of the MAIN file is a record of its own: the step it opened.
+    expect(index?.targetAt(1, MAIN.id)?.kind).toBe('seq')
+  })
+})

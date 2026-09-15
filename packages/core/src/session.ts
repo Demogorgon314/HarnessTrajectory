@@ -116,8 +116,17 @@ export interface ImageStore {
  */
 export interface SessionParser {
   readonly kind: HarnessKind
-  /** Feed one raw JSONL line from one of the session's files. */
-  push(line: string, file: SessionFileRef): void
+  /**
+   * Feed one raw JSONL line from one of the session's files.
+   *
+   * @param lineIndex - where the line sits in that file: the 0-based index
+   * among its NON-BLANK lines, the same numbering the server's replay
+   * (`SessionLiveEvent.startLine`) and its search index (`SearchHit.line`) use.
+   * Omitted, the fold records no line for the record — `snapshot().sourceLines`
+   * then cannot resolve it. Negative marks a synthetic line that is in no file
+   * (grok's sidecar), so it never consumes an index.
+   */
+  push(line: string, file: SessionFileRef, lineIndex?: number): void
   /** Current trajectory fold; a new object only when something changed. */
   snapshot(): TrajectorySnapshot
   meta(): ParsedSessionMeta
@@ -130,7 +139,14 @@ export interface SessionParser {
 
 /** Server-sent live update for one open session. */
 export type SessionLiveEvent =
-  | { type: 'lines'; file: SessionFileRef; lines: readonly string[] }
+  /**
+   * Consecutive lines of one file. `startLine` is the 0-based index of
+   * `lines[0]` among that file's non-blank lines, so a consumer numbers the
+   * chunk as `startLine + i`. A NEGATIVE `startLine` marks synthetic lines the
+   * server injects rather than reads (grok's sidecar): they are in no file and
+   * never share an event with real ones, so they consume no index.
+   */
+  | { type: 'lines'; file: SessionFileRef; lines: readonly string[]; startLine: number }
   /** A file joined the session or its facts changed; `reset` means it was truncated and must be refolded. */
   | { type: 'file'; file: SessionFileRef; reset?: boolean }
   | { type: 'meta'; summary: SessionSummary; children: readonly SessionChildSummary[] }
