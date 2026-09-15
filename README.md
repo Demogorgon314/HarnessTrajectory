@@ -43,6 +43,12 @@ stopped needing a flag. There is no native dependency to build.)
 npx @demogorgon314/harness-trajectory@latest
 ```
 
+Opens `http://127.0.0.1:5170` in the default browser. To serve without opening one:
+
+```sh
+npx @demogorgon314/harness-trajectory@latest --no-open
+```
+
 Full-text search is off by default. To index transcripts:
 
 ```sh
@@ -67,7 +73,7 @@ pnpm start      # http://127.0.0.1:5170
 ### Configuration
 
 Transcript roots are discovered from the harness home directories. Every setting is an
-environment variable; the server also accepts `--port`, `--host`, and `--static`.
+environment variable; the server also accepts `--port`, `--host`, `--static`, and `--no-open`.
 
 | Setting | Default | Notes |
 | --- | --- | --- |
@@ -80,6 +86,7 @@ environment variable; the server also accepts `--port`, `--host`, and `--static`
 | `HARNESS_TRAJECTORY_{CLAUDE,CODEX,KIMI,GROK}_ROOT` | derived | Point one harness at an arbitrary directory |
 | `HARNESS_TRAJECTORY_CACHE_DIR` | `$XDG_CACHE_HOME/harness-trajectory`, else `~/.cache/harness-trajectory` | Holds `search.sqlite`, the only file the server writes |
 | `HARNESS_TRAJECTORY_SEARCH` | off | `1`, `true`, or `on` enables indexing into `search.sqlite`; otherwise `/api/search` answers `{ "enabled": false }` |
+| `HARNESS_TRAJECTORY_NO_OPEN` | off | `1`, `true`, or `on` skips opening the default browser (same as `--no-open`). SSH sessions never open one. |
 
 Transcript roots are only ever read. The search index is a cache: delete
 `search.sqlite` and the next start rebuilds it.

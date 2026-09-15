@@ -9,6 +9,7 @@ import { createApp } from './app.ts'
 import { searchDbPath, searchEnabled } from './cache.ts'
 import { SessionIndex } from './index.ts'
 import { defaultRoots } from './roots.ts'
+import { browserUrl, openBrowser, shouldOpenBrowser } from './open-browser.ts'
 import { createSearchService, type SearchService } from './search/index.ts'
 
 function argValue(flag: string): string | undefined {
@@ -30,7 +31,7 @@ function findStaticDir(): string | undefined {
 
 async function main(): Promise<void> {
   if (process.argv.includes('--help') || process.argv.includes('-h')) {
-    console.log(`harness-trajectory [--port N] [--host H] [--static DIR]
+    console.log(`harness-trajectory [--port N] [--host H] [--static DIR] [--no-open]
 
 Scans Claude Code (~/.claude/projects), Codex (~/.codex/sessions), Kimi Code
 (~/.kimi-code/sessions) and Grok Build (~/.grok/sessions) transcripts on this machine
@@ -38,6 +39,9 @@ and serves the trajectory viewer. Harness home overrides (CLAUDE_CONFIG_DIR /
 CODEX_HOME / KIMI_CODE_HOME / GROK_HOME) are honoured; override a root directly with
 HARNESS_TRAJECTORY_CLAUDE_ROOT / HARNESS_TRAJECTORY_CODEX_ROOT /
 HARNESS_TRAJECTORY_KIMI_ROOT / HARNESS_TRAJECTORY_GROK_ROOT.
+
+A local launch opens the UI in the default browser. Pass --no-open (or set
+HARNESS_TRAJECTORY_NO_OPEN=1) to skip. An SSH session never opens a browser.
 
 Full-text search is off by default. Set HARNESS_TRAJECTORY_SEARCH=1 to index
 transcripts into one SQLite file under HARNESS_TRAJECTORY_CACHE_DIR (default
@@ -66,11 +70,20 @@ Harness roots are never written to.`)
   })
   const staticDir = findStaticDir()
   const app = createApp({ index, staticDir, search })
+  const open = shouldOpenBrowser()
   serve({ fetch: app.fetch, port, hostname }, (info) => {
-    console.log(`[harness-trajectory] listening on http://${info.address}:${info.port}`)
+    const url = browserUrl(info.address, info.port)
+    console.log(`[harness-trajectory] listening on ${url}`)
     if (staticDir === undefined) {
       console.log('[harness-trajectory] no built web UI found; run `pnpm --filter @harness-trajectory/web dev` for the dev server')
+      return
     }
+    if (!open) return
+    console.log('[harness-trajectory] opening the default browser; pass --no-open to disable')
+    void openBrowser(url).catch((error: unknown) => {
+      const reason = error instanceof Error ? error.message : String(error)
+      console.error(`[harness-trajectory] could not open the default browser (${reason}); open ${url} yourself`)
+    })
   })
   for (const root of roots) console.log(`  ${root.kind}: ${root.dir}`)
   if (search === undefined) {
