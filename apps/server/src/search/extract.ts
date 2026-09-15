@@ -40,7 +40,8 @@
  * The rules that are the same everywhere: the human/injected split reuses the
  * classifier the meta scanner and the adapters use, image blocks are skipped,
  * embedded base64 runs are stripped (the surrounding prose is kept), and each
- * document is capped at 16 KB so one `Write` of a large file cannot dominate
+ * document is capped — 16 KB for prose, 4 KB for tool output, which is the
+ * bulk of every transcript — so one `Write` of a large file cannot dominate
  * the index.
  *
  * Never throws: an unknown or malformed record yields no documents.
@@ -62,7 +63,15 @@ export interface SearchDocDraft {
 /** Longest text stored per document, in UTF-16 code units. */
 export const MAX_DOC_CHARS = 16 * 1024
 
-/** Control characters (`snippet()` markers among them) never reach the index. */
+/**
+ * Longest text stored per tool-*output* document. Tool output is the bulk of
+ * every transcript (~95% of indexed text on the reference corpus), so it gets
+ * a tighter cap than prose: the head still answers "which session ran this"
+ * queries, and the rest is re-readable in the session itself.
+ */
+export const MAX_TOOL_OUTPUT_CHARS = 4 * 1024
+
+/** Control characters never reach the index. */
 const CONTROL = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g
 
 /**
@@ -89,12 +98,12 @@ class DocBuilder {
 
   constructor(private readonly timeMs: number | null) {}
 
-  add(role: SearchRole, text: string): void {
+  add(role: SearchRole, text: string, maxChars: number = MAX_DOC_CHARS): void {
     const cleaned = scrub(text)
     if (cleaned === '') return
     this.drafts.push({
       role,
-      text: cleaned.length > MAX_DOC_CHARS ? cleaned.slice(0, MAX_DOC_CHARS) : cleaned,
+      text: cleaned.length > maxChars ? cleaned.slice(0, maxChars) : cleaned,
       ...(this.timeMs === null ? {} : { timeMs: this.timeMs }),
     })
   }
@@ -222,7 +231,7 @@ function claudeDocs(line: string): SearchDocDraft[] {
       isRecord(block) && asString(block['type']) === 'tool_result')
     if (results.length > 0) {
       // A tool_result-only turn is the harness replying to itself, not a prompt.
-      for (const result of results) builder.add('tool', blockText(result['content']))
+      for (const result of results) builder.add('tool', blockText(result['content']), MAX_TOOL_OUTPUT_CHARS)
       return builder.docs
     }
     const text = typeof content === 'string' ? content : blockText(content)
@@ -318,7 +327,7 @@ function codexDocs(line: string): SearchDocDraft[] {
     case 'function_call_output':
     case 'custom_tool_call_output':
     case 'local_shell_call_output':
-      builder.add('tool', codexOutputText(payload['output']))
+      builder.add('tool', codexOutputText(payload['output']), MAX_TOOL_OUTPUT_CHARS)
       break
     default:
       // `compaction` (an encrypted replay), `web_search_call`, and future items.
@@ -373,7 +382,7 @@ function kimiDocs(line: string): SearchDocDraft[] {
       const result = isRecord(event['result']) ? event['result'] : {}
       const note = asString(result['note']) ?? ''
       const output = asString(result['output']) ?? ''
-      builder.add('tool', note === '' ? output : `${output}\n${note}`)
+      builder.add('tool', note === '' ? output : `${output}\n${note}`, MAX_TOOL_OUTPUT_CHARS)
       break
     }
     default:
@@ -449,7 +458,7 @@ function grokDocs(line: string): SearchDocDraft[] {
     case 'tool_call_update': {
       const status = asString(update['status'])
       if (status === undefined || !GROK_TERMINAL_STATUS.has(status)) break
-      builder.add('tool', grokResultText(update))
+      builder.add('tool', grokResultText(update), MAX_TOOL_OUTPUT_CHARS)
       break
     }
     case 'plan':

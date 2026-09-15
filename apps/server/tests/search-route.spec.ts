@@ -105,7 +105,8 @@ describe('GET /api/search', () => {
     expect(claude?.updatedAt).toBeTypeOf('number')
     const hit = claude?.hits[0]
     expect(hit?.snippet.slice(hit.matches[0]?.start, hit.matches[0]?.end).toLowerCase()).toBe('port the')
-    expect(hit?.score).toBeLessThan(0)
+    // The score is the occurrence count now that the index stores no positions.
+    expect(hit?.score).toBe(1)
   })
 
   it('honours the kind filter and the limit, and clamps a hostile one', async () => {

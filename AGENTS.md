@@ -29,9 +29,11 @@ packages/context  dsh-context port (Apache-2.0; keep LICENSE + NOTICE):
                   src/fold = vendored fold (do not change its event vocabulary),
                   src/synth/<kind>.ts = transcript → fold events, src/client = dashboard.
 apps/server       Hono API: scans harness roots, classifies files, replays + tails JSONL over SSE.
-                  src/search = SQLite FTS5 (node:sqlite, trigram) full-text index:
-                  store.ts schema, extract.ts record → docs, indexer.ts batched writes,
-                  query.ts the /api/search read. Contract types live in core/src/search.ts.
+                  src/search = SQLite FTS5 (node:sqlite, trigram, detail=none) full-text index:
+                  store.ts schema, extract.ts record → docs (tool outputs capped at 4 KB),
+                  indexer.ts batched writes, query.ts the /api/search read (trigram-AND
+                  cover + JS verify/snippet/rank — FTS phrase, snippet and bm25 are unused).
+                  Contract types live in core/src/search.ts.
 apps/web          Vite/React shell: sidebar, routes, harness registry (src/harnesses.tsx).
 ```
 

@@ -141,9 +141,9 @@ Tests use hand-written synthetic records only. Never commit real transcript cont
   server writes one `search.sqlite` under the cache directory (first build runs in the
   background). Delete the file to reclaim the space.
 - **Search granularity.** Queries shorter than three characters return nothing: the trigram
-  tokenizer cannot index them. Each record is indexed up to 16 KB, so a match past that
-  point in a very large tool output is not found. Compaction summaries, system reminders,
-  images, and base64 payloads are deliberately not indexed.
+  tokenizer cannot index them. Tool output is indexed up to 4 KB and other records up to
+  16 KB, so a match past that point in a very large record is not found. Compaction
+  summaries, system reminders, images, and base64 payloads are deliberately not indexed.
 
 ## Acknowledgements and license
 

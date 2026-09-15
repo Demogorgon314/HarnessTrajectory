@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { GROK_SIDECAR_METHOD } from '@harness-trajectory/core'
-import { MAX_DOC_CHARS, extractSearchDocs, type SearchDocDraft } from '../src/search/extract.ts'
+import { MAX_DOC_CHARS, MAX_TOOL_OUTPUT_CHARS, extractSearchDocs, type SearchDocDraft } from '../src/search/extract.ts'
 
 const T0 = Date.parse('2026-09-14T10:00:00.000Z')
 const iso = (offsetMs: number) => new Date(T0 + offsetMs).toISOString()
@@ -322,6 +322,42 @@ describe('extractSearchDocs — shared rules', () => {
     })
     expect(doc?.text).toHaveLength(MAX_DOC_CHARS)
     expect(doc?.text).toBe(long.slice(0, MAX_DOC_CHARS))
+  })
+
+  it('caps a tool output at 4 KB but a tool call at 16 KB', () => {
+    // Spaced prose: a solid base64-alphabet run would be scrubbed as a payload.
+    const long = 'chunk of output text. '.repeat(4_000)
+    // The output side of a result gets the tighter cap.
+    const [output] = docs('claude', {
+      type: 'user', timestamp: iso(0),
+      message: { role: 'user', content: [{ tool_use_id: 't1', type: 'tool_result', content: long }] },
+    })
+    expect(output?.text).toHaveLength(MAX_TOOL_OUTPUT_CHARS)
+    expect(output?.text).toBe(long.slice(0, MAX_TOOL_OUTPUT_CHARS))
+    // The call side keeps the prose cap: a Write's whole `content` argument is
+    // the call, not an output.
+    const [call] = docs('claude', {
+      type: 'assistant', timestamp: iso(1),
+      message: {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'toolu_1', name: 'Write', input: { file_path: '/f.ts', content: long } }],
+      },
+    })
+    expect(call?.text).toHaveLength(MAX_DOC_CHARS)
+  })
+
+  it('caps tool outputs of the other harnesses too', () => {
+    const long = 'chunk of output text. '.repeat(4_000)
+    const [codex] = docs('codex', {
+      timestamp: iso(0), type: 'response_item',
+      payload: { type: 'function_call_output', call_id: 'c1', output: long },
+    })
+    expect(codex?.text).toHaveLength(MAX_TOOL_OUTPUT_CHARS)
+    const [kimi] = docs('kimi', {
+      type: 'context.append_loop_event', time: T0, agentId: 'a1',
+      event: { type: 'tool.result', toolCallId: 'c1', result: { output: long } },
+    })
+    expect(kimi?.text).toHaveLength(MAX_TOOL_OUTPUT_CHARS)
   })
 
   it('strips embedded base64 payloads and keeps the surrounding prose', () => {

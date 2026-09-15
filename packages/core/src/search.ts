@@ -31,7 +31,7 @@ export interface SearchHit {
   timeMs?: number
   snippet: string
   matches: SearchMatchRange[]
-  /** bm25 rank: lower is better. The UI only sorts by it. */
+  /** Occurrences of the query in the record: higher is better. The server sorts by it. */
   score: number
 }
 

@@ -3,12 +3,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { SEARCH_GROUP_HIT_LIMIT } from '@harness-trajectory/core'
-import { search, splitMarkers, toPhraseQuery } from '../src/search/query.ts'
+import { buildSnippet, search, toTrigramQuery } from '../src/search/query.ts'
 import { SEARCH_SCHEMA_VERSION, SearchStore, type SearchDoc, type SearchFileKey } from '../src/search/store.ts'
-
-/** The markers `snippet()` wraps a match in, before `splitMarkers` strips them. */
-const OPEN = '\u0002'
-const CLOSE = '\u0003'
 
 const stores: SearchStore[] = []
 const dirs: string[] = []
@@ -108,9 +104,21 @@ describe('search', () => {
     expect(search(store, { q: 'not in there' }).totalHits).toBe(0)
     const range = hit?.matches[0]
     expect(range).toBeDefined()
-    expect(hit?.snippet.slice(range?.start, range?.end).toLowerCase()).toContain('run --project')
-    // The markers themselves never reach the caller.
-    expect(hit?.snippet).not.toContain(OPEN)
+    expect(hit?.snippet.slice(range?.start, range?.end).toLowerCase()).toBe('run --project')
+  })
+
+  it('rejects documents where the trigrams merely coexist, exactly like a phrase query', () => {
+    const store = open()
+    add(store, key(), [
+      // Every trigram of `packages/co`, scattered: detail=none sends this row
+      // back as a candidate and the verification must drop it.
+      { line: 0, role: 'tool', text: 'pac ack cka kag age ges es/ s/c /co' },
+      { line: 1, role: 'tool', text: 'cat packages/core/src alive' },
+    ])
+    const response = search(store, { q: 'packages/co' })
+    expect(response.totalHits).toBe(1)
+    expect(response.groups[0]?.hits[0]).toMatchObject({ line: 1 })
+    expect(response.groups[0]?.hitCount).toBe(1)
   })
 
   it('answers nothing below the trigram minimum rather than scanning', () => {
@@ -121,17 +129,33 @@ describe('search', () => {
     expect(search(store, { q: 'ab ' })).toMatchObject({ groups: [], totalHits: 0 })
   })
 
-  it('treats the query as a literal phrase, so FTS5 operators are not operators', () => {
+  it('treats the query as a literal string, so FTS5 operators are not operators', () => {
     const store = open()
     add(store, key(), [
       { line: 0, role: 'human', text: 'search for "quoted" AND NOT plain' },
       { line: 1, role: 'human', text: 'something entirely else' },
     ])
-    expect(toPhraseQuery('say "hi"')).toBe('"say ""hi"""')
+    // The trigram cover slides over spaces and punctuation, folds ASCII case,
+    // dedupes, and doubles embedded quotes.
+    expect(toTrigramQuery('abcde')).toBe('"abc" AND "bcd" AND "cde"')
+    expect(toTrigramQuery('ABCABC')).toBe('"abc" AND "bca" AND "cab"')
+    expect(toTrigramQuery('a"bcd')).toBe('"a""b" AND """bc" AND "bcd"')
     expect(search(store, { q: '"quoted" AND NOT' }).totalHits).toBe(1)
     expect(search(store, { q: 'AND NOT plain' }).totalHits).toBe(1)
     // A syntactically hostile query returns nothing instead of throwing.
     expect(search(store, { q: 'a" OR b NEAR(' }).totalHits).toBe(0)
+  })
+
+  it('ranks records with more occurrences first, bm25-style', () => {
+    const store = open()
+    add(store, key(), [
+      { line: 0, role: 'assistant', text: 'needle' },
+      { line: 1, role: 'assistant', text: 'needle needle needle' },
+      { line: 2, role: 'assistant', text: 'needle needle' },
+    ])
+    const hits = search(store, { q: 'needle' }).groups[0]?.hits
+    expect(hits?.map(hit => hit.line)).toEqual([1, 2, 0])
+    expect(hits?.map(hit => hit.score)).toEqual([3, 2, 1])
   })
 
   it('groups hits by session, caps them per group, and keeps the total count', () => {
@@ -194,6 +218,17 @@ describe('search', () => {
     expect(limited.groups[0]?.hits).toHaveLength(3)
   })
 
+  it('reports truncation and a lower-bound count when the candidate cap cuts in', () => {
+    const store = open()
+    add(store, key(), Array.from({ length: 5 }, (_unused, index) => ({
+      line: index, role: 'assistant' as const, text: `needle in record number ${index}`,
+    })))
+    const response = search(store, { q: 'needle', candidateLimit: 3 })
+    expect(response).toMatchObject({ totalHits: 3, truncated: true })
+    // Only the scanned candidates could be verified, so the badge is a floor.
+    expect(response.groups[0]?.hitCount).toBe(3)
+  })
+
   it('reports whether the startup backfill is still running', () => {
     const store = open()
     expect(search(store, { q: 'anything', indexing: { pendingFiles: 3, ready: false, filesDone: 2, filesTotal: 9 } }).indexing)
@@ -204,14 +239,36 @@ describe('search', () => {
   })
 })
 
-describe('splitMarkers', () => {
-  it('turns the snippet markers into character ranges', () => {
-    expect(splitMarkers(`…the ${OPEN}needle${CLOSE} in a ${OPEN}needle${CLOSE}stack…`)).toEqual({
-      snippet: '…the needle in a needlestack…',
-      matches: [{ start: 5, end: 11 }, { start: 17, end: 23 }],
+describe('buildSnippet', () => {
+  it('marks every occurrence when the document fits the window', () => {
+    expect(buildSnippet('the needle in a needlestack', 'needle')).toEqual({
+      snippet: 'the needle in a needlestack',
+      matches: [{ start: 4, end: 10 }, { start: 16, end: 22 }],
     })
-    expect(splitMarkers('no markers at all')).toEqual({ snippet: 'no markers at all', matches: [] })
-    // A marker the snippet window cut short still yields a usable range.
-    expect(splitMarkers(`${OPEN}unclosed`)).toEqual({ snippet: 'unclosed', matches: [{ start: 0, end: 8 }] })
+  })
+
+  it('centres a window on the first occurrence and ellipsizes both ends', () => {
+    const text = `${'x'.repeat(100)}needle${'y'.repeat(100)}`
+    const { snippet, matches } = buildSnippet(text, 'needle')
+    expect(snippet.startsWith('…')).toBe(true)
+    expect(snippet.endsWith('…')).toBe(true)
+    expect(matches).toHaveLength(1)
+    expect(snippet.slice(matches[0]?.start, matches[0]?.end)).toBe('needle')
+  })
+
+  it('matches case-insensitively while keeping the document case', () => {
+    const { snippet, matches } = buildSnippet('Some NEEDLE here', 'needle')
+    expect(snippet.slice(matches[0]?.start, matches[0]?.end)).toBe('NEEDLE')
+  })
+
+  it('widens the window when the needle itself is longer than the window', () => {
+    const needle = 'n'.repeat(70)
+    const { snippet, matches } = buildSnippet(`xx${needle}yy`, needle)
+    expect(snippet).toBe(`…${needle}…`)
+    expect(matches).toEqual([{ start: 1, end: 71 }])
+  })
+
+  it('falls back to the document head when the needle is absent', () => {
+    expect(buildSnippet('nothing here', 'zzz')).toEqual({ snippet: 'nothing here', matches: [] })
   })
 })

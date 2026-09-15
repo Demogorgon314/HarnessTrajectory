@@ -14,7 +14,10 @@ import { SearchStore } from './store.ts'
 
 export { extractSearchDocs, MAX_DOC_CHARS, type SearchDocDraft } from './extract.ts'
 export { SearchIndexer, type SearchIndexerOptions } from './indexer.ts'
-export { search, splitMarkers, toPhraseQuery, type SearchOptions, type SearchSessionFacts } from './query.ts'
+export {
+  buildSnippet, search, SEARCH_CANDIDATE_LIMIT, toTrigramQuery,
+  type SearchOptions, type SearchSessionFacts,
+} from './query.ts'
 export {
   SearchStore, SEARCH_SCHEMA_VERSION,
   type SearchDoc, type SearchFileKey, type SearchFileState, type SearchStoreOptions,

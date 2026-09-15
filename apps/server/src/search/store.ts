@@ -9,9 +9,18 @@
  * or `--project serv` would find nothing. Trigram is case-insensitive for ASCII
  * by default (`case_sensitive 0`) and cannot match fewer than three characters.
  *
- * `docs_fts` is a plain (not external-content) FTS5 table so `snippet()` and
- * `highlight()` keep working; `docs` beside it holds the addressing columns and
- * shares its rowid.
+ * The table is created with `detail=none`: the index stores only which
+ * documents contain each trigram, not where. Positions are what made the
+ * trigram index cost 2× the document text on disk (60% of a 5.6 GB database);
+ * without them the inverted index shrinks by ~80%. The price is paid in
+ * `query.ts`: FTS5 refuses phrase queries, `snippet()` and `bm25` on such a
+ * table, so the read side slices the query into trigrams itself, ANDs them
+ * (a superset of the real matches), and then verifies the substring, ranks,
+ * and builds snippets against the stored text in JavaScript.
+ *
+ * `docs_fts` is a plain (not external-content or contentless) FTS5 table, so
+ * the document text itself stays available for that verification; `docs`
+ * beside it holds the addressing columns and shares its rowid.
  */
 
 import { mkdirSync } from 'node:fs'
@@ -20,7 +29,7 @@ import { DatabaseSync } from 'node:sqlite'
 import type { HarnessKind, SearchRole } from '@harness-trajectory/core'
 
 /** Bumped whenever the schema below changes; a mismatch drops and rebuilds. */
-export const SEARCH_SCHEMA_VERSION = 1
+export const SEARCH_SCHEMA_VERSION = 2
 
 /** Identity of one indexed transcript, as the SSE route addresses it. */
 export interface SearchFileKey {
@@ -77,7 +86,7 @@ create table docs (
 );
 create index docs_by_path on docs(path);
 create index docs_by_session on docs(kind, session_id);
-create virtual table docs_fts using fts5(text, tokenize="trigram");
+create virtual table docs_fts using fts5(text, tokenize="trigram", detail=none);
 `
 
 function asInt(value: unknown, fallback = 0): number {
