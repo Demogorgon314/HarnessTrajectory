@@ -1,6 +1,7 @@
 /**
  * Where the server keeps its own derived state. Harness roots stay read-only:
- * the only file this process ever writes is the search index, and it lives here.
+ * the only files this process ever writes are the search index, the listing
+ * cache, and settings — all of them live here.
  */
 
 import { homedir } from 'node:os'
@@ -21,6 +22,11 @@ export function cacheDir(env: NodeJS.ProcessEnv = process.env): string {
 /** The SQLite file backing full-text search. */
 export function searchDbPath(env: NodeJS.ProcessEnv = process.env): string {
   return join(cacheDir(env), 'search.sqlite')
+}
+
+/** The SQLite file backing the listing cache (consume cursors + meta state). */
+export function listingDbPath(env: NodeJS.ProcessEnv = process.env): string {
+  return join(cacheDir(env), 'listing.sqlite')
 }
 
 /** Env override that forces indexing on for one launch (`1`/`true`/`on`); the Settings toggle decides otherwise. */

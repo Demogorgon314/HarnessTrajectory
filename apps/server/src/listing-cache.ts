@@ -1,0 +1,169 @@
+/**
+ * Listing cache: the per-file consume cursor and listing metadata, persisted
+ * so a restart does not re-read transcripts that did not change.
+ *
+ * `SessionIndex` keeps the session listing in memory only, so every process
+ * start used to replay every transcript from byte 0 — tens of gigabytes of
+ * JSONL on a large corpus — even though the search index already resumes
+ * per line. This cache stores, per transcript, how far it was consumed
+ * (`consumed_bytes`, `rest`, `lines`) plus the meta scanner's serialized
+ * state. A file whose `(size, mtime)` still matches is not read at all; one
+ * that only grew resumes from the persisted cursor, exactly like the live
+ * tail does. Anything else — a shrink, an older mtime, a scanner-logic
+ * version bump, a changed sidecar fingerprint — falls back to a full scan.
+ *
+ * Grok's `summary.json` is a scanner input that lives outside the transcript,
+ * so its mtime is part of the fingerprint (`sidecar_mtime_ms`); other
+ * sidecars are re-read at registration regardless and need none.
+ *
+ * The index is a cache, same policy as the search store: bump
+ * {@link LISTING_CACHE_VERSION} on a format change instead of migrating, and
+ * `META_SCANNER_VERSION` (meta.ts) on a scanner-logic change — stale rows then
+ * simply miss and the files are re-read. One SQLite file under the cache
+ * directory, never inside a harness root.
+ */
+
+import { mkdirSync } from 'node:fs'
+import { dirname } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
+
+/** Bumped whenever the schema below changes; a mismatch drops and rebuilds. */
+export const LISTING_CACHE_VERSION = 1
+
+/** What the index persists for one consumed transcript. */
+export interface ListingRow {
+  size: number
+  mtimeMs: number
+  /** Byte offset up to which lines were consumed (same as `FileEntry.offset`). */
+  consumedBytes: number
+  /** Unterminated trailing text carried between reads. */
+  rest: string
+  /** Non-blank records consumed; also the next record's search line index. */
+  lines: number
+  /** `META_SCANNER_VERSION` the serialized state was written under. */
+  scannerVersion: number
+  /** Grok: `summary.json`'s mtime, a scanner input outside the transcript. */
+  sidecarMtimeMs: number | null
+  /** `serializeMeta()` output; null when the file carried no scanner. */
+  state: string | null
+}
+
+const SCHEMA = `
+create table files (
+  path            text primary key,
+  size            integer not null,
+  mtime_ms        real not null,
+  consumed_bytes  integer not null,
+  rest            text not null,
+  lines           integer not null,
+  scanner_version integer not null,
+  sidecar_mtime   real,
+  state           text
+);
+`
+
+function asInt(value: unknown, fallback = 0): number {
+  if (typeof value === 'number') return value
+  if (typeof value === 'bigint') return Number(value)
+  return fallback
+}
+
+export class ListingCache {
+  readonly db: DatabaseSync
+
+  constructor(options: { path: string }) {
+    if (options.path !== ':memory:') mkdirSync(dirname(options.path), { recursive: true })
+    this.db = new DatabaseSync(options.path)
+    this.db.exec('pragma journal_mode = wal')
+    this.db.exec('pragma synchronous = normal')
+    this.ensureSchema()
+  }
+
+  private ensureSchema(): void {
+    const row = this.db.prepare('pragma user_version').get()
+    const version = asInt(row?.['user_version'], 0)
+    if (version === LISTING_CACHE_VERSION) {
+      const table = this.db.prepare(
+        `select name from sqlite_master where type = 'table' and name = 'files'`,
+      ).get()
+      if (table !== undefined) return
+    }
+    this.db.exec('drop table if exists files')
+    this.db.exec(SCHEMA)
+    this.db.exec(`pragma user_version = ${LISTING_CACHE_VERSION}`)
+  }
+
+  load(path: string): ListingRow | undefined {
+    const row = this.db.prepare('select * from files where path = ?').get(path)
+    if (row === undefined) return undefined
+    const sidecar = row['sidecar_mtime']
+    const state = row['state']
+    return {
+      size: asInt(row['size']),
+      mtimeMs: asInt(row['mtime_ms']),
+      consumedBytes: asInt(row['consumed_bytes']),
+      rest: typeof row['rest'] === 'string' ? row['rest'] : '',
+      lines: asInt(row['lines']),
+      scannerVersion: asInt(row['scanner_version'], -1),
+      sidecarMtimeMs: typeof sidecar === 'number' || typeof sidecar === 'bigint' ? Number(sidecar) : null,
+      state: typeof state === 'string' ? state : null,
+    }
+  }
+
+  /** Upsert one file's snapshot; a cache that cannot write must not stop the server. */
+  save(path: string, row: ListingRow): void {
+    try {
+      this.db.prepare(`
+        insert into files (path, size, mtime_ms, consumed_bytes, rest, lines, scanner_version, sidecar_mtime, state)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        on conflict(path) do update set
+          size = excluded.size,
+          mtime_ms = excluded.mtime_ms,
+          consumed_bytes = excluded.consumed_bytes,
+          rest = excluded.rest,
+          lines = excluded.lines,
+          scanner_version = excluded.scanner_version,
+          sidecar_mtime = excluded.sidecar_mtime,
+          state = excluded.state
+      `).run(
+        path, row.size, row.mtimeMs, row.consumedBytes, row.rest, row.lines,
+        row.scannerVersion, row.sidecarMtimeMs, row.state,
+      )
+    } catch {
+      // A locked or full database only costs the next start a re-read.
+    }
+  }
+
+  /** Forget files that no longer exist, run once at the end of the startup sweep. */
+  prune(live: ReadonlySet<string>): void {
+    const gone = this.db.prepare('select path from files').all()
+      .map(row => String(row['path']))
+      .filter(path => !live.has(path))
+    if (gone.length === 0) return
+    try {
+      this.db.exec('begin')
+      const drop = this.db.prepare('delete from files where path = ?')
+      for (const path of gone) drop.run(path)
+      this.db.exec('commit')
+    } catch {
+      try {
+        this.db.exec('rollback')
+      } catch {
+        // Already rolled back.
+      }
+    }
+  }
+
+  close(): void {
+    try {
+      this.db.exec('pragma wal_checkpoint(truncate)')
+    } catch {
+      // A concurrent reader blocks the truncate; the next one succeeds.
+    }
+    try {
+      this.db.close()
+    } catch {
+      // Already closed.
+    }
+  }
+}

@@ -14,8 +14,10 @@ import {
   type SessionLiveEvent, type SessionSummary,
 } from '@harness-trajectory/core'
 import {
-  agentMetaEqual, createMetaScanner, listingScannerFor, mergeChildAgent, readHead, type MetaScanner,
+  agentMetaEqual, createMetaScanner, hydrateMeta, listingScannerFor, mergeChildAgent, META_SCANNER_VERSION,
+  readHead, serializeMeta, type MetaScanner,
 } from './meta.ts'
+import type { ListingCache } from './listing-cache.ts'
 import type { HarnessRoot } from './roots.ts'
 import type { SearchIndexer } from './search/indexer.ts'
 import type { SearchFileKey } from './search/store.ts'
@@ -102,6 +104,11 @@ export interface SessionIndexOptions {
    * Omitted (tests, or search left at its off-by-default) means nothing is indexed.
    */
   search?: SearchIndexer
+  /**
+   * Persisted consume cursors + listing metadata; a restart then re-reads
+   * only transcripts that changed (listing-cache.ts). Omitted in tests.
+   */
+  listing?: ListingCache
   /** Files registered concurrently during the startup sweep; 1 for a strict order. */
   backfillConcurrency?: number
 }
@@ -192,6 +199,10 @@ export class SessionIndex extends EventEmitter {
   private readonly backfillConcurrency: number
   private readonly now: () => number
   private readonly search: SearchIndexer | undefined
+  private readonly listing: ListingCache | undefined
+  /** Startup-sweep counters for the launch log. */
+  private sweepRead = 0
+  private sweepCached = 0
   private stopped = false
 
   constructor(options: SessionIndexOptions) {
@@ -201,10 +212,13 @@ export class SessionIndex extends EventEmitter {
     this.backfillConcurrency = Math.max(1, options.backfillConcurrency ?? BACKFILL_CONCURRENCY)
     this.now = options.now ?? Date.now
     this.search = options.search
+    this.listing = options.listing
   }
 
   async start(): Promise<void> {
     this.stopped = false
+    this.sweepRead = 0
+    this.sweepCached = 0
     // Walk every root first so the search UI can show N/M from the first file,
     // instead of a total that jumps each time a harness directory is entered.
     const planned: { root: HarnessRoot; path: string; mtimeMs: number }[] = []
@@ -255,6 +269,10 @@ export class SessionIndex extends EventEmitter {
     this.search?.finishBackfill(
       [...this.files.values()].flatMap(entry => (entry.searchSkipped ? [] : [entry.path])),
     )
+    // Rows for transcripts that disappeared between runs are dropped here;
+    // unlike the search index the listing cache also covers retention-skipped
+    // files, so its live set is every registered path.
+    this.listing?.prune(new Set(this.files.keys()))
     if (this.watchEnabled) {
       this.poll = setInterval(() => { void this.pollSubscribed() }, POLL_INTERVAL_MS)
       this.poll.unref()
@@ -275,6 +293,11 @@ export class SessionIndex extends EventEmitter {
   async refreshPath(path: string): Promise<void> {
     const root = this.rootFor(path)
     if (root !== undefined) await this.refresh(root, path)
+  }
+
+  /** Files the last startup sweep re-read vs served whole from the listing cache. */
+  sweepStats(): { read: number; cached: number } {
+    return { read: this.sweepRead, cached: this.sweepCached }
   }
 
   /** Sessions with a main transcript, newest activity first. */
@@ -471,8 +494,8 @@ export class SessionIndex extends EventEmitter {
     if (role === 'main') session.main = entry
     else session.children.set(id, entry)
     if (role === 'child' && !initial) this.emitTo(session, { type: 'file', file: ref })
-    // The meta scanner always replays from byte 0 (its state is in memory only);
-    // the search index answers with the first line it has not stored yet.
+    // The meta scanner replays from byte 0 unless the listing cache restores
+    // it; the search index answers with the first line it has not stored yet.
     // A transcript untouched for longer than the retention window stays
     // browsable but out of the index; the next start reconsiders it under its
     // then-current mtime and settings.
@@ -480,9 +503,29 @@ export class SessionIndex extends EventEmitter {
     entry.searchFrom = entry.searchSkipped
       ? 0
       : this.search?.beginFile(searchKeyOf(entry), { size: info.size, mtimeMs: info.mtimeMs }) ?? 0
-    await this.consumeInitial(entry, info.size, info.mtimeMs, initial)
+    // The listing cache only serves the startup sweep: a file registered live
+    // (a subagent transcript that just appeared) is always read, since its
+    // lines are forwarded to whoever is watching.
+    const restored = initial
+      ? this.restoreListing(entry, info, await this.sidecarMtime(entry))
+      : 'none'
+    if (restored === 'none') {
+      if (initial) this.sweepRead += 1
+      await this.consumeInitial(entry, info.size, info.mtimeMs, initial)
+    } else {
+      if (restored === 'tail') {
+        // Only the appended bytes are read, through the restored scanner.
+        if (initial) this.sweepRead += 1
+        await this.consume(entry, info.size, info.mtimeMs, initial)
+      } else {
+        if (initial) this.sweepCached += 1
+      }
+      // consumeInner's stamping never ran, so stamp children explicitly.
+      this.applyChildListing(session)
+    }
     await this.syncKimiTitle(entry)
     await this.syncGrokSummary(entry, true)
+    this.saveListing(entry)
     return entry
   }
 
@@ -701,6 +744,70 @@ export class SessionIndex extends EventEmitter {
       this.sessions.set(key, session)
     }
     return session
+  }
+
+  /**
+   * Resume a startup-sweep file from the listing cache. `full`: the transcript
+   * is byte-identical to the snapshot — not read at all. `tail`: it only grew —
+   * the appended bytes are read through the restored scanner, exactly like the
+   * live tail. `none`: anything else, and the file is scanned from byte 0.
+   */
+  private restoreListing(
+    entry: FileEntry,
+    info: { size: number; mtimeMs: number },
+    sidecarMtimeMs: number | null,
+  ): 'none' | 'full' | 'tail' {
+    const cache = this.listing
+    if (cache === undefined) return 'none'
+    const row = cache.load(entry.path)
+    if (row === undefined || row.scannerVersion !== META_SCANNER_VERSION) return 'none'
+    if (row.sidecarMtimeMs !== sidecarMtimeMs) return 'none'
+    // `unchanged` also requires the snapshot to have been fully consumed: a row
+    // that stopped mid-file must not skip the bytes past `consumedBytes`.
+    const unchanged =
+      row.consumedBytes === row.size && info.size === row.size && info.mtimeMs === row.mtimeMs
+    // `appended` covers both a grown transcript and a partially consumed one:
+    // resuming at `consumedBytes` reads the remainder through `rest`.
+    const appended =
+      info.size >= row.size && info.size > row.consumedBytes && info.mtimeMs >= row.mtimeMs
+    if (!unchanged && !appended) return 'none'
+    // A scanner exists now but none ran back then: it cannot own state for
+    // bytes it was never fed. The inverse is fine — a file that gained a
+    // sidecar since simply drops the serialized state.
+    if (row.state === null && entry.meta !== null) return 'none'
+    // The search index must already cover the persisted lines, or the gap
+    // below `searchFrom` would never reach it again.
+    if (!entry.searchSkipped && this.search !== undefined && entry.searchFrom < row.lines) return 'none'
+    if (row.state !== null && entry.meta !== null && !hydrateMeta(entry.meta, row.state)) return 'none'
+    entry.offset = row.consumedBytes
+    entry.rest = row.rest
+    entry.lines = row.lines
+    entry.size = info.size
+    return unchanged ? 'full' : 'tail'
+  }
+
+  /** Grok: `summary.json`'s mtime — the one scanner input outside the transcript. */
+  private async sidecarMtime(entry: FileEntry): Promise<number | null> {
+    if (entry.kind !== 'grok') return null
+    try {
+      return (await stat(join(dirname(entry.path), 'summary.json'))).mtimeMs
+    } catch {
+      return null
+    }
+  }
+
+  /** Persist the consume cursor and scanner state at a settle point. */
+  private saveListing(entry: FileEntry): void {
+    this.listing?.save(entry.path, {
+      size: entry.size,
+      mtimeMs: entry.mtimeMs,
+      consumedBytes: entry.offset,
+      rest: entry.rest,
+      lines: entry.lines,
+      scannerVersion: META_SCANNER_VERSION,
+      sidecarMtimeMs: entry.kind === 'grok' ? entry.summaryMtimeMs ?? null : null,
+      state: serializeMeta(entry.meta),
+    })
   }
 
   /**
@@ -930,6 +1037,7 @@ export class SessionIndex extends EventEmitter {
       await this.syncKimiTitle(entry)
       await this.syncGrokSummary(entry)
       await this.refreshGrokBinding(root, entry)
+      this.saveListing(entry)
     } catch {
       // Deleted or momentarily unreadable; keep the last known state.
     }
@@ -950,6 +1058,7 @@ export class SessionIndex extends EventEmitter {
           await this.syncGrokSummary(entry)
           const entryRoot = entry.grokUnresolved === true ? this.rootFor(entry.path) : undefined
           if (entryRoot !== undefined) await this.refreshGrokBinding(entryRoot, entry)
+          this.saveListing(entry)
         } catch {
           // Ignore transient errors.
         }

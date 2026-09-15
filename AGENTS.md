@@ -42,6 +42,15 @@ apps/server       Hono API: scans harness roots, classifies files, replays + tai
                   the retention window (searchMaxAgeDays,
                   default 90, 0 = all) at registration; the startup sweep and
                   applyMaxAgeDays purge what falls outside it.
+                  src/listing-cache.ts = the restart fast path: per-file consume
+                  cursors (bytes, rest, line count) + serialized meta-scanner
+                  state, so a restart re-reads only transcripts whose
+                  (size, mtime) changed, and resumes grown ones at the saved
+                  offset. Fingerprint includes the scanner version
+                  (`META_SCANNER_VERSION` in meta.ts — bump on scanner-logic
+                  changes) and, for grok, `summary.json`'s mtime; a file the
+                  search index has not fully covered (`searchFrom` below the
+                  cached line count) is re-read so its docs can flow.
 apps/web          Vite/React shell: sidebar, routes, harness registry (src/harnesses.tsx).
 ```
 
@@ -57,13 +66,19 @@ Both parsers are incremental and must never throw on a malformed or unknown reco
 - Adapters document their verified on-disk format in the module header: transcript
   path, harness version checked, unit traps (seconds vs ms, ids, flush order). Decide
   human-vs-injected by a structural field, never by matching text.
+- A meta scanner's state must be serializable for the listing cache:
+  `serializeMeta`/`hydrateMeta` (meta.ts) cover `MetaState`; scanner-private
+  state (Kimi's pending Agent calls) goes through the optional `save`/`load`
+  pair. `pnpm dev` passes `--no-open` — the dev UI is Vite on :5173, and the
+  auto-opened :5170 serves only the stale production bundle.
 - Human prompt counting must agree across three places: the core adapter, the context
   synthesizer, and the server meta scanner (`apps/server/src/meta.ts`). Share one
   exported classifier per harness. The search extractor
   (`apps/server/src/search/extract.ts`) is the fourth caller and must reuse the same
   classifiers — never re-derive human-vs-injected from the text.
 - The server writes only under the cache dir (`apps/server/src/cache.ts`):
-  `search.sqlite` and `settings.json` (`apps/server/src/settings.ts`). Harness roots stay
+  `search.sqlite`, `listing.sqlite` (`apps/server/src/listing-cache.ts`), and
+  `settings.json` (`apps/server/src/settings.ts`). Harness roots stay
   read-only. The index is a cache:
   bump `SEARCH_SCHEMA_VERSION` instead of migrating. A search hit addresses a record by
   `(kind, sessionId, fileId, line)`, where `line` is the 0-based index of the record among

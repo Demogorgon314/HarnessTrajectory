@@ -5,7 +5,7 @@
  */
 
 import {
-  agentMentions, asArray, asString, classifyInjectedUser, grokMessageClass, isCodexHumanPrompt, isRecord,
+  agentMentions, asArray, asNumber, asString, classifyInjectedUser, grokMessageClass, isCodexHumanPrompt, isRecord,
   kimiMessageClass, kimiTitleText, parseGrokLine, parseJsonLine, parseTime, titleFrom,
   type AgentFileMeta, type HarnessKind,
 } from '@harness-trajectory/core'
@@ -45,6 +45,89 @@ export function emptyMeta(): MetaState {
 export interface MetaScanner {
   readonly state: MetaState
   push(line: string): void
+  /**
+   * Scanner-private state a byte-resume needs beyond `state`, serialized by the
+   * listing cache. Most scanners derive everything into `state` and omit both.
+   */
+  save?(): unknown
+  load?(saved: unknown): void
+}
+
+/**
+ * Bump when any scanner's logic changes: cached listing states from an older
+ * version are discarded and the transcripts they covered are re-read.
+ */
+export const META_SCANNER_VERSION = 1
+
+/**
+ * Serialized scanner payload for the listing cache: the public `state` plus
+ * whatever private state the scanner chose to keep (`save`). `null` when the
+ * file carried no scanner (a sidecar'd child), which still lets the cache
+ * resume its byte cursor.
+ */
+export function serializeMeta(scanner: MetaScanner | null): string | null {
+  if (scanner === null) return null
+  const state = scanner.state
+  return JSON.stringify({
+    s: {
+      title: state.title,
+      aiTitle: state.aiTitle,
+      cwd: state.cwd,
+      model: state.model,
+      startedAt: state.startedAt,
+      lastTime: state.lastTime,
+      promptCount: state.promptCount,
+      agentType: state.agentType,
+      agents: [...state.agents.entries()],
+    },
+    x: scanner.save?.(),
+  })
+}
+
+/**
+ * Apply a payload written by {@link serializeMeta} to a fresh scanner. Either
+ * the whole snapshot lands or the scanner is left untouched (the caller then
+ * re-reads the transcript from byte 0).
+ */
+export function hydrateMeta(scanner: MetaScanner, saved: string): boolean {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(saved)
+  } catch {
+    return false
+  }
+  if (!isRecord(parsed)) return false
+  const s = parsed['s']
+  if (!isRecord(s)) return false
+  const agents = new Map<string, AgentFileMeta>()
+  const entries = asArray(s['agents'])
+  if (entries === undefined) return false
+  for (const pair of entries) {
+    if (!Array.isArray(pair) || pair.length !== 2) return false
+    const id = asString(pair[0])
+    const meta = isRecord(pair[1]) ? pair[1] : undefined
+    if (id === undefined || meta === undefined) return false
+    agents.set(id, {
+      agentId: asString(meta['agentId']) ?? id,
+      ...field('toolUseId', asString(meta['toolUseId'])),
+      ...field('description', asString(meta['description'])),
+      ...field('agentType', asString(meta['agentType'])),
+      ...field('model', asString(meta['model'])),
+      ...(meta['isFork'] === true ? { isFork: true } : {}),
+    })
+  }
+  const state = scanner.state
+  state.title = asString(s['title']) ?? null
+  state.aiTitle = asString(s['aiTitle']) ?? null
+  state.cwd = asString(s['cwd']) ?? null
+  state.model = asString(s['model']) ?? null
+  state.startedAt = asNumber(s['startedAt']) ?? null
+  state.lastTime = asNumber(s['lastTime']) ?? null
+  state.promptCount = asNumber(s['promptCount']) ?? 0
+  state.agentType = asString(s['agentType']) ?? null
+  state.agents = agents
+  scanner.load?.(parsed['x'])
+  return true
 }
 
 /**
@@ -277,6 +360,22 @@ function kimiMetaScanner(): MetaScanner {
   const pending = new Map<string, { description: string | undefined; agentType: string | undefined }>()
   return {
     state,
+    // A call awaiting its result across a restart keeps its description.
+    save() {
+      return [...pending.entries()]
+    },
+    load(saved) {
+      for (const pair of asArray(saved) ?? []) {
+        if (!Array.isArray(pair) || pair.length !== 2) continue
+        const callId = asString(pair[0])
+        const value = isRecord(pair[1]) ? pair[1] : undefined
+        if (callId === undefined || value === undefined) continue
+        pending.set(callId, {
+          description: asString(value['description']),
+          agentType: asString(value['agentType']),
+        })
+      }
+    },
     push(line) {
       const record = parseJsonLine(line)
       if (!isRecord(record)) return

@@ -6,8 +6,9 @@ import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { serve } from '@hono/node-server'
 import { createApp } from './app.ts'
-import { searchDbPath, searchEnabled } from './cache.ts'
+import { listingDbPath, searchDbPath, searchEnabled } from './cache.ts'
 import { SessionIndex } from './index.ts'
+import { ListingCache } from './listing-cache.ts'
 import { defaultRoots } from './roots.ts'
 import { browserUrl, openBrowser, shouldOpenBrowser } from './open-browser.ts'
 import { createSearchService, type SearchService } from './search/index.ts'
@@ -74,7 +75,19 @@ are editable in the UI.`)
     }
   }
   const settings = new SettingsController(settingsFile, search?.indexer)
-  const index = new SessionIndex({ roots, ...(search === undefined ? {} : { search: search.indexer }) })
+  // The listing cache makes restarts cheap: unchanged transcripts are not
+  // re-read at all, grown ones resume at the persisted byte offset.
+  let listing: ListingCache | undefined
+  try {
+    listing = new ListingCache({ path: listingDbPath() })
+  } catch (error) {
+    console.error('[harness-trajectory] listing cache unavailable:', error)
+  }
+  const index = new SessionIndex({
+    roots,
+    ...(listing === undefined ? {} : { listing }),
+    ...(search === undefined ? {} : { search: search.indexer }),
+  })
   index.on('error', (error: unknown) => {
     console.error('[harness-trajectory] watcher error:', error)
   })
@@ -109,7 +122,7 @@ are editable in the UI.`)
     if (search === undefined) return
     const stats = search.indexer.stats()
     if (stats.filesTotal === 0 && !stats.ready) return
-    const line = `[harness-trajectory] search backfill ${stats.filesDone}/${stats.filesTotal} files, `
+    const line = `[harness-trajectory] startup scan ${stats.filesDone}/${stats.filesTotal} files, `
       + `${search.store.docCount()} docs`
     if (line === lastProgress) return
     lastProgress = line
@@ -119,7 +132,9 @@ are editable in the UI.`)
   index.start().then(() => {
     if (progressTimer !== null) clearInterval(progressTimer)
     const sessions = index.list()
-    console.log(`[harness-trajectory] indexed ${sessions.length} sessions in ${Date.now() - started}ms`)
+    const sweep = index.sweepStats()
+    const cached = listing === undefined ? '' : ` (${sweep.cached} cached, ${sweep.read} re-read)`
+    console.log(`[harness-trajectory] indexed ${sessions.length} sessions in ${Date.now() - started}ms${cached}`)
     if (search === undefined) return
     logSearchProgress()
     let bytes = 0
@@ -128,7 +143,7 @@ are editable in the UI.`)
     } catch {
       // In-memory or not yet flushed to disk.
     }
-    console.log(`[harness-trajectory] search backfill: ${search.store.fileCount()} files, `
+    console.log(`[harness-trajectory] search index: ${search.store.fileCount()} files, `
       + `${search.store.docCount()} docs, ${Date.now() - started}ms, ${(bytes / 1e6).toFixed(1)} MB`)
   }, (error: unknown) => {
     if (progressTimer !== null) clearInterval(progressTimer)
@@ -138,6 +153,7 @@ are editable in the UI.`)
   const shutdown = () => {
     if (progressTimer !== null) clearInterval(progressTimer)
     index.stop()
+    listing?.close()
     search?.close()
     process.exit(0)
   }
