@@ -49,7 +49,9 @@ Opens `http://127.0.0.1:5170` in the default browser. To serve without opening o
 npx @demogorgon314/harness-trajectory@latest --no-open
 ```
 
-Full-text search is off by default. To index transcripts:
+Full-text search is off by default. Turn on **Content search** in the UI's
+settings dialog (the gear button in the sidebar) — it applies on the next
+start — or force it on for a launch:
 
 ```sh
 HARNESS_TRAJECTORY_SEARCH=1 npx @demogorgon314/harness-trajectory@latest
@@ -74,8 +76,8 @@ pnpm start      # http://127.0.0.1:5170
 
 Transcript roots are discovered from the harness home directories. Environment variables
 below; the server also accepts `--port`, `--host`, `--static`, and `--no-open`. Runtime
-settings (search retention days) live in `settings.json` under the cache directory and
-are editable in the UI's settings dialog (the gear button in the sidebar).
+settings (content search on/off, search retention days) live in `settings.json` under the cache
+directory and are editable in the UI's settings dialog (the gear button in the sidebar).
 
 | Setting | Default | Notes |
 | --- | --- | --- |
@@ -87,7 +89,7 @@ are editable in the UI's settings dialog (the gear button in the sidebar).
 | `GROK_HOME` | `~/.grok` | Grok Build home (`<home>/sessions`) |
 | `HARNESS_TRAJECTORY_{CLAUDE,CODEX,KIMI,GROK}_ROOT` | derived | Point one harness at an arbitrary directory |
 | `HARNESS_TRAJECTORY_CACHE_DIR` | `$XDG_CACHE_HOME/harness-trajectory`, else `~/.cache/harness-trajectory` | Holds `search.sqlite` and `settings.json`, the only files the server writes |
-| `HARNESS_TRAJECTORY_SEARCH` | off | `1`, `true`, or `on` enables indexing into `search.sqlite`; otherwise `/api/search` answers `{ "enabled": false }` |
+| `HARNESS_TRAJECTORY_SEARCH` | off | `1`, `true`, or `on` forces indexing on for the launch; otherwise the Content search toggle in `settings.json` decides. While off, `/api/search` answers `{ "enabled": false }` |
 | `HARNESS_TRAJECTORY_NO_OPEN` | off | `1`, `true`, or `on` skips opening the default browser (same as `--no-open`). SSH sessions never open one. |
 
 Transcript roots are only ever read. The search index is a cache: delete
@@ -139,7 +141,7 @@ Tests use hand-written synthetic records only. Never commit real transcript cont
 - **Per-call tokens.** Grok Build reports usage per turn; the per-call split is an estimate
   weighted by each call's own total. Codex compaction summaries are encrypted in the rollout.
 - **Large sessions** load fully into the browser. A 60 MB rollout takes a few seconds.
-- **The search index is big.** Off by default. With `HARNESS_TRAJECTORY_SEARCH=1` the
+- **The search index is big.** Off by default. With Content search on the
   server writes one `search.sqlite` under the cache directory (first build runs in the
   background). Delete the file to reclaim the space.
 - **Search granularity.** Queries shorter than three characters return nothing: the trigram

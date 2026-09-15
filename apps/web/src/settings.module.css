@@ -78,6 +78,10 @@
   gap: 18px;
 }
 
+.row + .row {
+  margin-top: 16px;
+}
+
 .rowText {
   display: flex;
   flex-direction: column;
@@ -108,6 +112,24 @@
   text-align: right;
   color: var(--dsw-alias-label-primary);
   background: var(--dsw-alias-bg-layer-1);
+}
+
+.toggle {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin: 2px 0 0;
+  accent-color: var(--dsw-alias-state-business-primary);
+  cursor: pointer;
+}
+
+.toggle:disabled {
+  cursor: default;
+}
+
+.toggle:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary);
+  outline-offset: 1px;
 }
 
 .number:focus-visible {

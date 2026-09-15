@@ -73,8 +73,8 @@ export function fetchSettings(signal?: AbortSignal): Promise<SettingsResponse> {
   return getJson('/api/settings', signal)
 }
 
-/** Persist a new settings value; the answer carries the value in effect. */
-export async function putSettings(value: ServerSettings): Promise<SettingsUpdateResponse> {
+/** Persist a settings change; the server merges it over the stored value and answers the value in effect. */
+export async function putSettings(value: Partial<ServerSettings>): Promise<SettingsUpdateResponse> {
   const response = await fetch('/api/settings', {
     method: 'PUT',
     headers: { 'content-type': 'application/json', accept: 'application/json' },

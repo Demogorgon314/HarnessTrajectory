@@ -45,6 +45,10 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
 
   if (!open) return null
 
+  const current = state.current
+  const toggle = current?.contentSearch ?? false
+  const live = current?.searchEnabled ?? false
+
   const commit = () => {
     const next = Number(draft)
     const valid = Number.isInteger(next)
@@ -70,6 +74,30 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
         <div className={css.body}>
           <div className={css.row}>
             <span className={css.rowText}>
+              <span className={css.rowLabel}>Content search</span>
+              <span className={css.rowHint}>
+                Index transcript contents into one SQLite file under the cache directory for full-text
+                search. Turning this off keeps the file; indexing just stops.
+              </span>
+            </span>
+            <input
+              type="checkbox"
+              className={css.toggle}
+              checked={toggle}
+              disabled={state.saving || current === null}
+              aria-label="Content search"
+              onChange={() => { void saveSettings({ contentSearch: !toggle }) }}
+            />
+          </div>
+          {toggle !== live && (
+            <p className={css.note}>
+              {toggle
+                ? 'Saved. Search starts after the server restarts; the index builds in the background.'
+                : 'Saved. Search stops after the server restarts; the index file stays on disk.'}
+            </p>
+          )}
+          <div className={css.row}>
+            <span className={css.rowText}>
               <span className={css.rowLabel}>Index retention (days)</span>
               <span className={css.rowHint}>
                 Transcripts not modified within this many days stay out of the search index; they remain
@@ -93,12 +121,6 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
               }}
             />
           </div>
-          {state.current !== null && !state.current.searchEnabled && (
-            <p className={css.note}>
-              Search is off on this server (start it with HARNESS_TRAJECTORY_SEARCH=1). The value is
-              still saved and applies when search is on.
-            </p>
-          )}
           {state.purged !== null && state.purged > 0 && (
             <p className={css.note}>Dropped {state.purged} older transcript files from the index.</p>
           )}

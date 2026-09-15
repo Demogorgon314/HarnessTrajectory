@@ -43,13 +43,27 @@ describe('/api/settings', () => {
     })
     expect(put.status).toBe(200)
     const updated = await put.json() as SettingsUpdateResponse
-    expect(updated).toMatchObject({ searchMaxAgeDays: 30, purged: 0, searchEnabled: true })
-    expect(readSettings(join(dir, 'settings.json'))).toEqual({ searchMaxAgeDays: 30 })
+    expect(updated).toMatchObject({ contentSearch: false, searchMaxAgeDays: 30, purged: 0, searchEnabled: true })
+    expect(readSettings(join(dir, 'settings.json'))).toEqual({ contentSearch: false, searchMaxAgeDays: 30 })
     expect(service.indexer.shouldIndex({ mtimeMs: Date.now() - 10 * 86_400_000 })).toBe(true)
     expect(service.indexer.shouldIndex({ mtimeMs: Date.now() - 60 * 86_400_000 })).toBe(false)
 
     const body = await (await app.request('/api/settings')).json() as SettingsResponse
-    expect(body).toEqual({ searchMaxAgeDays: 30, searchEnabled: true })
+    expect(body).toEqual({ contentSearch: false, searchMaxAgeDays: 30, searchEnabled: true })
+  })
+
+  it('toggles content search with a partial body without touching the retention window', async () => {
+    const put = await app.request('/api/settings', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ contentSearch: true }),
+    })
+    expect(put.status).toBe(200)
+    // The live flag still reports this process: the toggle applies on the next start.
+    expect(await put.json() as SettingsUpdateResponse)
+      .toMatchObject({ contentSearch: true, searchMaxAgeDays: SETTINGS_DEFAULTS.searchMaxAgeDays, searchEnabled: true })
+    const body = await (await app.request('/api/settings')).json() as SettingsResponse
+    expect(body).toMatchObject({ contentSearch: true, searchMaxAgeDays: SETTINGS_DEFAULTS.searchMaxAgeDays })
   })
 
   it('clamps a hostile value and rejects a body that is not JSON', async () => {

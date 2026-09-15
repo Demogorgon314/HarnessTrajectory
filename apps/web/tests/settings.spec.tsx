@@ -44,8 +44,12 @@ function daysInput(): HTMLInputElement {
   return screen.getByLabelText('Index retention days') as HTMLInputElement
 }
 
-async function answerCurrent(days: number, searchEnabled = true): Promise<void> {
-  await act(async () => { calls[0]?.resolve({ searchMaxAgeDays: days, searchEnabled }) })
+function toggleInput(): HTMLInputElement {
+  return screen.getByLabelText('Content search') as HTMLInputElement
+}
+
+async function answerCurrent(days: number, searchEnabled = true, contentSearch = searchEnabled): Promise<void> {
+  await act(async () => { calls[0]?.resolve({ contentSearch, searchMaxAgeDays: days, searchEnabled }) })
 }
 
 beforeEach(() => {
@@ -83,7 +87,7 @@ describe('SettingsDialog', () => {
     expect(put?.url).toBe('/api/settings')
     expect(put?.body).toEqual({ searchMaxAgeDays: 30 })
     await act(async () => {
-      put?.resolve({ searchMaxAgeDays: 30, searchEnabled: true, purged: 12 })
+      put?.resolve({ contentSearch: true, searchMaxAgeDays: 30, searchEnabled: true, purged: 12 })
     })
     expect(daysInput().value).toBe('30')
     expect(screen.getByText(/Dropped 12 older transcript files/)).toBeTruthy()
@@ -109,10 +113,29 @@ describe('SettingsDialog', () => {
     expect(calls.find(call => call.method === 'PUT')).toBeUndefined()
   })
 
-  it('notes when the server runs without search', async () => {
+  it('toggles content search on and notes the restart it waits for', async () => {
     render(<SettingsDialog open onClose={() => {}} />)
-    await answerCurrent(90, false)
-    expect(screen.getByText(/Search is off on this server/)).toBeTruthy()
+    await answerCurrent(90, false, false)
+    expect(toggleInput().checked).toBe(false)
+    expect(screen.queryByText(/restarts/)).toBeNull()
+    fireEvent.click(toggleInput())
+    const put = calls.find(call => call.method === 'PUT')
+    expect(put?.body).toEqual({ contentSearch: true })
+    // The server still runs without the index: the toggle applies on the next start.
+    await act(async () => { put?.resolve({ contentSearch: true, searchMaxAgeDays: 90, searchEnabled: false, purged: 0 }) })
+    expect(toggleInput().checked).toBe(true)
+    expect(screen.getByText(/Search starts after the server restarts/)).toBeTruthy()
+  })
+
+  it('toggles content search off and notes the index file is kept', async () => {
+    render(<SettingsDialog open onClose={() => {}} />)
+    await answerCurrent(90, true, true)
+    fireEvent.click(toggleInput())
+    const put = calls.find(call => call.method === 'PUT')
+    expect(put?.body).toEqual({ contentSearch: false })
+    await act(async () => { put?.resolve({ contentSearch: false, searchMaxAgeDays: 90, searchEnabled: true, purged: 0 }) })
+    expect(toggleInput().checked).toBe(false)
+    expect(screen.getByText(/Search stops after the server restarts; the index file stays on disk/)).toBeTruthy()
   })
 
   it('closes on Escape, on the mask, and on the close button', async () => {

@@ -43,11 +43,20 @@ describe('settings file', () => {
   it('round-trips a written value, including 0 for no limit', async () => {
     const dir = await tempDir()
     const path = join(dir, 'nested', 'settings.json')
-    writeSettings({ searchMaxAgeDays: 30 }, path)
-    expect(readSettings(path)).toEqual({ searchMaxAgeDays: 30 })
-    writeSettings({ searchMaxAgeDays: 0 }, path)
-    expect(readSettings(path)).toEqual({ searchMaxAgeDays: 0 })
-    expect(JSON.parse(await readFile(path, 'utf8'))).toEqual({ searchMaxAgeDays: 0 })
+    writeSettings({ contentSearch: false, searchMaxAgeDays: 30 }, path)
+    expect(readSettings(path)).toEqual({ contentSearch: false, searchMaxAgeDays: 30 })
+    writeSettings({ contentSearch: true, searchMaxAgeDays: 0 }, path)
+    expect(readSettings(path)).toEqual({ contentSearch: true, searchMaxAgeDays: 0 })
+    expect(JSON.parse(await readFile(path, 'utf8'))).toEqual({ contentSearch: true, searchMaxAgeDays: 0 })
+  })
+
+  it('clamps each field on its own: one junk field does not reset the other', async () => {
+    const dir = await tempDir()
+    const path = join(dir, 'settings.json')
+    await writeFile(path, JSON.stringify({ contentSearch: true, searchMaxAgeDays: '90' }))
+    expect(readSettings(path)).toEqual({ contentSearch: true, searchMaxAgeDays: SETTINGS_DEFAULTS.searchMaxAgeDays })
+    await writeFile(path, JSON.stringify({ contentSearch: 'yes', searchMaxAgeDays: 30 }))
+    expect(readSettings(path)).toEqual({ contentSearch: false, searchMaxAgeDays: 30 })
   })
 })
 
@@ -71,10 +80,23 @@ describe('SettingsController', () => {
     const controller = new SettingsController(path, indexer)
 
     const update = controller.update({ searchMaxAgeDays: 30 })
-    expect(update).toEqual({ value: { searchMaxAgeDays: 30 }, purged: 7 })
+    expect(update).toEqual({ value: { contentSearch: false, searchMaxAgeDays: 30 }, purged: 7 })
     expect(applied).toEqual([30])
-    expect(readSettings(path)).toEqual({ searchMaxAgeDays: 30 })
-    expect(controller.read()).toEqual({ searchMaxAgeDays: 30 })
+    expect(readSettings(path)).toEqual({ contentSearch: false, searchMaxAgeDays: 30 })
+    expect(controller.read()).toEqual({ contentSearch: false, searchMaxAgeDays: 30 })
+  })
+
+  it('merges a partial update over the stored value instead of resetting the other field', async () => {
+    const dir = await tempDir()
+    const path = join(dir, 'settings.json')
+    const controller = new SettingsController(path, undefined)
+
+    controller.update({ searchMaxAgeDays: 30 })
+    const update = controller.update({ contentSearch: true })
+    expect(update.value).toEqual({ contentSearch: true, searchMaxAgeDays: 30 })
+    expect(readSettings(path)).toEqual({ contentSearch: true, searchMaxAgeDays: 30 })
+    // …and back, still keeping the retention window.
+    expect(controller.update({ contentSearch: false }).value).toEqual({ contentSearch: false, searchMaxAgeDays: 30 })
   })
 
   it('clamps a hostile value to the defaults before it touches disk or the indexer', async () => {
@@ -94,7 +116,7 @@ describe('SettingsController', () => {
     const path = join(dir, 'settings.json')
     const controller = new SettingsController(path, undefined)
     const update = controller.update({ searchMaxAgeDays: 14 })
-    expect(update).toEqual({ value: { searchMaxAgeDays: 14 }, purged: 0 })
-    expect(readSettings(path)).toEqual({ searchMaxAgeDays: 14 })
+    expect(update).toEqual({ value: { contentSearch: false, searchMaxAgeDays: 14 }, purged: 0 })
+    expect(readSettings(path)).toEqual({ contentSearch: false, searchMaxAgeDays: 14 })
   })
 })

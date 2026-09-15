@@ -37,7 +37,9 @@ apps/server       Hono API: scans harness roots, classifies files, replays + tai
                   JS — FTS phrase, snippet and bm25 are unused).
                   Contract types live in core/src/search.ts.
                   src/settings.ts = settings.json persistence + the /api/settings controller.
-                  indexer.shouldIndex enforces the retention window (searchMaxAgeDays,
+                  contentSearch (default off; HARNESS_TRAJECTORY_SEARCH=1 forces on) decides
+                  at startup whether the index exists at all. indexer.shouldIndex enforces
+                  the retention window (searchMaxAgeDays,
                   default 90, 0 = all) at registration; the startup sweep and
                   applyMaxAgeDays purge what falls outside it.
 apps/web          Vite/React shell: sidebar, routes, harness registry (src/harnesses.tsx).

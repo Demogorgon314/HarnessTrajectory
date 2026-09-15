@@ -31,8 +31,8 @@ export async function loadSettings(): Promise<void> {
   }
 }
 
-/** Persist a new value; the store adopts exactly what the server answers. */
-export async function saveSettings(value: ServerSettings): Promise<void> {
+/** Persist a change to one or more fields; the store adopts exactly what the server answers. */
+export async function saveSettings(value: Partial<ServerSettings>): Promise<void> {
   settingsStore.update(state => ({ ...state, saving: true, error: null }))
   try {
     const answered = await putSettings(value)

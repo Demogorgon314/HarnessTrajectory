@@ -8,7 +8,8 @@ npx @demogorgon314/harness-trajectory@latest
 
 Opens `http://127.0.0.1:5170` in the default browser. Pass `--no-open` to skip.
 
-Full-text search is off by default. To index transcripts:
+Full-text search is off by default. Turn on **Content search** in the UI's
+settings dialog (applies on the next start), or force it on for a launch:
 
 ```sh
 HARNESS_TRAJECTORY_SEARCH=1 npx @demogorgon314/harness-trajectory@latest

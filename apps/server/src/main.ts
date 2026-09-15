@@ -44,11 +44,13 @@ HARNESS_TRAJECTORY_KIMI_ROOT / HARNESS_TRAJECTORY_GROK_ROOT.
 A local launch opens the UI in the default browser. Pass --no-open (or set
 HARNESS_TRAJECTORY_NO_OPEN=1) to skip. An SSH session never opens a browser.
 
-Full-text search is off by default. Set HARNESS_TRAJECTORY_SEARCH=1 to index
-transcripts into one SQLite file under HARNESS_TRAJECTORY_CACHE_DIR (default
-$XDG_CACHE_HOME/harness-trajectory, else ~/.cache/harness-trajectory).
-Harness roots are never written to. Server settings (search retention days,
-default 90) live in settings.json there and are editable in the UI.`)
+Full-text search is off by default. Turn on "Content search" in the UI's
+Settings dialog (persisted to settings.json), or set HARNESS_TRAJECTORY_SEARCH=1
+to force it on for a launch. The index is one SQLite file under
+HARNESS_TRAJECTORY_CACHE_DIR (default $XDG_CACHE_HOME/harness-trajectory, else
+~/.cache/harness-trajectory). Harness roots are never written to. Server
+settings (search retention days, default 90) live in settings.json there and
+are editable in the UI.`)
     return
   }
   const port = Number(argValue('--port') ?? process.env['HARNESS_TRAJECTORY_PORT'] ?? 5170)
@@ -61,7 +63,10 @@ default 90) live in settings.json there and are editable in the UI.`)
   const dbPath = searchDbPath()
   const settingsFile = settingsPath()
   const startupSettings = readSettings(settingsFile)
-  if (searchEnabled()) {
+  // The persisted toggle decides; the env var forces search on for a launch
+  // without touching the file. There is deliberately no env "force off":
+  // `0`/`false` simply mean "no override", exactly what unset meant before.
+  if (searchEnabled() || startupSettings.contentSearch) {
     try {
       search = createSearchService({ path: dbPath, maxAgeDays: startupSettings.searchMaxAgeDays })
     } catch (error) {
@@ -92,7 +97,7 @@ default 90) live in settings.json there and are editable in the UI.`)
   })
   for (const root of roots) console.log(`  ${root.kind}: ${root.dir}`)
   if (search === undefined) {
-    console.log('[harness-trajectory] search disabled (set HARNESS_TRAJECTORY_SEARCH=1 to enable)')
+    console.log('[harness-trajectory] search disabled (enable "Content search" in Settings, or set HARNESS_TRAJECTORY_SEARCH=1)')
   } else {
     const days = startupSettings.searchMaxAgeDays
     const retention = days === 0 ? 'no retention limit' : `retention ${days}d`

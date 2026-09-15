@@ -58,8 +58,14 @@ export class SettingsController {
     return readSettings(this.path)
   }
 
+  /**
+   * Persist a (possibly partial) change: the body is merged over the stored
+   * value, so a client that only sends the field it edited cannot reset the
+   * other one to its default.
+   */
   update(input: unknown): SettingsUpdate {
-    const value = clampSettings(input)
+    const current = readSettings(this.path)
+    const value = clampSettings(typeof input === 'object' && input !== null ? { ...current, ...input } : current)
     writeSettings(value, this.path)
     const purged = this.indexer?.applyMaxAgeDays(value.searchMaxAgeDays) ?? 0
     return { value, purged }

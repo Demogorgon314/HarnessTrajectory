@@ -6,6 +6,12 @@
 
 export interface ServerSettings {
   /**
+   * Index transcript contents for full-text search. Takes effect on the next
+   * start: enabling builds the index then, disabling stops indexing and keeps
+   * the file on disk. `HARNESS_TRAJECTORY_SEARCH=1` forces this on.
+   */
+  contentSearch: boolean
+  /**
    * Transcript files not modified within this many days are left out of the
    * search index. They stay browsable; they just do not answer searches.
    * `0` indexes everything.
@@ -14,6 +20,7 @@ export interface ServerSettings {
 }
 
 export const SETTINGS_DEFAULTS: ServerSettings = {
+  contentSearch: false,
   searchMaxAgeDays: 90,
 }
 
@@ -23,7 +30,7 @@ export const SEARCH_MAX_AGE_DAYS_MAX = 3650
 
 /** What `GET /api/settings` answers. */
 export interface SettingsResponse extends ServerSettings {
-  /** False when the server runs without the search index. */
+  /** False when this server runs without the index — regardless of the stored toggle. */
   searchEnabled: boolean
 }
 
@@ -35,14 +42,18 @@ export interface SettingsUpdateResponse extends SettingsResponse {
 
 /**
  * Coerce anything — a hand-edited `settings.json`, a crafted PUT body — into a
- * valid value, falling back field by field to the defaults.
+ * valid value. Each field falls back to its default on its own, so one junk
+ * field does not reset the other.
  */
 export function clampSettings(input: unknown): ServerSettings {
   const record = typeof input === 'object' && input !== null ? input as Record<string, unknown> : {}
+  const toggle = record['contentSearch']
   const days = record['searchMaxAgeDays']
-  if (typeof days === 'number' && Number.isInteger(days)
-    && days >= SEARCH_MAX_AGE_DAYS_MIN && days <= SEARCH_MAX_AGE_DAYS_MAX) {
-    return { searchMaxAgeDays: days }
+  return {
+    contentSearch: typeof toggle === 'boolean' ? toggle : SETTINGS_DEFAULTS.contentSearch,
+    searchMaxAgeDays: typeof days === 'number' && Number.isInteger(days)
+      && days >= SEARCH_MAX_AGE_DAYS_MIN && days <= SEARCH_MAX_AGE_DAYS_MAX
+      ? days
+      : SETTINGS_DEFAULTS.searchMaxAgeDays,
   }
-  return { ...SETTINGS_DEFAULTS }
 }
