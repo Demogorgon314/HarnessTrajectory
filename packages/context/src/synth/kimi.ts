@@ -753,10 +753,14 @@ class KimiSynthesizer implements EventSynthesizer {
   // ---------------------------------------------------------------------------
 
   /**
-   * `context.apply_compaction` replaces every prior context message with one
-   * summary user message — EXCEPT the last `keptUserMessageCount` user turns,
-   * which stay live (the "kept tail"). `legacyTail` marks the older builds
-   * whose count does not describe a tail, so the claim then covers everything.
+   * `context.apply_compaction` replaces the whole context with one summary
+   * message plus a SELECTION OF USER MESSAGES — never whole turns. The kept
+   * set is `keptUserMessageCount` prompts: `keptHeadUserMessageCount` of them
+   * from the session's head (present only when the selection elided the
+   * middle), the rest from the tail. The kept prompts' assistant replies and
+   * tool results are compacted away too, so only the human message nodes
+   * themselves survive the shadow claim. `legacyTail` marks the older builds
+   * whose count describes a raw message slice, so the claim covers everything.
    */
   private onCompaction(record: Record<string, unknown>, time: number, out: TimelineEvent[]): void {
     this.flushStep(out, time, undefined)
@@ -783,13 +787,16 @@ class KimiSynthesizer implements EventSynthesizer {
     }, op)
   }
 
-  /** The live seqs the kept tail protects: everything from the k-th most recent human message on. */
+  /** The live seqs the kept selection protects: the kept head and tail HUMAN message nodes. */
   private keptTailSeqs(record: Record<string, unknown>): Set<number> {
     const kept = asNumber(record['keptUserMessageCount'])
     if (kept === undefined || kept <= 0 || record['legacyTail'] === true) return new Set<number>()
-    const start = this.humanSeqs[Math.max(0, this.humanSeqs.length - Math.floor(kept))]
-    if (start === undefined) return new Set<number>()
-    return new Set(this.liveSeqs.filter(seq => seq >= start))
+    const keptHead = Math.max(0, Math.floor(asNumber(record['keptHeadUserMessageCount']) ?? 0))
+    const head = keptHead === 0 ? [] : this.humanSeqs.slice(0, keptHead)
+    const tailCount = Math.max(0, Math.floor(kept) - keptHead)
+    const tail = tailCount === 0 ? [] : this.humanSeqs.slice(-tailCount)
+    const protectedSeqs = new Set([...head, ...tail])
+    return new Set(this.liveSeqs.filter(seq => protectedSeqs.has(seq)))
   }
 
   /** `context.undo` retracts the last `count` context messages. */
@@ -955,16 +962,17 @@ function textOf(blocks: readonly ContentBlock[]): string {
 }
 
 /**
- * The compaction summary text: the current builds write a plain `summary`
- * string, `contextSummary` is the alternate spelling, and the legacy shape put
- * a whole message object in `summary`.
+ * The compaction summary text AS IT ENTERS THE CONTEXT: current builds put the
+ * context's message in `contextSummary` (the shorter `summary` is the working
+ * summary the trajectory view shows). The legacy shape put a whole message
+ * object in `summary`.
  */
 function compactionSummaryOf(record: Record<string, unknown>): string {
+  const context = asString(record['contextSummary'])
+  if (context !== undefined && context !== '') return context
   const summary = record['summary']
   const direct = asString(summary)
   if (direct !== undefined && direct !== '') return direct
-  const context = asString(record['contextSummary'])
-  if (context !== undefined && context !== '') return context
   if (isRecord(summary)) {
     const text = textOf(contentBlocksOf(asArray(summary['content']) ?? []))
     if (text !== '') return text

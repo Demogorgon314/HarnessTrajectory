@@ -99,10 +99,15 @@ README roots and limits, and specs in core, context, server, and web.
   `kimiMessageClass` counts it as human (titles skip its `<git-context>` prelude via
   `kimiTitleText`). An `llm.request` with `kind: 'compaction'` is not a loop step: it
   has no `turnStep` and its `maxTokens` is the summary model's cap, not the context
-  window. There is no durable spawn record for subagents: a background launch binds
-  through `task.started` (`info.parentToolCallId`), a foreground one only through the
-  `Agent` result's `agent_id:` header (arriving after the child's whole transcript —
-  child loop events are buffered until it lands), an `AgentSwarm` through the result's
+  window. A compaction replaces the context with a summary message (the
+  `contextSummary` field — the shorter `summary` is the working summary the
+  trajectory shows) plus a SELECTION OF USER MESSAGES (`keptUserMessageCount`,
+  `keptHeadUserMessageCount` when the middle was elided), never whole turns; a
+  trend that keeps whole turns alive never drops. There is no durable spawn
+  record for subagents: a background launch binds through `task.started`
+  (`info.parentToolCallId`), a foreground one only through the `Agent` result's
+  `agent_id:` header (arriving after the child's whole transcript — child loop
+  events are buffered until it lands), an `AgentSwarm` through the result's
   `<subagent agent_id="…">` XML. Images are `image_url` parts: inline `data:` URLs
   below ~4 KB, else `blobref:<mime>;<sha256>` whose bytes sit in `agents/<id>/blobs/`
   and are served by the server's blob route.

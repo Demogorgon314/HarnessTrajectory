@@ -571,13 +571,18 @@ describe('kimi synthesizer', () => {
     ])
   })
 
-  it('shadows everything but the kept tail on a compaction', () => {
+  it('shadows everything but the kept user messages on a compaction', () => {
     const { events } = run([
       ...TYPICAL_TURN,
       appendMessage(9, 'second prompt', { kind: 'user' }),
       appendMessage(10, 'third prompt', { kind: 'user' }),
+      // The answer to the last prompt: kept user messages do NOT keep their turns.
+      stepBegin(10, '1', 1),
+      contentPart(10, { type: 'text', text: 'third answer' }, '1', 1),
+      stepEnd(10),
       line(11, 'context.apply_compaction', {
-        summary: 'we read a file',
+        summary: 'working summary',
+        contextSummary: 'we read a file',
         compactedCount: 3,
         tokensBefore: 4100,
         tokensAfter: 900,
@@ -588,16 +593,44 @@ describe('kimi synthesizer', () => {
     const summary = firstOf(events, 'compaction/summary')
     const shadowed = dataOf(summary)['shadowedSeqs'] as number[]
     const thirdPrompt = allOf(events, 'user/message').find(m => blocksOf(m)[0]?.text === 'third prompt')
+    const thirdAnswer = allOf(events, 'assistant/message').at(-1)
     expect(dataOf(summary)['shadowedTokenCount']).toBe(4100)
-    // The most recent human prompt (k = 1) and everything after it stay live.
+    // The most recent human prompt (k = 1) stays live; its own answer does not.
     expect(shadowed).not.toContain(thirdPrompt?.seq)
-    expect(shadowed.length).toBeGreaterThan(0)
+    expect(shadowed).toContain(thirdAnswer?.seq)
     const replacement = allOf(events, 'user/message').at(-1)
     expect(sourceOf(replacement)).toEqual({ kind: 'plugin', form: 'compaction', plugin: 'compaction' })
+    // The fold prices the message that enters the context (contextSummary),
+    // not the shorter working summary.
     expect(blocksOf(replacement)).toEqual([{ type: 'text', text: 'we read a file' }])
     expect(replacement?.surfaceOp).toEqual({
       op: 'replace', startSeq: Math.min(...shadowed), endSeq: Math.max(...shadowed),
     })
+  })
+
+  it('keeps the head and tail user messages an elided compaction declares', () => {
+    const { events } = run([
+      ...TYPICAL_TURN,
+      appendMessage(9, 'second prompt', { kind: 'user' }),
+      appendMessage(10, 'third prompt', { kind: 'user' }),
+      line(11, 'context.apply_compaction', {
+        contextSummary: 'we read a file',
+        compactedCount: 3,
+        tokensBefore: 4100,
+        tokensAfter: 900,
+        keptUserMessageCount: 2,
+        keptHeadUserMessageCount: 1,
+        droppedCount: 3,
+      }),
+    ])
+    const shadowed = dataOf(firstOf(events, 'compaction/summary'))['shadowedSeqs'] as number[]
+    const prompts = allOf(events, 'user/message').filter(m => sourceOf(m)['kind'] === 'user')
+    const [first, second, third] = prompts
+    // keptHeadUserMessageCount from the head, the rest from the tail; the
+    // elided middle joins the shadow claim.
+    expect(shadowed).not.toContain(first?.seq)
+    expect(shadowed).toContain(second?.seq)
+    expect(shadowed).not.toContain(third?.seq)
   })
 
   it('shadows the whole surface when the compaction declares a legacy tail', () => {
