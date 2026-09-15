@@ -85,7 +85,12 @@ Mirror the most recent one (`git show --stat` of the Kimi or Grok commit lists e
 touchpoint): `HarnessKind` + `HARNESS_KINDS`, `adapters/<kind>.ts` + registry,
 `synth/<kind>.ts` + registry, server `roots.ts` / `classifyPath` / meta scanner /
 child binding / `search/extract.ts` branch, web registry entry with logo + resume command,
-README roots and limits, and specs in core, context, server, and web.
+README roots and limits, and specs in core, context, server, and web. Child listing
+titles go through `listingScannerFor` / `MetaState.agents` / `mergeChildAgent` in
+`apps/server/src/meta.ts` — a sidecar harness attaches `file.agent` at registration
+and skips the child scan; a JSONL-only harness fills the parent scanner's `agents`
+map (spawn description) and the child's own `title`/`agentType`. Do not branch on
+kind in `index.ts` to stamp those facts.
 
 ## Harness facts that are easy to get wrong
 
@@ -108,9 +113,18 @@ README roots and limits, and specs in core, context, server, and web.
   (`info.parentToolCallId`), a foreground one only through the `Agent` result's
   `agent_id:` header (arriving after the child's whole transcript — child loop
   events are buffered until it lands), an `AgentSwarm` through the result's
-  `<subagent agent_id="…">` XML. Images are `image_url` parts: inline `data:` URLs
-  below ~4 KB, else `blobref:<mime>;<sha256>` whose bytes sit in `agents/<id>/blobs/`
-  and are served by the server's blob route.
+  `<subagent agent_id="…">` XML. There is no sidecar: the listing description is
+  the parent Agent call's `description` (else the child's delegated prompt),
+  discovered by the meta scanner. Finished subagent wires can still grow after
+  `turn.ended` — the AGENTS.md reminder service lives in the agent's scope,
+  which outlives the turn and keeps watching the session's instruction files;
+  `reminder.notify()` appends `agents_md_change` to context memory immediately
+  (no turn gate), so they are real context records.
+  The TUI replay skips rendering `origin.kind === 'injection'`; this viewer
+  folds them as context, the same way it shows Claude system-reminders. Images
+  are `image_url` parts:
+  inline `data:` URLs below ~4 KB, else `blobref:<mime>;<sha256>` whose bytes
+  sit in `agents/<id>/blobs/` and are served by the server's blob route.
 - Grok: parse only `updates.jsonl` (`chat_history.jsonl` is a derived cache, `events.jsonl`
   is telemetry). Envelope `timestamp` is seconds, `_meta.agentTimestampMs` is ms. Usage
   arrives per turn in `turn_completed`; per-call split uses each stream's first

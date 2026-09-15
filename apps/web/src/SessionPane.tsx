@@ -78,6 +78,8 @@ function shortAgentId(agentId: string): string {
 export function subagentRows(
   runs: readonly SubagentRun[],
   children: readonly SessionChildSummary[],
+  /** The open child's own transcript title, used when no spawn description is known. */
+  own?: { fileId: string; title: string | null },
 ): SubagentRow[] {
   const byAgentId = new Map<string, SessionChildSummary>()
   const byFileId = new Map<string, SessionChildSummary>()
@@ -92,10 +94,11 @@ export function subagentRows(
     const child = (run.fileId === null ? undefined : byFileId.get(run.fileId)) ?? byAgentId.get(run.agentId)
     if (child !== undefined) used.add(child.file.id)
     const meta = child?.file.agent
+    const fileId = child?.file.id ?? run.fileId
     rows.push({
       key: run.callId ?? run.agentId,
-      fileId: child?.file.id ?? run.fileId,
-      title: run.description ?? meta?.description ?? shortAgentId(run.agentId),
+      fileId,
+      title: rowTitle(run.description ?? meta?.description, run.agentId, fileId, own),
       agentType: run.agentType ?? meta?.agentType ?? (meta?.isFork === true ? 'fork' : null),
       model: run.model ?? meta?.model ?? null,
       status: run.status,
@@ -111,7 +114,7 @@ export function subagentRows(
     rows.push({
       key: `file:${child.file.id}`,
       fileId: child.file.id,
-      title: meta?.description ?? shortAgentId(child.file.id),
+      title: rowTitle(meta?.description, child.file.id, child.file.id, own),
       agentType: meta?.agentType ?? (meta?.isFork === true ? 'fork' : null),
       model: meta?.model ?? null,
       status: 'running',
@@ -122,6 +125,20 @@ export function subagentRows(
     })
   }
   return rows
+}
+
+function rowTitle(
+  description: string | null | undefined,
+  agentId: string,
+  fileId: string | null,
+  own: { fileId: string; title: string | null } | undefined,
+): string {
+  if (description !== undefined && description !== null && description !== '') return description
+  if (own !== undefined && own.title !== null && own.title !== ''
+    && (fileId === own.fileId || agentId === own.fileId)) {
+    return own.title
+  }
+  return shortAgentId(fileId ?? agentId)
 }
 
 /** A run counts as active only while its transcript keeps being written. */
@@ -265,7 +282,14 @@ export function SessionPane({ route, summary: listSummary, onNavigate, t, locale
   const summary = state.summary ?? listSummary
   const started = summary?.startedAt ?? null
   const resumeCommand = harnessMeta(kind).resumeCommand({ id, cwd: summary?.cwd ?? null })
-  const rows = useMemo(() => subagentRows(state.subagents, state.children), [state.subagents, state.children])
+  const rows = useMemo(
+    () => subagentRows(
+      state.subagents,
+      state.children,
+      file === null || state.meta.title === null ? undefined : { fileId: file, title: state.meta.title },
+    ),
+    [state.subagents, state.children, file, state.meta.title],
+  )
   const sessionLive = summary?.live === true
   /*
    * The subagent a view is ABOUT, whichever tab shows it: the trajectory folds

@@ -419,7 +419,7 @@ describe('kimi adapter', () => {
           parentToolCallId: 'call-agent',
           description: 'Fix the bug',
           subagentType: 'coder',
-          model: 'k3',
+          model: 'kimi-code/k3',
           thinkingEffort: 'high',
           status: 'running',
           startedAt: at(400),
@@ -614,6 +614,66 @@ describe('kimi adapter', () => {
     expect(agentResult?.callId).toBe('call-agent')
     expect(agentResult?.subCalls.map(call => call.callId)).toEqual(['child-call-1'])
     expect(toolResults(parser)).toHaveLength(1)
+  })
+
+  it('does not treat post-completion child injections as activity on the parent run', () => {
+    const parser = createKimiParser()
+    for (const item of [
+      metadata(),
+      profileBind(10),
+      turnPrompt(100, 'review it'),
+      appendMessage(110, 'review it', { kind: 'user' }),
+      stepBegin(200, '0', 1),
+      toolCall(300, '0', 1, 'call-agent', 'Agent', {
+        subagent_type: 'explore', prompt: 'review the diff carefully', description: 'Review the diff',
+      }),
+      stepEnd(310, '0', 1, { finishReason: 'tool_use', usage: usage(10, 0, 0, 5) }),
+    ]) parser.push(item, MAIN)
+    for (const item of [
+      JSON.stringify({ type: 'metadata', created_at: at(320), protocol_version: '1.5' }),
+      stepBegin(400, '0', 1, CHILD_ID),
+      toolCall(500, '0', 1, 'child-call-1', 'Read', { path: '/tmp/a.ts' }, CHILD_ID),
+      toolResult(600, 'child-call-1', { output: 'export const a = 1' }, CHILD_ID),
+      loop(700, { type: 'step.end', finishReason: 'stop', step: 1, turnId: '0' }, CHILD_ID),
+    ]) parser.push(item, CHILD)
+    for (const item of [
+      toolResult(800, 'call-agent', {
+        output: `agent_id: ${CHILD_ID}\nactual_subagent_type: explore\nstatus: completed\nstop_reason: completed\n\n[summary]\nReviewed.`,
+      }),
+      turnEnded(900, 0),
+    ]) parser.push(item, MAIN)
+    parser.push(appendMessage(2_000, '<system-reminder>AGENTS.md changed</system-reminder>', {
+      kind: 'injection', variant: 'agents_md_change',
+    }), CHILD)
+    expect(parser.subagents()).toEqual([{
+      agentId: CHILD_ID,
+      fileId: CHILD_ID,
+      callId: 'call-agent',
+      description: 'Review the diff',
+      agentType: 'explore',
+      model: null,
+      status: 'completed',
+      startedAt: at(320),
+      endedAt: at(800),
+      lastTime: at(700),
+      toolCalls: 1,
+    }])
+  })
+
+  it('folds injections that arrive after turn.ended, matching kimi-code context memory', () => {
+    // `AgentReminderService.notify()` appends immediately, with no turn gate.
+    const parser = feed([
+      ...twoStepFixture(),
+      appendMessage(3_000, '<system-reminder>AGENTS.md changed</system-reminder>', {
+        kind: 'injection', variant: 'agents_md_change',
+      }),
+      appendMessage(3_100, '<system-reminder>AGENTS.md changed</system-reminder>', {
+        kind: 'injection', variant: 'agents_md_change',
+      }),
+    ])
+    expect(contexts(parser).map(node => node.provenance.label)).toEqual([
+      'agents_md_change', 'agents_md_change',
+    ])
   })
 
   it('binds every agent an AgentSwarm result announces', () => {

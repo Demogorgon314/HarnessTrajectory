@@ -5,8 +5,9 @@
  */
 
 import {
-  asArray, asString, classifyInjectedUser, grokMessageClass, isCodexHumanPrompt, isRecord, kimiMessageClass,
-  kimiTitleText, parseGrokLine, parseJsonLine, parseTime, titleFrom, type HarnessKind,
+  agentMentions, asArray, asString, classifyInjectedUser, grokMessageClass, isCodexHumanPrompt, isRecord,
+  kimiMessageClass, kimiTitleText, parseGrokLine, parseJsonLine, parseTime, titleFrom,
+  type AgentFileMeta, type HarnessKind,
 } from '@harness-trajectory/core'
 
 export interface FileHead {
@@ -24,10 +25,21 @@ export interface MetaState {
   startedAt: number | null
   lastTime: number | null
   promptCount: number
+  /**
+   * Children this transcript named (spawn description, type, model). A parent
+   * file fills this; a child file leaves it empty. Sidecar harnesses never
+   * write it — they attach `file.agent` at registration.
+   */
+  agents: Map<string, AgentFileMeta>
+  /** This file's own agent type, when the transcript records one (Kimi `profile.bind`). */
+  agentType: string | null
 }
 
 export function emptyMeta(): MetaState {
-  return { title: null, aiTitle: null, cwd: null, model: null, startedAt: null, lastTime: null, promptCount: 0 }
+  return {
+    title: null, aiTitle: null, cwd: null, model: null, startedAt: null, lastTime: null, promptCount: 0,
+    agents: new Map(), agentType: null,
+  }
 }
 
 export interface MetaScanner {
@@ -52,6 +64,69 @@ export function createMetaScanner(
     case 'kimi': return kimiMetaScanner()
     case 'grok': return grokMetaScanner(summary ?? null)
   }
+}
+
+/**
+ * Listing scan for one file: every main transcript, and any child that has no
+ * sidecar facts yet. Harnesses with `.meta.json` / `summary.json` attach
+ * `sidecar` at registration and skip the child scan; a harness that only
+ * names children inside the parent JSONL leaves `sidecar` unset, so the
+ * child's own title/type still reach the catalog.
+ */
+export function listingScannerFor(
+  kind: HarnessKind,
+  role: 'main' | 'child',
+  sidecar: AgentFileMeta | undefined,
+  summary?: Record<string, unknown> | null,
+): MetaScanner | null {
+  if (role === 'child' && sidecar !== undefined) return null
+  return createMetaScanner(kind, summary ?? null)
+}
+
+function nonempty(value: string | null | undefined): string | undefined {
+  return value !== undefined && value !== null && value !== '' ? value : undefined
+}
+
+/** Parent spawn facts win; the child's own listing title/type/model fill gaps; an existing sidecar is last. */
+export function mergeChildAgent(
+  id: string,
+  parent: AgentFileMeta | undefined,
+  own: MetaState | undefined,
+  existing: AgentFileMeta | undefined,
+): AgentFileMeta | undefined {
+  const ownDescription = nonempty(own?.title)
+  const ownType = nonempty(own?.agentType)
+  const ownModel = nonempty(own?.model)
+  if (parent === undefined && ownDescription === undefined && ownType === undefined && ownModel === undefined) {
+    return existing
+  }
+  const description = nonempty(parent?.description) ?? ownDescription ?? existing?.description
+  const agentType = nonempty(parent?.agentType) ?? ownType ?? existing?.agentType
+  const model = nonempty(parent?.model) ?? ownModel ?? existing?.model
+  const toolUseId = nonempty(parent?.toolUseId) ?? existing?.toolUseId
+  const isFork = parent?.isFork ?? existing?.isFork
+  if (description === undefined && agentType === undefined && model === undefined
+    && toolUseId === undefined && isFork === undefined) {
+    return existing
+  }
+  return {
+    agentId: nonempty(existing?.agentId) ?? id,
+    ...(toolUseId === undefined ? {} : { toolUseId }),
+    ...(description === undefined ? {} : { description }),
+    ...(agentType === undefined ? {} : { agentType }),
+    ...(model === undefined ? {} : { model }),
+    ...(isFork === undefined ? {} : { isFork }),
+  }
+}
+
+export function agentMetaEqual(left: AgentFileMeta | undefined, right: AgentFileMeta | undefined): boolean {
+  if (left === undefined || right === undefined) return left === right
+  return left.agentId === right.agentId
+    && left.toolUseId === right.toolUseId
+    && left.description === right.description
+    && left.agentType === right.agentType
+    && left.model === right.model
+    && left.isFork === right.isFork
 }
 
 function noteTime(state: MetaState, value: unknown): void {
@@ -152,12 +227,54 @@ function aliasTail(alias: string | undefined): string | undefined {
   return slash === -1 ? alias : alias.slice(slash + 1)
 }
 
+/** Tools whose result names one or more subagents — same set as the adapter. */
+const KIMI_SUBAGENT_TOOLS: ReadonlySet<string> = new Set(['Agent', 'AgentSwarm'])
+
+function field<K extends string>(key: K, value: string | null | undefined): { [P in K]: string } | Record<string, never> {
+  const text = nonempty(value)
+  return text === undefined ? {} : { [key]: text } as { [P in K]: string }
+}
+
+function noteKimiAgent(state: MetaState, id: string, patch: {
+  description?: string
+  agentType?: string
+  model?: string
+  toolUseId?: string
+}): void {
+  const prev = state.agents.get(id)
+  const description = nonempty(patch.description) ?? prev?.description
+  const agentType = nonempty(patch.agentType) ?? prev?.agentType
+  const model = nonempty(patch.model) ?? prev?.model
+  const toolUseId = nonempty(patch.toolUseId) ?? prev?.toolUseId
+  state.agents.set(id, {
+    agentId: id,
+    ...(toolUseId === undefined ? {} : { toolUseId }),
+    ...(description === undefined ? {} : { description }),
+    ...(agentType === undefined ? {} : { agentType }),
+    ...(model === undefined ? {} : { model }),
+  })
+}
+
+/** Kimi loop events nest their payload under `event`; read both levels. */
+function kimiLoopEvent(record: Record<string, unknown>): Record<string, unknown> {
+  const event = record['event']
+  return isRecord(event) ? event : record
+}
+
+function kimiToolOutput(event: Record<string, unknown>): string {
+  const result = isRecord(event['result']) ? event['result'] : undefined
+  const output = result === undefined ? event['output'] : result['output']
+  return typeof output === 'string' ? output : ''
+}
+
 /**
  * Kimi wire records are `{ type, time, agentId, ...payload }` with the payload
  * fields at the top level; `time` is epoch milliseconds.
  */
 function kimiMetaScanner(): MetaScanner {
   const state = emptyMeta()
+  // Agent/AgentSwarm calls remembered until their result names the child.
+  const pending = new Map<string, { description: string | undefined; agentType: string | undefined }>()
   return {
     state,
     push(line) {
@@ -172,6 +289,7 @@ function kimiMetaScanner(): MetaScanner {
           const environment = record['environmentDisclosure']
           if (isRecord(environment)) state.cwd ??= asString(environment['cwd']) ?? null
           state.model ??= aliasTail(asString(record['modelAlias'])) ?? null
+          state.agentType ??= asString(record['profileName']) ?? null
           break
         }
         case 'llm.request':
@@ -188,6 +306,54 @@ function kimiMetaScanner(): MetaScanner {
           if (text.trim() === '') break
           state.promptCount += 1
           if (state.title === null) state.title = titleFrom(text)
+          break
+        }
+        case 'task.started': {
+          const info = isRecord(record['info']) ? record['info'] : undefined
+          if (info === undefined || asString(info['kind']) !== 'agent') break
+          const agentId = asString(info['agentId'])
+          if (agentId === undefined) break
+          noteKimiAgent(state, agentId, {
+            ...field('description', asString(info['description'])),
+            ...field('agentType', asString(info['subagentType'])),
+            ...field('model', aliasTail(asString(info['model']))),
+            ...field('toolUseId', asString(info['parentToolCallId'])),
+          })
+          break
+        }
+        case 'context.append_loop_event': {
+          const event = kimiLoopEvent(record)
+          const kind = asString(event['type'])
+          if (kind === 'tool.call') {
+            const name = asString(event['name'])
+            const callId = asString(event['toolCallId'])
+            if (callId === undefined || name === undefined || !KIMI_SUBAGENT_TOOLS.has(name)) break
+            const args = isRecord(event['args']) ? event['args'] : undefined
+            const description = nonempty(asString(args?.['description']))
+              ?? nonempty(asString(args?.['prompt'])?.slice(0, 80))
+            pending.set(callId, {
+              description,
+              agentType: nonempty(asString(args?.['subagent_type'])),
+            })
+            break
+          }
+          if (kind !== 'tool.result') break
+          const callId = asString(event['toolCallId'])
+          if (callId === undefined) break
+          const fallback = pending.get(callId)
+          pending.delete(callId)
+          // Only Agent/AgentSwarm results name children; other outputs can
+          // quote the same `agent_id:` shape (TaskOutput's task dump does).
+          if (fallback === undefined) break
+          const output = kimiToolOutput(event)
+          if (output === '') break
+          for (const mention of agentMentions(output)) {
+            noteKimiAgent(state, mention.agentId, {
+              ...field('description', nonempty(mention.description) ?? fallback?.description),
+              ...field('agentType', nonempty(mention.agentType) ?? fallback?.agentType),
+              ...field('toolUseId', callId),
+            })
+          }
           break
         }
         default:

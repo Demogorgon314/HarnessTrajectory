@@ -112,6 +112,29 @@ describe('subagentRows titles', () => {
   test('an unbound run falls back to the short agent id', () => {
     expect(subagentRows([run('agent-12')], [])[0]?.title).toBe('12')
   })
+
+  test('a child file without a run uses sidecar description, not the directory id', () => {
+    const rows = subagentRows(
+      [],
+      [{
+        file: {
+          id: 'agent-1', role: 'child', path: '/x/wire.jsonl',
+          agent: { agentId: 'agent-1', description: 'Survey the repo', agentType: 'explore' },
+        },
+        updatedAt: 200, bytes: 10,
+      }],
+    )
+    expect(rows[0]).toMatchObject({ title: 'Survey the repo', agentType: 'explore', fileId: 'agent-1' })
+  })
+
+  test('the open child falls back to its own transcript title', () => {
+    const rows = subagentRows(
+      [],
+      [{ file: { id: 'agent-1', role: 'child', path: '/x/wire.jsonl' }, updatedAt: 200, bytes: 10 }],
+      { fileId: 'agent-1', title: 'Survey the repo structure' },
+    )
+    expect(rows[0]?.title).toBe('Survey the repo structure')
+  })
 })
 
 describe('SessionPane subagent view title', () => {

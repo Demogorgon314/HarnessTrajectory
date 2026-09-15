@@ -13,7 +13,9 @@ import {
   type AgentFileMeta, type HarnessKind, type SessionChildSummary, type SessionDetail, type SessionFileRef,
   type SessionLiveEvent, type SessionSummary,
 } from '@harness-trajectory/core'
-import { createMetaScanner, readHead, type MetaScanner } from './meta.ts'
+import {
+  agentMetaEqual, createMetaScanner, listingScannerFor, mergeChildAgent, readHead, type MetaScanner,
+} from './meta.ts'
 import type { HarnessRoot } from './roots.ts'
 import type { SearchIndexer } from './search/indexer.ts'
 import type { SearchFileKey } from './search/store.ts'
@@ -459,7 +461,7 @@ export class SessionIndex extends EventEmitter {
       consumePending: undefined,
       searchFrom: 0,
       searchSkipped: false,
-      meta: role === 'main' ? createMetaScanner(root.kind, grokSummary) : null,
+      meta: listingScannerFor(root.kind, role, agent, grokSummary),
       ...(root.kind === 'grok' ? { summaryTitle: grokSummaryTitle(grokSummary) } : {}),
       ...(grokUnresolved && role === 'main' ? { grokUnresolved: true } : {}),
     }
@@ -760,7 +762,11 @@ export class SessionIndex extends EventEmitter {
       entry.lines = 0
       entry.searchFrom = 0
       this.search?.reset(entry.path)
-      entry.meta = entry.ref.role === 'main'
+      // Recreate the listing scanner only if this file already had one. A
+      // sidecar-less child is later stamped onto `ref.agent`; consulting that
+      // after the first consume would skip the rescan.
+      const hadListing = entry.meta !== null
+      entry.meta = hadListing
         // Grok's listing facts come from `summary.json`, not from the lines.
         ? createMetaScanner(entry.kind, entry.kind === 'grok'
           ? await readJsonRecord(join(dirname(entry.path), 'summary.json'))
@@ -782,6 +788,7 @@ export class SessionIndex extends EventEmitter {
     const startLine = entry.lines
     this.index(entry, result.lines)
     if (result.lines.length === 0 || session === undefined) return
+    this.applyChildListing(session)
     if (!initial) {
       this.emitTo(session, { type: 'lines', file: entry.ref, lines: result.lines, startLine })
       this.emitTo(session, { type: 'meta', summary: this.summarize(session), children: this.childSummaries(session) })
@@ -829,6 +836,26 @@ export class SessionIndex extends EventEmitter {
     const set = this.subscribers.get(sessionKey(session.kind, session.id))
     if (set === undefined) return
     for (const subscriber of set) subscriber(event)
+  }
+
+  /**
+   * Stamp each child `ref.agent` from listing facts: the parent scanner's
+   * spawn map, else the child's own title/type/model, else an existing sidecar.
+   * Sidecar harnesses no-op (parent map empty, child unscanned, sidecar already
+   * on the ref). A harness that only names children in JSONL fills the gaps.
+   * Only the main wire's spawn map is consulted: a nested spawn's facts sit in
+   * the intermediate child's own map, so a grandchild falls back to its own
+   * transcript title.
+   */
+  private applyChildListing(session: SessionRecord): void {
+    if (session.children.size === 0) return
+    const fromParent = session.main?.meta?.state.agents
+    for (const [id, child] of session.children) {
+      const next = mergeChildAgent(id, fromParent?.get(id), child.meta?.state, child.ref.agent)
+      if (next === undefined || agentMetaEqual(child.ref.agent, next)) continue
+      child.ref = { ...child.ref, agent: next }
+      this.emitTo(session, { type: 'file', file: child.ref })
+    }
   }
 
   private childSummaries(session: SessionRecord): SessionChildSummary[] {

@@ -41,7 +41,15 @@
  * `<subagent agent_id="…" item="…" outcome="…">` element per swarm item
  * (`agentMentions`). A foreground result arrives AFTER the child's whole
  * transcript, so an unbound child's loop events are buffered per run and
- * replayed into sub-calls when the result finally binds it.
+ * replayed into sub-calls when the result finally binds it. There is no
+ * sidecar: the listing title is the parent Agent call's `description` (else
+ * the child's delegated prompt). After a run reaches a terminal status its
+ * wire can still grow: the AGENTS.md reminder service lives in the agent's
+ * scope, which outlives `turn.ended`, and `notify()` appends
+ * `agents_md_change` to context memory immediately, with no turn gate. Those
+ * late records fold as context but do not count as activity on the parent's
+ * run — and an `Agent(resume=…)` reusing the same wire and agentId does not
+ * reopen the run either (runs are keyed by agentId, one per wire).
  *
  * Images travel as `{ type: 'image_url', imageUrl: { url } }` parts — in user
  * messages and in `tool.result.output` ARRAYS (ReadMediaFile). The url is an
@@ -895,7 +903,8 @@ class KimiParser implements SessionParser {
     run.callId ??= asString(info['parentToolCallId']) ?? null
     run.description ??= asString(info['description']) ?? null
     run.agentType ??= asString(info['subagentType']) ?? null
-    run.model ??= asString(info['model']) ?? null
+    const taskModel = asString(info['model'])
+    run.model ??= taskModel === undefined ? null : modelOfAlias(taskModel)
     run.startedAt = parseTime(info['startedAt']) ?? run.startedAt ?? time
     if (run.status === 'launching') run.status = 'running'
     if (run.taskId !== null) this.runByTask.set(run.taskId, agentId)
@@ -985,8 +994,11 @@ class KimiParser implements SessionParser {
     time: number,
   ): void {
     const run = this.runFor(file.id, time)
-    run.lastTime = run.lastTime === null ? time : Math.max(run.lastTime, time)
-    if (run.status === 'launching') run.status = 'running'
+    const terminal = run.status === 'completed' || run.status === 'failed' || run.status === 'stopped'
+    if (!terminal) {
+      run.lastTime = run.lastTime === null ? time : Math.max(run.lastTime, time)
+      if (run.status === 'launching') run.status = 'running'
+    }
     if (type !== 'context.append_loop_event') return
     const event = loopEvent(record)
     if (asString(event['type']) === 'tool.call') run.toolCalls += 1

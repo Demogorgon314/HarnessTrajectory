@@ -370,6 +370,24 @@ describe('kimi synthesizer', () => {
     expect(synth.meta().label).toBe('hello there')
   })
 
+  it('emits injections that arrive after turn.ended, matching kimi-code context memory', () => {
+    const { events } = run([
+      profileBind(0),
+      line(1, 'turn.prompt', { promptId: 'p1', input: [], origin: { kind: 'user' } }),
+      appendMessage(2, 'hello there', { kind: 'user' }),
+      line(3, 'turn.ended', { durationMs: 1000, reason: 'completed', turnId: 0 }),
+      appendMessage(4, '<system-reminder>AGENTS.md changed</system-reminder>', {
+        kind: 'injection', variant: 'agents_md_change',
+      }),
+      appendMessage(5, '<system-reminder>AGENTS.md changed</system-reminder>', {
+        kind: 'injection', variant: 'agents_md_change',
+      }),
+    ])
+    expect(allOf(events, 'user/message').map(m => sourceOf(m)['kind'])).toEqual([
+      'user', 'agents_md_change', 'agents_md_change',
+    ])
+  })
+
   it('derives file ops from the call arguments of each file tool', () => {
     const call = (s: number, id: string, name: string, args: Rec): string[] => [
       toolCall(s, id, name, args),

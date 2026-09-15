@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { GROK_SIDECAR_METHOD, type SessionLiveEvent } from '@harness-trajectory/core'
 import { SessionIndex, classifyPath, lineTime, lineTimes, mergeChronologically, scopeToFile } from '../src/index.ts'
-import { createMetaScanner } from '../src/meta.ts'
+import { createMetaScanner, emptyMeta, listingScannerFor, mergeChildAgent } from '../src/meta.ts'
 import { defaultRoots } from '../src/roots.ts'
 
 function jsonl(records: readonly unknown[]): string {
@@ -308,6 +308,99 @@ describe('meta scanners', () => {
     expect(scanner.state).toMatchObject({ title: null, promptCount: 0 })
   })
 
+  it('discovers Kimi subagent listing facts from task.started and from an Agent result', () => {
+    const started = createMetaScanner('kimi')
+    started.push(JSON.stringify(kimi('task.started', 40, {
+      info: {
+        kind: 'agent', agentId: 'agent-0', parentToolCallId: 'call-bg',
+        description: 'Fix the bug', subagentType: 'coder', model: 'kimi-code/k3',
+      },
+    })))
+    expect(started.state.agents.get('agent-0')).toEqual({
+      agentId: 'agent-0', description: 'Fix the bug', agentType: 'coder', model: 'k3', toolUseId: 'call-bg',
+    })
+
+    const foreground = createMetaScanner('kimi')
+    for (const line of jsonl([
+      kimi('context.append_loop_event', 50, {
+        event: {
+          type: 'tool.call', toolCallId: 'call-fg', name: 'Agent',
+          args: { description: 'Survey the repo', subagent_type: 'explore', prompt: 'look around' },
+        },
+      }),
+      kimi('context.append_loop_event', 80, {
+        event: {
+          type: 'tool.result', toolCallId: 'call-fg',
+          result: { output: 'agent_id: agent-1\nactual_subagent_type: explore\nstatus: completed\n\nDone.' },
+        },
+      }),
+    ]).split('\n').filter(line => line !== '')) {
+      foreground.push(line)
+    }
+    expect(foreground.state.agents.get('agent-1')).toEqual({
+      agentId: 'agent-1', description: 'Survey the repo', agentType: 'explore', toolUseId: 'call-fg',
+    })
+  })
+
+  it('ignores an agent_id header quoted by a result that is not an Agent call', () => {
+    // TaskOutput's task dump carries a bare `agent_id:` line; it must not stamp
+    // the child with the polling call's id.
+    const scanner = createMetaScanner('kimi')
+    for (const line of jsonl([
+      kimi('context.append_loop_event', 50, {
+        event: {
+          type: 'tool.call', toolCallId: 'call-poll', name: 'TaskOutput',
+          args: { task_id: 'agent-2prrfelx' },
+        },
+      }),
+      kimi('context.append_loop_event', 60, {
+        event: {
+          type: 'tool.result', toolCallId: 'call-poll',
+          result: {
+            output: 'retrieval_status: not_ready\ntask_id: agent-2prrfelx\nstatus: running\nagent_id: agent-7\nsubagent_type: explore',
+          },
+        },
+      }),
+    ]).split('\n').filter(line => line !== '')) {
+      scanner.push(line)
+    }
+    expect(scanner.state.agents.size).toBe(0)
+  })
+
+  it('scans a child transcript only when registration attached no sidecar', () => {
+    expect(listingScannerFor('kimi', 'child', undefined)).not.toBeNull()
+    expect(listingScannerFor('codex', 'child', undefined)).not.toBeNull()
+    expect(listingScannerFor('claude', 'child', { agentId: 'agent-0' })).toBeNull()
+    expect(listingScannerFor('grok', 'child', { agentId: 'child', description: 'helper' })).toBeNull()
+    expect(listingScannerFor('claude', 'main', { agentId: 'agent-0' })).not.toBeNull()
+  })
+
+  it('merges parent spawn facts over the child listing title, filling type from the child', () => {
+    const own = emptyMeta()
+    own.title = 'look around thoroughly'
+    own.agentType = 'explore'
+    own.model = 'k3'
+    expect(mergeChildAgent(
+      'sub-1',
+      { agentId: 'sub-1', description: 'Survey the repo', toolUseId: 'call-fg' },
+      own,
+      undefined,
+    )).toEqual({
+      agentId: 'sub-1',
+      description: 'Survey the repo',
+      agentType: 'explore',
+      model: 'k3',
+      toolUseId: 'call-fg',
+    })
+    expect(mergeChildAgent('sub-1', undefined, own, undefined)).toEqual({
+      agentId: 'sub-1', description: 'look around thoroughly', agentType: 'explore', model: 'k3',
+    })
+    expect(mergeChildAgent('sub-1', undefined, undefined, { agentId: 'sub-1', description: 'sidecar' }))
+      .toEqual({ agentId: 'sub-1', description: 'sidecar' })
+    const sidecar = { agentId: 'a1', description: 'Find things', agentType: 'Explore', model: 'sonnet' }
+    expect(mergeChildAgent('main-1/agent-a1', undefined, emptyMeta(), sidecar)).toBe(sidecar)
+  })
+
   it('counts only genuine human Grok chunks, never hostTurn relays or the session preamble', () => {
     // No path, so no `summary.json`: the scanner falls back to what the stream carries.
     const scanner = createMetaScanner('grok')
@@ -443,7 +536,10 @@ describe('SessionIndex', () => {
       model: 'k3', startedAt: T0, childCount: 1, promptCount: 1,
     })
     expect(session?.files.map(file => `${file.role}:${file.id}`)).toEqual(['main:session_k1', 'child:sub-1'])
-    expect(session?.files[1]).toMatchObject({ parentId: 'session_k1' })
+    expect(session?.files[1]).toMatchObject({
+      parentId: 'session_k1',
+      agent: { agentId: 'sub-1', agentType: 'explore', model: 'k3' },
+    })
     // The subagent transcript is not a session of its own, and side stores are skipped.
     expect(index.get('kimi', 'sub-1')).toBeUndefined()
     expect(index.hasChild('kimi', 'session_k1', 'sub-1')).toBe(true)
@@ -455,6 +551,50 @@ describe('SessionIndex', () => {
     await appendFile(mainPath, jsonl([kimiUser('One more thing', 5000)]))
     await index.refreshPath(mainPath)
     expect(index.get('kimi', 'session_k1')).toMatchObject({ title: 'Renamed by the user', promptCount: 2 })
+  })
+
+  it('stamps a Kimi child with the parent Agent description so the subagent view has a title', async () => {
+    const sessionDir = join(dir, 'kimi', 'wd_project_ab12cd34ef56', 'session_k1')
+    const mainPath = join(sessionDir, 'agents', 'main', 'wire.jsonl')
+    const childPath = join(sessionDir, 'agents', 'sub-1', 'wire.jsonl')
+    await appendFile(mainPath, jsonl([
+      kimi('context.append_loop_event', 50, {
+        event: {
+          type: 'tool.call', toolCallId: 'call-agent', name: 'Agent',
+          args: { description: 'Survey the repo', subagent_type: 'explore', prompt: 'look around' },
+        },
+      }),
+      kimi('context.append_loop_event', 80, {
+        event: {
+          type: 'tool.result', toolCallId: 'call-agent',
+          result: { output: 'agent_id: sub-1\nactual_subagent_type: explore\nstatus: completed\n\nDone.' },
+        },
+      }),
+    ]))
+    await appendFile(childPath, jsonl([
+      kimi('context.append_message', 60, {
+        message: {
+          role: 'user',
+          content: [{
+            type: 'text',
+            text: '<git-context>\nWorking directory: /work\n</git-context>\n\nlook around thoroughly',
+          }],
+          toolCalls: [],
+          origin: { kind: 'system_trigger', name: 'subagent' },
+        },
+      }, 'sub-1'),
+    ]))
+    await index.refreshPath(mainPath)
+    await index.refreshPath(childPath)
+    expect(index.get('kimi', 'session_k1')?.files[1]).toMatchObject({
+      id: 'sub-1',
+      agent: {
+        agentId: 'sub-1',
+        description: 'Survey the repo',
+        agentType: 'explore',
+        toolUseId: 'call-agent',
+      },
+    })
   })
 
   it('falls back to the first human prompt when state.json has no usable title', async () => {
