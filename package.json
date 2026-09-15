@@ -10,6 +10,7 @@
     "dev": "pnpm -r --parallel --filter \"./apps/*\" dev",
     "build": "pnpm -r build && node scripts/bundle-web.mjs",
     "start": "node apps/server/dist/main.js",
+    "pack:cli": "pnpm build && pnpm --filter @demogorgon314/harness-trajectory pack",
     "typecheck": "pnpm -r typecheck",
     "test": "vitest run",
     "test:watch": "vitest"

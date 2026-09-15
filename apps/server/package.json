@@ -1,25 +1,44 @@
 {
-  "name": "@harness-trajectory/server",
+  "name": "@demogorgon314/harness-trajectory",
   "version": "0.1.0",
-  "private": true,
-  "description": "Local server that scans Claude Code, Codex, Kimi Code and Grok Build transcripts and streams them to the trajectory web UI",
+  "description": "Local viewer for Claude Code, Codex, Kimi Code and Grok Build session transcripts",
   "type": "module",
+  "license": "MIT",
   "bin": {
     "harness-trajectory": "./dist/main.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22.13"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Demogorgon314/harness-trajectory.git",
+    "directory": "apps/server"
+  },
+  "homepage": "https://github.com/Demogorgon314/harness-trajectory",
+  "bugs": {
+    "url": "https://github.com/Demogorgon314/harness-trajectory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "dev": "tsx watch src/main.ts",
     "build": "tsdown",
     "start": "node dist/main.js",
+    "prepack": "node ../../scripts/prepack-cli.mjs",
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run --project server"
   },
   "dependencies": {
-    "@harness-trajectory/core": "workspace:*",
     "@hono/node-server": "^1.14.0",
     "hono": "^4.7.0"
   },
   "devDependencies": {
+    "@harness-trajectory/core": "workspace:*",
     "@types/node": "^24.0.0",
     "tsdown": "^0.15.0",
     "tsx": "^4.19.0",

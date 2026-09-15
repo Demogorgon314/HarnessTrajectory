@@ -36,8 +36,15 @@ both ported to run on top of plain transcript files instead of a runtime.
 
 ## Quick start
 
-Requires Node 22.13+ and pnpm 12. (22.13 is where `node:sqlite`, which backs the search
-index, stopped needing a flag. There is no native dependency to build.)
+Requires Node 22.13+. (22.13 is where `node:sqlite`, which backs the search index,
+stopped needing a flag. There is no native dependency to build.)
+
+```sh
+npx @demogorgon314/harness-trajectory@latest
+```
+
+That starts the API and the built UI together at `http://127.0.0.1:5170`. From a
+checkout, with pnpm 12:
 
 ```sh
 pnpm install

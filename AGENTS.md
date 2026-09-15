@@ -14,6 +14,7 @@ pnpm test         # vitest, all projects (core, ui, context, context-ui, server,
 pnpm vitest run --project core   # one project
 pnpm typecheck    # tsc in every package; must be clean before you finish
 pnpm build && pnpm start         # production bundle served by the server
+pnpm pack:cli                    # npm tarball for `npx @demogorgon314/harness-trajectory`
 ```
 
 Node ≥ 22, pnpm 12. No linter is configured; `tsc` strictness is the lint.
