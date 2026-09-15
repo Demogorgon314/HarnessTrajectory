@@ -39,9 +39,9 @@ CODEX_HOME / KIMI_CODE_HOME / GROK_HOME) are honoured; override a root directly 
 HARNESS_TRAJECTORY_CLAUDE_ROOT / HARNESS_TRAJECTORY_CODEX_ROOT /
 HARNESS_TRAJECTORY_KIMI_ROOT / HARNESS_TRAJECTORY_GROK_ROOT.
 
-Transcripts are also indexed for full-text search into one SQLite file under
-HARNESS_TRAJECTORY_CACHE_DIR (default $XDG_CACHE_HOME/harness-trajectory, else
-~/.cache/harness-trajectory). Set HARNESS_TRAJECTORY_SEARCH=0 to switch it off.
+Full-text search is off by default. Set HARNESS_TRAJECTORY_SEARCH=1 to index
+transcripts into one SQLite file under HARNESS_TRAJECTORY_CACHE_DIR (default
+$XDG_CACHE_HOME/harness-trajectory, else ~/.cache/harness-trajectory).
 Harness roots are never written to.`)
     return
   }
@@ -74,7 +74,7 @@ Harness roots are never written to.`)
   })
   for (const root of roots) console.log(`  ${root.kind}: ${root.dir}`)
   if (search === undefined) {
-    console.log('[harness-trajectory] search disabled (HARNESS_TRAJECTORY_SEARCH=0)')
+    console.log('[harness-trajectory] search disabled (set HARNESS_TRAJECTORY_SEARCH=1 to enable)')
   } else {
     console.log(`[harness-trajectory] search index ${dbPath} (building in the background)`)
   }

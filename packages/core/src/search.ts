@@ -48,7 +48,7 @@ export interface SearchSessionGroup {
 }
 
 export interface SearchResponse {
-  /** False when indexing is switched off (`HARNESS_TRAJECTORY_SEARCH=0`). */
+  /** False when indexing is off (the default, unless `HARNESS_TRAJECTORY_SEARCH=1`). */
   enabled: boolean
   query: string
   /** Shortest query the index can answer; a shorter one returns no groups. */

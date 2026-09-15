@@ -33,12 +33,12 @@ describe('cache paths', () => {
     expect(searchDbPath({ XDG_CACHE_HOME: '/xdg' })).toBe(join('/xdg', 'harness-trajectory', 'search.sqlite'))
   })
 
-  it('switches indexing off only for the documented values', () => {
-    expect(searchEnabled({})).toBe(true)
-    expect(searchEnabled({ HARNESS_TRAJECTORY_SEARCH: '1' })).toBe(true)
+  it('indexes only when explicitly switched on', () => {
+    expect(searchEnabled({})).toBe(false)
     expect(searchEnabled({ HARNESS_TRAJECTORY_SEARCH: '0' })).toBe(false)
-    expect(searchEnabled({ HARNESS_TRAJECTORY_SEARCH: 'false' })).toBe(false)
-    expect(searchEnabled({ HARNESS_TRAJECTORY_SEARCH: 'off' })).toBe(false)
+    expect(searchEnabled({ HARNESS_TRAJECTORY_SEARCH: '1' })).toBe(true)
+    expect(searchEnabled({ HARNESS_TRAJECTORY_SEARCH: 'true' })).toBe(true)
+    expect(searchEnabled({ HARNESS_TRAJECTORY_SEARCH: 'on' })).toBe(true)
   })
 })
 

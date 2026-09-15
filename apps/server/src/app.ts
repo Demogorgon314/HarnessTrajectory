@@ -34,7 +34,7 @@ export interface AppOptions {
   index: SessionIndex
   /** Directory holding the built web UI; omitted or missing disables static serving. */
   staticDir?: string | undefined
-  /** Full-text index; omitted (or `HARNESS_TRAJECTORY_SEARCH=0`) disables `/api/search`. */
+  /** Full-text index; omitted (search is off by default) disables `/api/search`. */
   search?: SearchService | undefined
 }
 

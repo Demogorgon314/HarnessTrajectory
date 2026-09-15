@@ -89,7 +89,7 @@ export interface SessionIndexOptions {
   now?: () => number
   /**
    * Full-text index fed from the same byte stream the meta scanner reads.
-   * Omitted (tests, `HARNESS_TRAJECTORY_SEARCH=0`) means nothing is indexed.
+   * Omitted (tests, or search left at its off-by-default) means nothing is indexed.
    */
   search?: SearchIndexer
 }

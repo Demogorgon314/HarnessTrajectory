@@ -23,8 +23,8 @@ export function searchDbPath(env: NodeJS.ProcessEnv = process.env): string {
   return join(cacheDir(env), 'search.sqlite')
 }
 
-/** Whether transcripts are indexed at all; `HARNESS_TRAJECTORY_SEARCH=0` turns it off. */
+/** Whether transcripts are indexed; off unless `HARNESS_TRAJECTORY_SEARCH` is `1`/`true`/`on`. */
 export function searchEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const value = env['HARNESS_TRAJECTORY_SEARCH']
-  return value !== '0' && value !== 'false' && value !== 'off'
+  return value === '1' || value === 'true' || value === 'on'
 }

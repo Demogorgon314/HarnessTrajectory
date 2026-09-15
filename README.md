@@ -43,10 +43,10 @@ stopped needing a flag. There is no native dependency to build.)
 npx @demogorgon314/harness-trajectory@latest
 ```
 
-Skip the search index (faster first start, no `search.sqlite`):
+Full-text search is off by default. To index transcripts:
 
 ```sh
-HARNESS_TRAJECTORY_SEARCH=0 npx @demogorgon314/harness-trajectory@latest
+HARNESS_TRAJECTORY_SEARCH=1 npx @demogorgon314/harness-trajectory@latest
 ```
 
 That starts the API and the built UI together at `http://127.0.0.1:5170`. From a
@@ -79,7 +79,7 @@ environment variable; the server also accepts `--port`, `--host`, and `--static`
 | `GROK_HOME` | `~/.grok` | Grok Build home (`<home>/sessions`) |
 | `HARNESS_TRAJECTORY_{CLAUDE,CODEX,KIMI,GROK}_ROOT` | derived | Point one harness at an arbitrary directory |
 | `HARNESS_TRAJECTORY_CACHE_DIR` | `$XDG_CACHE_HOME/harness-trajectory`, else `~/.cache/harness-trajectory` | Holds `search.sqlite`, the only file the server writes |
-| `HARNESS_TRAJECTORY_SEARCH` | `1` | `0`, `false`, or `off` disables indexing; `/api/search` then answers `{ "enabled": false }` |
+| `HARNESS_TRAJECTORY_SEARCH` | off | `1`, `true`, or `on` enables indexing into `search.sqlite`; otherwise `/api/search` answers `{ "enabled": false }` |
 
 Transcript roots are only ever read. The search index is a cache: delete
 `search.sqlite` and the next start rebuilds it.
@@ -130,9 +130,9 @@ Tests use hand-written synthetic records only. Never commit real transcript cont
 - **Per-call tokens.** Grok Build reports usage per turn; the per-call split is an estimate
   weighted by each call's own total. Codex compaction summaries are encrypted in the rollout.
 - **Large sessions** load fully into the browser. A 60 MB rollout takes a few seconds.
-- **The search index is big.** The server writes one `search.sqlite` under the cache
-  directory; the first build runs in the background after listen. Delete the file to
-  reclaim the space, or set `HARNESS_TRAJECTORY_SEARCH=0`.
+- **The search index is big.** Off by default. With `HARNESS_TRAJECTORY_SEARCH=1` the
+  server writes one `search.sqlite` under the cache directory (first build runs in the
+  background). Delete the file to reclaim the space.
 - **Search granularity.** Queries shorter than three characters return nothing: the trigram
   tokenizer cannot index them. Each record is indexed up to 16 KB, so a match past that
   point in a very large tool output is not found. Compaction summaries, system reminders,
