@@ -11,6 +11,7 @@ import { SessionIndex } from './index.ts'
 import { defaultRoots } from './roots.ts'
 import { browserUrl, openBrowser, shouldOpenBrowser } from './open-browser.ts'
 import { createSearchService, type SearchService } from './search/index.ts'
+import { SettingsController, readSettings, settingsPath } from './settings.ts'
 
 function argValue(flag: string): string | undefined {
   const index = process.argv.indexOf(flag)
@@ -46,7 +47,8 @@ HARNESS_TRAJECTORY_NO_OPEN=1) to skip. An SSH session never opens a browser.
 Full-text search is off by default. Set HARNESS_TRAJECTORY_SEARCH=1 to index
 transcripts into one SQLite file under HARNESS_TRAJECTORY_CACHE_DIR (default
 $XDG_CACHE_HOME/harness-trajectory, else ~/.cache/harness-trajectory).
-Harness roots are never written to.`)
+Harness roots are never written to. Server settings (search retention days,
+default 90) live in settings.json there and are editable in the UI.`)
     return
   }
   const port = Number(argValue('--port') ?? process.env['HARNESS_TRAJECTORY_PORT'] ?? 5170)
@@ -57,19 +59,22 @@ Harness roots are never written to.`)
   // would hide real ones.
   let search: SearchService | undefined
   const dbPath = searchDbPath()
+  const settingsFile = settingsPath()
+  const startupSettings = readSettings(settingsFile)
   if (searchEnabled()) {
     try {
-      search = createSearchService({ path: dbPath })
+      search = createSearchService({ path: dbPath, maxAgeDays: startupSettings.searchMaxAgeDays })
     } catch (error) {
       console.error('[harness-trajectory] search index unavailable:', error)
     }
   }
+  const settings = new SettingsController(settingsFile, search?.indexer)
   const index = new SessionIndex({ roots, ...(search === undefined ? {} : { search: search.indexer }) })
   index.on('error', (error: unknown) => {
     console.error('[harness-trajectory] watcher error:', error)
   })
   const staticDir = findStaticDir()
-  const app = createApp({ index, staticDir, search })
+  const app = createApp({ index, staticDir, search, settings })
   const open = shouldOpenBrowser()
   serve({ fetch: app.fetch, port, hostname }, (info) => {
     const url = browserUrl(info.address, info.port)
@@ -89,7 +94,9 @@ Harness roots are never written to.`)
   if (search === undefined) {
     console.log('[harness-trajectory] search disabled (set HARNESS_TRAJECTORY_SEARCH=1 to enable)')
   } else {
-    console.log(`[harness-trajectory] search index ${dbPath} (building in the background)`)
+    const days = startupSettings.searchMaxAgeDays
+    const retention = days === 0 ? 'no retention limit' : `retention ${days}d`
+    console.log(`[harness-trajectory] search index ${dbPath} (${retention}, building in the background)`)
   }
   const started = Date.now()
   let lastProgress = ''

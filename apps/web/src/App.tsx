@@ -10,6 +10,7 @@ import { HarnessFilter } from './HarnessFilter.tsx'
 import { SessionList } from './SessionList.tsx'
 import { SessionPane } from './SessionPane.tsx'
 import { IndexProgress, SessionSearch } from './SessionSearch.tsx'
+import { SettingsDialog } from './SettingsDialog.tsx'
 import {
   SIDEBAR_AUTO_COLLAPSE, SIDEBAR_COLLAPSED, clampSidebarWidth, setSidebarCollapsed, setSidebarWidth,
   sidebarStore, toggleGroupFold,
@@ -17,7 +18,7 @@ import {
 import { themeStore, type ThemePreference } from './theme.ts'
 import css from './app.module.css'
 
-const { IconPanelLeftOutline16 } = icons
+const { IconPanelLeftOutline16, IconSettingsOutline16 } = icons
 
 const LIST_REFRESH_MS = 5_000
 /** Wide content stays mounted this long after a collapse so it can fade out. */
@@ -170,6 +171,7 @@ export function App() {
   const [kinds, setKinds] = useState<ReadonlySet<HarnessKind>>(EMPTY_KINDS)
   const [query, setQuery] = useState('')
   const [locale, setLocale] = useState<TrajectoryLocale>(defaultLocale)
+  const [settingsOpen, setSettingsOpen] = useState(false)
   const t = useMemo(() => createTrajectoryTranslate(locale), [locale])
   const durationStore = useMemo(() => createTrajectoryDurationStore(), [])
   const theme = useSnapshotSelector(themeStore, value => value)
@@ -318,6 +320,18 @@ export function App() {
               {locale === 'en' ? 'EN' : '中'}
             </button>
           </Tooltip>
+          <Tooltip label="Settings" delayMs={500}>
+            <button
+              type="button"
+              className={css.iconButton}
+              aria-label="Settings"
+              aria-haspopup="dialog"
+              aria-expanded={settingsOpen}
+              onClick={() => { setSettingsOpen(true) }}
+            >
+              <IconSettingsOutline16 size={16} />
+            </button>
+          </Tooltip>
           {!wide && <HarnessFilter selected={kinds} onChange={setKinds} counts={counts} compact />}
         </div>
         {wide && (
@@ -373,6 +387,7 @@ export function App() {
       {!collapsed && (
         <DragHandle left={sidebarWidth} onStart={onDragStart} onDrag={onDrag} onEnd={onDragEnd} />
       )}
+      <SettingsDialog open={settingsOpen} onClose={() => { setSettingsOpen(false) }} />
     </div>
   )
 }

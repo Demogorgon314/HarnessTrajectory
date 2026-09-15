@@ -1,4 +1,4 @@
-import { appendFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -198,6 +198,53 @@ describe('SearchIndexer with SessionIndex', () => {
       sessionId: 'main-1', fileId: 'main-1',
     })
   })
+
+  it('keeps a transcript older than the retention window browsable but unindexed', async () => {
+    const path = join(dir, 'claude', '-slug', 'main-1.jsonl')
+    await writeFile(path, jsonl([claudeUser('Ancient prompt from long ago', 'main-1', 0)]))
+    const aged = new Date(Date.now() - 120 * 86_400_000)
+    await utimes(path, aged, aged)
+    indexer = new SearchIndexer({ store, flushDelayMs: 5, maxAgeDays: 90 })
+    const live = await start()
+
+    expect(search(store, { q: 'Ancient prompt' }).totalHits).toBe(0)
+    // No `files` row either: the file is not live for the index at all.
+    expect(store.fileState(path)).toBeUndefined()
+    // The session itself is still listed and openable.
+    expect(live.list().map(session => session.id)).toContain('main-1')
+  })
+
+  it('purges rows of a file that aged out since the last run', async () => {
+    const path = join(dir, 'claude', '-slug', 'main-1.jsonl')
+    await writeFile(path, jsonl([claudeUser('Once young, now ancient', 'main-1', 0)]))
+    indexer = new SearchIndexer({ store, flushDelayMs: 5, maxAgeDays: 90 })
+    await start()
+    expect(search(store, { q: 'Once young' }).totalHits).toBe(1)
+
+    // The file falls out of the window before the next start; its rows go too.
+    const aged = new Date(Date.now() - 120 * 86_400_000)
+    await utimes(path, aged, aged)
+    await start()
+    expect(store.fileState(path)).toBeUndefined()
+    expect(search(store, { q: 'Once young' }).totalHits).toBe(0)
+  })
+
+  it('reconsiders a skipped file on the next start once the window widens', async () => {
+    const path = join(dir, 'claude', '-slug', 'main-1.jsonl')
+    await writeFile(path, jsonl([claudeUser('Old but welcome now', 'main-1', 0)]))
+    const aged = new Date(Date.now() - 120 * 86_400_000)
+    await utimes(path, aged, aged)
+    indexer = new SearchIndexer({ store, flushDelayMs: 5, maxAgeDays: 90 })
+    await start()
+    expect(store.fileState(path)).toBeUndefined()
+
+    // Widening mid-run does not re-index what is already skipped…
+    expect(indexer.applyMaxAgeDays(365)).toBe(0)
+    expect(store.fileState(path)).toBeUndefined()
+    // …but the next start's sweep registers the file under the new window.
+    await start()
+    expect(search(store, { q: 'Old but welcome' }).totalHits).toBe(1)
+  })
 })
 
 describe('SearchIndexer', () => {
@@ -303,5 +350,108 @@ describe('SearchIndexer', () => {
     indexer.flush()
     expect(store.docCount()).toBe(1)
     indexer.stop()
+  })
+
+  it('decides indexability by the retention window, 0 meaning no limit', () => {
+    const NOW = Date.parse('2026-09-15T12:00:00.000Z')
+    const DAY = 86_400_000
+    // The default matches the settings default.
+    const indexer = new SearchIndexer({ store, now: () => NOW })
+    expect(indexer.shouldIndex({ mtimeMs: NOW - 89 * DAY })).toBe(true)
+    expect(indexer.shouldIndex({ mtimeMs: NOW - 90 * DAY })).toBe(true)
+    expect(indexer.shouldIndex({ mtimeMs: NOW - 90 * DAY - 1 })).toBe(false)
+    const everything = new SearchIndexer({ store, maxAgeDays: 0, now: () => NOW })
+    expect(everything.shouldIndex({ mtimeMs: 0 })).toBe(true)
+    indexer.stop()
+    everything.stop()
+  })
+
+  it('purges indexed rows immediately when the window narrows', () => {
+    const NOW = Date.parse('2026-09-15T12:00:00.000Z')
+    const DAY = 86_400_000
+    const indexer = new SearchIndexer({ store, maxAgeDays: 0, now: () => NOW })
+    const stale = { path: '/r/c/old.jsonl', kind: 'claude' as const, sessionId: 'old', fileId: 'old' }
+    const fresh = { path: '/r/c/new.jsonl', kind: 'claude' as const, sessionId: 'new', fileId: 'new' }
+    store.transaction(() => {
+      store.insertDocs(stale, [{ line: 0, role: 'human', text: 'a stale prompt' }])
+      store.setFileState(stale, { size: 10, mtimeMs: NOW - 120 * DAY, indexedBytes: 10, indexedLines: 1 })
+      store.insertDocs(fresh, [{ line: 0, role: 'human', text: 'a fresh prompt' }])
+      store.setFileState(fresh, { size: 10, mtimeMs: NOW - DAY, indexedBytes: 10, indexedLines: 1 })
+    })
+
+    expect(indexer.applyMaxAgeDays(90)).toBe(1)
+    expect(store.paths()).toEqual([fresh.path])
+    expect(search(store, { q: 'stale prompt' }).totalHits).toBe(0)
+    expect(search(store, { q: 'fresh prompt' }).totalHits).toBe(1)
+    // Narrowing further with nothing left to purge is a no-op.
+    expect(indexer.applyMaxAgeDays(30)).toBe(0)
+    // 0 lifts the limit and never purges.
+    expect(indexer.applyMaxAgeDays(0)).toBe(0)
+    expect(indexer.shouldIndex({ mtimeMs: 0 })).toBe(true)
+    indexer.stop()
+  })
+})
+
+describe('SessionIndex backfill sweep', () => {
+  let dir: string
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'harness-trajectory-sweep-'))
+    await mkdir(join(dir, 'claude', '-slug'), { recursive: true })
+  })
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  async function writeSession(id: string, mtimeMs: number): Promise<void> {
+    const path = join(dir, 'claude', '-slug', `${id}.jsonl`)
+    await writeFile(path, jsonl([claudeUser(`prompt of ${id}`, id, 0)]))
+    const atime = new Date(mtimeMs)
+    await utimes(path, atime, atime)
+  }
+
+  it('registers the newest transcripts first', async () => {
+    const base = Date.parse('2026-09-10T00:00:00.000Z')
+    const DAY = 86_400_000
+    await writeSession('old-one', base)
+    await writeSession('new-one', base + 4 * DAY)
+    await writeSession('mid-one', base + 2 * DAY)
+    const store = new SearchStore({ path: ':memory:' })
+    const indexer = new SearchIndexer({ store, maxAgeDays: 0 })
+    const order: string[] = []
+    const beginFile = indexer.beginFile.bind(indexer)
+    indexer.beginFile = (key, file) => {
+      order.push(key.sessionId)
+      return beginFile(key, file)
+    }
+    const index = new SessionIndex({
+      roots: [{ kind: 'claude', dir: join(dir, 'claude') }],
+      watch: false,
+      search: indexer,
+      backfillConcurrency: 1,
+    })
+    await index.start()
+    expect(order).toEqual(['new-one', 'mid-one', 'old-one'])
+    index.stop()
+    store.close()
+  })
+
+  it('registers every planned file through the concurrent pool', async () => {
+    const base = Date.parse('2026-09-10T00:00:00.000Z')
+    for (let n = 0; n < 12; n += 1) await writeSession(`s-${n}`, base + n * 60_000)
+    const store = new SearchStore({ path: ':memory:' })
+    const indexer = new SearchIndexer({ store, maxAgeDays: 0 })
+    const index = new SessionIndex({
+      roots: [{ kind: 'claude', dir: join(dir, 'claude') }],
+      watch: false,
+      search: indexer,
+    })
+    await index.start()
+    expect(index.list()).toHaveLength(12)
+    expect(indexer.stats()).toEqual({ pendingFiles: 0, ready: true, filesDone: 12, filesTotal: 12 })
+    expect(search(store, { q: 'prompt of s-7' }).totalHits).toBe(1)
+    index.stop()
+    store.close()
   })
 })

@@ -8,8 +8,9 @@
  * the user's string into the same trigram set the tokenizer would extract and
  * ANDs the terms — every true substring match is covered, plus some documents
  * where the trigrams merely coexist — then verifies the substring against the
- * stored text, counts occurrences for ranking, and cuts the snippet window
- * itself. Verification makes the result set identical to a phrase query; only
+ * document text (inflated from `docs.text`, the only copy the index keeps),
+ * counts occurrences for ranking, and cuts the snippet window itself.
+ * Verification makes the result set identical to a phrase query; only
  * very common queries change shape, when the candidate cap cuts in and
  * `truncated` plus lower-bound group counts report it.
  *
@@ -23,7 +24,7 @@ import {
   type HarnessKind, type SearchHit, type SearchIndexing, type SearchMatchRange, type SearchResponse,
   type SearchRole, type SearchSessionGroup,
 } from '@harness-trajectory/core'
-import type { SearchStore } from './store.ts'
+import { unpackText, type SearchStore } from './store.ts'
 
 /**
  * Width of the returned snippet window, in characters. What used to be a
@@ -166,16 +167,17 @@ export function buildSnippet(text: string, needle: string): { snippet: string; m
 function sql(byKind: boolean): string {
   return `
     select
-      d.kind        as kind,
-      d.session_id  as session_id,
-      d.file_id     as file_id,
+      f.kind        as kind,
+      f.session_id  as session_id,
+      f.file_id     as file_id,
       d.line        as line,
       d.role        as role,
       d.time_ms     as time_ms,
-      docs_fts.text as text
+      d.text        as blob
     from docs_fts
     join docs d on d.id = docs_fts.rowid
-    where docs_fts match ?${byKind ? ' and d.kind = ?' : ''}
+    join files f on f.id = d.file
+    where docs_fts match ?${byKind ? ' and f.kind = ?' : ''}
     order by docs_fts.rowid
     limit ?
   `
@@ -216,7 +218,14 @@ export function search(store: SearchStore, options: SearchOptions): SearchRespon
   const hits: SearchHit[] = []
   const totals = new Map<string, number>()
   for (const row of rows) {
-    const text = asText(row['text'])
+    const blob = row['blob']
+    let text: string
+    try {
+      text = blob instanceof Uint8Array ? unpackText(blob) : ''
+    } catch {
+      // A torn row (an interrupted write) is skipped, never fatal.
+      continue
+    }
     const occurrences = countOccurrences(foldCase(text), needle)
     // detail=none also matches documents where the trigrams coexist but the
     // substring does not; those drop out here.

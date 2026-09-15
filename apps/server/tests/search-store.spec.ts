@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { SEARCH_GROUP_HIT_LIMIT } from '@harness-trajectory/core'
 import { buildSnippet, search, toTrigramQuery } from '../src/search/query.ts'
-import { SEARCH_SCHEMA_VERSION, SearchStore, type SearchDoc, type SearchFileKey } from '../src/search/store.ts'
+import { SEARCH_SCHEMA_VERSION, SearchStore, packText, unpackText, type SearchDoc, type SearchFileKey } from '../src/search/store.ts'
 
 const stores: SearchStore[] = []
 const dirs: string[] = []
@@ -270,5 +270,47 @@ describe('buildSnippet', () => {
 
   it('falls back to the document head when the needle is absent', () => {
     expect(buildSnippet('nothing here', 'zzz')).toEqual({ snippet: 'nothing here', matches: [] })
+  })
+})
+
+describe('compressed text at rest', () => {
+  it('round-trips any text through the deflate blob', () => {
+    expect(unpackText(packText('原文 hello ✕ ⁄ and ❮unicode❯'))).toBe('原文 hello ✕ ⁄ and ❮unicode❯')
+    expect(unpackText(packText(''))).toBe('')
+    expect(() => unpackText(new Uint8Array([1, 2, 3, 4]))).toThrow()
+  })
+
+  it('serves snippets from the compressed copy, byte-identical to the insert', () => {
+    const store = open()
+    // 10 KB with low redundancy near the tail, so compression cannot be
+    // serving an accidental match from somewhere else.
+    const tail = 'qzv'.repeat(300)
+    const text = `${'the quick brown fox. '.repeat(300)}MARKER-${tail}-END`
+    add(store, key(), [{ line: 4, role: 'tool', text }])
+    const hit = search(store, { q: tail.slice(100, 150) }).groups[0]?.hits[0]
+    const range = hit?.matches[0]
+    expect(hit?.line).toBe(4)
+    expect(hit?.snippet.slice(range?.start, range?.end)).toBe(tail.slice(100, 150))
+  })
+
+  it('reuses one files row across batches of the same transcript', () => {
+    const store = open()
+    add(store, key(), [{ line: 0, role: 'human', text: 'first batch' }])
+    add(store, key(), [{ line: 1, role: 'human', text: 'second batch' }])
+    expect(store.fileCount()).toBe(1)
+    expect(store.docCount()).toBe(2)
+  })
+
+  it('skips a document whose stored blob is corrupt instead of failing the search', () => {
+    const store = open()
+    add(store, key(), [
+      { line: 0, role: 'human', text: 'corrupt me please' },
+      { line: 1, role: 'human', text: 'corrupt me not' },
+    ])
+    store.db.prepare(`update docs set text = ? where line = 0`).run(Buffer.from([1, 2, 3, 4]))
+    const response = search(store, { q: 'corrupt me' })
+    // The FTS index still nominates the torn row; verification skips it.
+    expect(response.totalHits).toBe(1)
+    expect(response.groups[0]?.hits[0]?.line).toBe(1)
   })
 })

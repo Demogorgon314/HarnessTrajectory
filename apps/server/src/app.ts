@@ -11,6 +11,7 @@ import {
 } from '@harness-trajectory/core'
 import { scopeToFile, type SessionIndex } from './index.ts'
 import { search, type SearchService } from './search/index.ts'
+import type { SettingsController } from './settings.ts'
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -36,6 +37,8 @@ export interface AppOptions {
   staticDir?: string | undefined
   /** Full-text index; omitted (search is off by default) disables `/api/search`. */
   search?: SearchService | undefined
+  /** Server settings backing `/api/settings`; omitted disables those routes. */
+  settings?: SettingsController | undefined
 }
 
 /** The shape `/api/search` answers with when nothing is indexed. */
@@ -51,7 +54,7 @@ function searchDisabled(query: string): SearchResponse {
   }
 }
 
-export function createApp({ index, staticDir, search: searchService }: AppOptions): Hono {
+export function createApp({ index, staticDir, search: searchService, settings }: AppOptions): Hono {
   const app = new Hono()
 
   app.get('/api/health', (c) => {
@@ -61,6 +64,22 @@ export function createApp({ index, staticDir, search: searchService }: AppOption
       search: { enabled: searchService !== undefined, indexing },
     })
   })
+
+  /**
+   * Server settings, persisted to `settings.json` under the cache directory.
+   * The web dialog mirrors them: it renders only what these routes answer.
+   */
+  if (settings !== undefined) {
+    app.get('/api/settings', (c) => {
+      return c.json({ ...settings.read(), searchEnabled: searchService !== undefined })
+    })
+    app.put('/api/settings', async (c) => {
+      const body = await c.req.json().catch(() => undefined)
+      if (body === undefined) return c.json({ error: 'invalid JSON body' }, 400)
+      const update = settings.update(body)
+      return c.json({ ...update.value, purged: update.purged, searchEnabled: searchService !== undefined })
+    })
+  }
 
   app.get('/api/sessions', (c) => {
     const kind = c.req.query('kind')

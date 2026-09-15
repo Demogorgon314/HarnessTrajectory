@@ -9,27 +9,33 @@
  * or `--project serv` would find nothing. Trigram is case-insensitive for ASCII
  * by default (`case_sensitive 0`) and cannot match fewer than three characters.
  *
- * The table is created with `detail=none`: the index stores only which
- * documents contain each trigram, not where. Positions are what made the
- * trigram index cost 2× the document text on disk (60% of a 5.6 GB database);
- * without them the inverted index shrinks by ~80%. The price is paid in
- * `query.ts`: FTS5 refuses phrase queries, `snippet()` and `bm25` on such a
- * table, so the read side slices the query into trigrams itself, ANDs them
- * (a superset of the real matches), and then verifies the substring, ranks,
- * and builds snippets against the stored text in JavaScript.
+ * Three decisions keep the index small on a large corpus:
  *
- * `docs_fts` is a plain (not external-content or contentless) FTS5 table, so
- * the document text itself stays available for that verification; `docs`
- * beside it holds the addressing columns and shares its rowid.
+ * - `detail=none`: the index stores only which documents contain each
+ *   trigram, not where. Positions are what made the trigram index cost 2× the
+ *   document text on disk; without them the inverted index shrinks by ~80%.
+ *   The price is paid in `query.ts`: FTS5 refuses phrase queries, `snippet()`
+ *   and `bm25` on such a table, so the read side slices the query into
+ *   trigrams itself, ANDs them (a superset of the real matches), and then
+ *   verifies the substring, ranks, and builds snippets in JavaScript.
+ * - `content=''` (contentless): the FTS table holds no document text at all.
+ *   Text lives once, deflate-compressed, in `docs.text` — about 70% smaller
+ *   than the raw text column it replaces — and is inflated only for the
+ *   candidates a query actually reads. `contentless_delete=1` keeps plain
+ *   `DELETE by rowid` working for the purge paths.
+ * - `docs.file` is an integer FK into `files`: the path and session id are
+ *   stored once per transcript instead of once per document (and no longer
+ *   duplicated again by a `docs(path)` index).
  */
 
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import { deflateSync, inflateSync } from 'node:zlib'
 import type { HarnessKind, SearchRole } from '@harness-trajectory/core'
 
 /** Bumped whenever the schema below changes; a mismatch drops and rebuilds. */
-export const SEARCH_SCHEMA_VERSION = 2
+export const SEARCH_SCHEMA_VERSION = 3
 
 /** Identity of one indexed transcript, as the SSE route addresses it. */
 export interface SearchFileKey {
@@ -43,6 +49,8 @@ export interface SearchFileKey {
 
 /** What the index already knows about a file on disk. */
 export interface SearchFileState extends SearchFileKey {
+  /** `files` rowid; the `docs.file` foreign key. */
+  id: number
   size: number
   mtimeMs: number
   indexedBytes: number
@@ -65,7 +73,8 @@ export interface SearchStoreOptions {
 
 const SCHEMA = `
 create table files (
-  path          text primary key,
+  id            integer primary key,
+  path          text not null unique,
   kind          text not null,
   session_id    text not null,
   file_id       text not null,
@@ -75,18 +84,15 @@ create table files (
   indexed_lines integer not null
 );
 create table docs (
-  id         integer primary key,
-  path       text not null,
-  line       integer not null,
-  role       text not null,
-  time_ms    integer,
-  kind       text not null,
-  session_id text not null,
-  file_id    text not null
+  id      integer primary key,
+  file    integer not null references files(id),
+  line    integer not null,
+  role    text not null,
+  time_ms integer,
+  text    blob not null
 );
-create index docs_by_path on docs(path);
-create index docs_by_session on docs(kind, session_id);
-create virtual table docs_fts using fts5(text, tokenize="trigram", detail=none);
+create index docs_by_file on docs(file);
+create virtual table docs_fts using fts5(text, tokenize="trigram", detail=none, content='', contentless_delete=1);
 `
 
 function asInt(value: unknown, fallback = 0): number {
@@ -97,6 +103,16 @@ function asInt(value: unknown, fallback = 0): number {
 
 function asText(value: unknown, fallback = ''): string {
   return typeof value === 'string' ? value : fallback
+}
+
+/** Document text at rest: one deflate stream per document (~70% smaller). */
+export function packText(text: string): Buffer {
+  return deflateSync(Buffer.from(text, 'utf8'))
+}
+
+/** The inverse of {@link packText}; throws on a corrupt blob — callers skip that row. */
+export function unpackText(blob: Uint8Array): string {
+  return inflateSync(blob).toString('utf8')
 }
 
 export class SearchStore {
@@ -147,6 +163,20 @@ export class SearchStore {
     }
   }
 
+  /**
+   * Return freed pages to the OS. Deletes (the retention purge, a vanished
+   * file) leave them inside the database file, so without this the file never
+   * shrinks. Runs outside any transaction; on a multi-GB database it takes a
+   * few seconds, which is why it is called only after a real purge.
+   */
+  compact(): void {
+    try {
+      this.db.exec('vacuum')
+    } catch {
+      // A concurrent reader blocks it; the freed pages get reused either way.
+    }
+  }
+
   close(): void {
     this.checkpoint()
     try {
@@ -177,6 +207,7 @@ export class SearchStore {
     const row = this.db.prepare('select * from files where path = ?').get(path)
     if (row === undefined) return undefined
     return {
+      id: asInt(row['id']),
       path,
       kind: asText(row['kind']) as HarnessKind,
       sessionId: asText(row['session_id']),
@@ -191,6 +222,27 @@ export class SearchStore {
   /** Every path the index has a `files` row for, for the startup sweep. */
   paths(): string[] {
     return this.db.prepare('select path from files').all().map(row => asText(row['path']))
+  }
+
+  /** Files whose recorded modification time is older than the cutoff. */
+  pathsOlderThan(cutoffMs: number): string[] {
+    return this.db.prepare('select path from files where mtime_ms < ?').all(cutoffMs)
+      .map(row => asText(row['path']))
+  }
+
+  /**
+   * The `files` rowid for `key`, creating a stub row when this is the file's
+   * first document. The stub's zeroed progress is filled in by the
+   * {@link setFileState} upsert landing in the same transaction.
+   */
+  private fileRef(key: SearchFileKey): number {
+    this.db.prepare(`
+      insert into files (path, kind, session_id, file_id, size, mtime_ms, indexed_bytes, indexed_lines)
+      values (?, ?, ?, ?, 0, 0, 0, 0)
+      on conflict(path) do nothing
+    `).run(key.path, key.kind, key.sessionId, key.fileId)
+    const row = this.db.prepare('select id from files where path = ?').get(key.path)
+    return asInt(row?.['id'])
   }
 
   setFileState(key: SearchFileKey, progress: {
@@ -219,14 +271,15 @@ export class SearchStore {
   /** Append documents for one file. Call inside {@link transaction}. */
   insertDocs(key: SearchFileKey, docs: readonly SearchDoc[]): void {
     if (docs.length === 0) return
+    const file = this.fileRef(key)
     const doc = this.db.prepare(
-      'insert into docs (path, line, role, time_ms, kind, session_id, file_id) values (?, ?, ?, ?, ?, ?, ?)',
+      'insert into docs (file, line, role, time_ms, text) values (?, ?, ?, ?, ?)',
     )
+    // The FTS table is contentless: the text is tokenized, then discarded.
     const text = this.db.prepare('insert into docs_fts (rowid, text) values (?, ?)')
     for (const entry of docs) {
       const { lastInsertRowid } = doc.run(
-        key.path, entry.line, entry.role, entry.timeMs ?? null,
-        key.kind, key.sessionId, key.fileId,
+        file, entry.line, entry.role, entry.timeMs ?? null, packText(entry.text),
       )
       text.run(lastInsertRowid, entry.text)
     }
@@ -234,11 +287,15 @@ export class SearchStore {
 
   /** Drop every document of a file, keeping its `files` row. */
   clearDocs(path: string): void {
-    this.db.prepare('delete from docs_fts where rowid in (select id from docs where path = ?)').run(path)
-    this.db.prepare('delete from docs where path = ?').run(path)
+    this.db.prepare(`
+      delete from docs_fts where rowid in (
+        select id from docs where file in (select id from files where path = ?)
+      )
+    `).run(path)
+    this.db.prepare('delete from docs where file in (select id from files where path = ?)').run(path)
   }
 
-  /** Forget a file entirely: it disappeared from disk. */
+  /** Forget a file entirely: it disappeared from disk or fell out of the retention window. */
   deleteFile(path: string): void {
     this.clearDocs(path)
     this.db.prepare('delete from files where path = ?').run(path)
@@ -246,11 +303,11 @@ export class SearchStore {
 
   /**
    * Re-home a file whose owning session was only learned after its lines were
-   * indexed (a subagent transcript that registered before its parent claimed it).
+   * indexed (a subagent transcript that registered before its parent claimed
+   * it). One row now: the documents follow their foreign key.
    */
   rebind(path: string, sessionId: string, fileId: string): void {
     this.db.prepare('update files set session_id = ?, file_id = ? where path = ?').run(sessionId, fileId, path)
-    this.db.prepare('update docs set session_id = ?, file_id = ? where path = ?').run(sessionId, fileId, path)
   }
 
   docCount(): number {

@@ -35,6 +35,8 @@ export interface SearchServiceOptions {
   path: string
   flushDelayMs?: number
   maxBatchDocs?: number
+  /** Retention window in days; older transcripts stay out of the index. 0 = all. */
+  maxAgeDays?: number
 }
 
 export function createSearchService(options: SearchServiceOptions): SearchService {
@@ -43,6 +45,7 @@ export function createSearchService(options: SearchServiceOptions): SearchServic
     store,
     ...(options.flushDelayMs === undefined ? {} : { flushDelayMs: options.flushDelayMs }),
     ...(options.maxBatchDocs === undefined ? {} : { maxBatchDocs: options.maxBatchDocs }),
+    ...(options.maxAgeDays === undefined ? {} : { maxAgeDays: options.maxAgeDays }),
   })
   return {
     store,

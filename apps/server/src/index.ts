@@ -23,6 +23,8 @@ const LIVE_WINDOW_MS = 2 * 60_000
 const WATCH_DEBOUNCE_MS = 120
 const POLL_INTERVAL_MS = 1_500
 const CHUNK_LINES = 400
+/** Files the startup sweep registers at once; the reads overlap, the parsing does not. */
+const BACKFILL_CONCURRENCY = 8
 /**
  * Bytes the first pass over a transcript reads at a time. The local corpus holds
  * rollouts of well over 100 MB and `readLines` allocates one buffer per call, so
@@ -54,7 +56,13 @@ interface FileEntry {
   lines: number
   /** First line index the search index still wants; everything below it is already stored. */
   searchFrom: number
+  /** Too old for the retention window: browsable, but nothing is queued for the index. */
+  searchSkipped: boolean
   meta: MetaScanner | null
+  /** A consume is reading this file right now; a concurrent one folds into `consumePending`. */
+  consuming: boolean
+  /** The newest stat a skipped consume arrived with, drained by the lock holder. */
+  consumePending: { size: number; mtimeMs: number } | undefined
   /** Grok only: mtime of the `summary.json` last read for this file. */
   summaryMtimeMs?: number
   /**
@@ -92,6 +100,8 @@ export interface SessionIndexOptions {
    * Omitted (tests, or search left at its off-by-default) means nothing is indexed.
    */
   search?: SearchIndexer
+  /** Files registered concurrently during the startup sweep; 1 for a strict order. */
+  backfillConcurrency?: number
 }
 
 type Subscriber = (event: SessionLiveEvent) => void
@@ -177,6 +187,7 @@ export class SessionIndex extends EventEmitter {
   private readonly pending = new Map<string, NodeJS.Timeout>()
   private poll: NodeJS.Timeout | null = null
   private readonly watchEnabled: boolean
+  private readonly backfillConcurrency: number
   private readonly now: () => number
   private readonly search: SearchIndexer | undefined
   private stopped = false
@@ -185,6 +196,7 @@ export class SessionIndex extends EventEmitter {
     super()
     this.roots = options.roots
     this.watchEnabled = options.watch ?? true
+    this.backfillConcurrency = Math.max(1, options.backfillConcurrency ?? BACKFILL_CONCURRENCY)
     this.now = options.now ?? Date.now
     this.search = options.search
   }
@@ -193,27 +205,54 @@ export class SessionIndex extends EventEmitter {
     this.stopped = false
     // Walk every root first so the search UI can show N/M from the first file,
     // instead of a total that jumps each time a harness directory is entered.
-    const planned: { root: HarnessRoot; paths: string[] }[] = []
+    const planned: { root: HarnessRoot; path: string; mtimeMs: number }[] = []
     for (const root of this.roots) {
       if (this.stopped) return
       const paths = (await walk(root.dir)).filter(path => classifyPath(root.kind, root.dir, path) !== null)
-      planned.push({ root, paths })
-    }
-    this.search?.setBackfillPlan(planned.reduce((count, item) => count + item.paths.length, 0))
-    for (const { root, paths } of planned) {
-      if (this.stopped) return
-      for (const path of paths) {
-        if (this.stopped) return
-        await this.register(root, path, true)
-        this.search?.noteBackfillFile()
-        await yieldTurn()
-      }
+      // Watch before the sweep, not after it: a transcript created while the
+      // pool below is still reading older files is announced by the watcher
+      // instead of waiting for the next start. The consume lock keeps a watch
+      // event from double-reading a file the pool is still registering.
       if (this.watchEnabled) this.watchRoot(root)
+      for (const path of paths) {
+        // The order needs the mtimes anyway; `register` stats again, but a
+        // stat is cheap next to the read that follows it.
+        const info = await stat(path).catch(() => null)
+        if (info !== null && info.isFile()) planned.push({ root, path, mtimeMs: info.mtimeMs })
+      }
     }
+    // Newest first: the sessions a user is most likely to open become visible
+    // and searchable within seconds, not only after the whole sweep has
+    // chewed through months of old transcripts.
+    planned.sort((left, right) => right.mtimeMs - left.mtimeMs)
+    this.search?.setBackfillPlan(planned.length)
+    // A few files in flight: parsing stays on this one thread, but the reads
+    // overlap and one multi-hundred-megabyte rollout no longer stalls every
+    // file queued behind it.
+    let cursor = 0
+    const workers = Array.from({ length: Math.min(this.backfillConcurrency, planned.length) }, async () => {
+      while (!this.stopped) {
+        const item = planned[cursor]
+        cursor += 1
+        if (item === undefined) return
+        try {
+          await this.register(item.root, item.path, true)
+        } catch {
+          // One unreadable transcript must not take the sweep down with it.
+        } finally {
+          this.search?.noteBackfillFile()
+        }
+      }
+    })
+    await Promise.all(workers)
     if (this.stopped) return
     // Everything on disk has been seen: commit the backfill and forget the
-    // files that are gone. Only now does search report itself as ready.
-    this.search?.finishBackfill(this.files.keys())
+    // files that are gone. Files the retention window skips are not live for
+    // the index either, so rows an earlier run stored for them are dropped
+    // here. Only now does search report itself as ready.
+    this.search?.finishBackfill(
+      [...this.files.values()].flatMap(entry => (entry.searchSkipped ? [] : [entry.path])),
+    )
     if (this.watchEnabled) {
       this.poll = setInterval(() => { void this.pollSubscribed() }, POLL_INTERVAL_MS)
       this.poll.unref()
@@ -402,7 +441,10 @@ export class SessionIndex extends EventEmitter {
       offset: 0,
       rest: '',
       lines: 0,
+      consuming: false,
+      consumePending: undefined,
       searchFrom: 0,
+      searchSkipped: false,
       meta: role === 'main' ? createMetaScanner(root.kind, grokSummary) : null,
       ...(root.kind === 'grok' ? { summaryTitle: grokSummaryTitle(grokSummary) } : {}),
       ...(grokUnresolved && role === 'main' ? { grokUnresolved: true } : {}),
@@ -415,7 +457,13 @@ export class SessionIndex extends EventEmitter {
     if (role === 'child' && !initial) this.emitTo(session, { type: 'file', file: ref })
     // The meta scanner always replays from byte 0 (its state is in memory only);
     // the search index answers with the first line it has not stored yet.
-    entry.searchFrom = this.search?.beginFile(searchKeyOf(entry), { size: info.size, mtimeMs: info.mtimeMs }) ?? 0
+    // A transcript untouched for longer than the retention window stays
+    // browsable but out of the index; the next start reconsiders it under its
+    // then-current mtime and settings.
+    entry.searchSkipped = this.search !== undefined && !this.search.shouldIndex({ mtimeMs: info.mtimeMs })
+    entry.searchFrom = entry.searchSkipped
+      ? 0
+      : this.search?.beginFile(searchKeyOf(entry), { size: info.size, mtimeMs: info.mtimeMs }) ?? 0
     await this.consumeInitial(entry, info.size, info.mtimeMs, initial)
     await this.syncKimiTitle(entry)
     await this.syncGrokSummary(entry, true)
@@ -648,14 +696,48 @@ export class SessionIndex extends EventEmitter {
     for (;;) {
       if (this.stopped) return
       await this.consume(entry, end, mtimeMs, initial)
-      if (end >= size) return
-      end = Math.min(end + INITIAL_CHUNK_BYTES, size)
+      // `offset` can land past `end` when a folded-in watch event was drained
+      // with the file's real size; never let `end` fall behind it, or the
+      // next slice would look like a truncation.
+      if (entry.offset >= size) return
+      end = Math.min(Math.max(end, entry.offset) + INITIAL_CHUNK_BYTES, size)
       await yieldTurn()
     }
   }
 
-  /** Consume appended bytes: update metadata and forward new lines to subscribers. */
+  /**
+   * Serialize the consumes of one file. A watch event (or the poll) that
+   * lands while an earlier consume is still reading would re-read the same
+   * bytes and feed the lines to the meta scanner and the search index twice;
+   * instead it folds its stat into `consumePending` and the lock holder
+   * drains it before releasing.
+   */
   private async consume(entry: FileEntry, size: number, mtimeMs: number, initial = false): Promise<void> {
+    if (entry.consuming) {
+      const pending = entry.consumePending
+      entry.consumePending = {
+        size: Math.max(size, pending?.size ?? 0),
+        mtimeMs: Math.max(mtimeMs, pending?.mtimeMs ?? 0),
+      }
+      return
+    }
+    entry.consuming = true
+    try {
+      let current = { size, mtimeMs }
+      for (;;) {
+        entry.consumePending = undefined
+        await this.consumeInner(entry, current.size, current.mtimeMs, initial)
+        const pending = entry.consumePending
+        if (pending === undefined || this.stopped) return
+        current = pending
+      }
+    } finally {
+      entry.consuming = false
+    }
+  }
+
+  /** Consume appended bytes: update metadata and forward new lines to subscribers. */
+  private async consumeInner(entry: FileEntry, size: number, mtimeMs: number, initial = false): Promise<void> {
     const session = this.sessions.get(sessionKey(entry.kind, entry.sessionId))
     if (size < entry.offset) {
       // Truncated or rewritten: start over and tell subscribers to reset the file.
@@ -700,7 +782,7 @@ export class SessionIndex extends EventEmitter {
    */
   private index(entry: FileEntry, lines: readonly string[]): void {
     const search = this.search
-    if (search === undefined) {
+    if (search === undefined || entry.searchSkipped) {
       entry.lines += lines.length
       return
     }

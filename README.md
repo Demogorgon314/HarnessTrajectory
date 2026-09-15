@@ -72,8 +72,10 @@ pnpm start      # http://127.0.0.1:5170
 
 ### Configuration
 
-Transcript roots are discovered from the harness home directories. Every setting is an
-environment variable; the server also accepts `--port`, `--host`, `--static`, and `--no-open`.
+Transcript roots are discovered from the harness home directories. Environment variables
+below; the server also accepts `--port`, `--host`, `--static`, and `--no-open`. Runtime
+settings (search retention days) live in `settings.json` under the cache directory and
+are editable in the UI's settings dialog (the gear button in the sidebar).
 
 | Setting | Default | Notes |
 | --- | --- | --- |
@@ -84,7 +86,7 @@ environment variable; the server also accepts `--port`, `--host`, `--static`, an
 | `KIMI_CODE_HOME` | `~/.kimi-code` | Kimi Code home (`<home>/sessions`) |
 | `GROK_HOME` | `~/.grok` | Grok Build home (`<home>/sessions`) |
 | `HARNESS_TRAJECTORY_{CLAUDE,CODEX,KIMI,GROK}_ROOT` | derived | Point one harness at an arbitrary directory |
-| `HARNESS_TRAJECTORY_CACHE_DIR` | `$XDG_CACHE_HOME/harness-trajectory`, else `~/.cache/harness-trajectory` | Holds `search.sqlite`, the only file the server writes |
+| `HARNESS_TRAJECTORY_CACHE_DIR` | `$XDG_CACHE_HOME/harness-trajectory`, else `~/.cache/harness-trajectory` | Holds `search.sqlite` and `settings.json`, the only files the server writes |
 | `HARNESS_TRAJECTORY_SEARCH` | off | `1`, `true`, or `on` enables indexing into `search.sqlite`; otherwise `/api/search` answers `{ "enabled": false }` |
 | `HARNESS_TRAJECTORY_NO_OPEN` | off | `1`, `true`, or `on` skips opening the default browser (same as `--no-open`). SSH sessions never open one. |
 
@@ -142,8 +144,11 @@ Tests use hand-written synthetic records only. Never commit real transcript cont
   background). Delete the file to reclaim the space.
 - **Search granularity.** Queries shorter than three characters return nothing: the trigram
   tokenizer cannot index them. Tool output is indexed up to 4 KB and other records up to
-  16 KB, so a match past that point in a very large record is not found. Compaction
-  summaries, system reminders, images, and base64 payloads are deliberately not indexed.
+  16 KB, so a match past that point in a very large record is not found. Only transcripts
+  modified within the retention window are indexed: 90 days by default, adjustable in the
+  settings dialog (`0` indexes everything; widening re-indexes older sessions on the next
+  start). Compaction summaries, system reminders, images, and base64 payloads are
+  deliberately not indexed.
 
 ## Acknowledgements and license
 

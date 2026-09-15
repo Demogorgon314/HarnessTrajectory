@@ -29,11 +29,17 @@ packages/context  dsh-context port (Apache-2.0; keep LICENSE + NOTICE):
                   src/fold = vendored fold (do not change its event vocabulary),
                   src/synth/<kind>.ts = transcript → fold events, src/client = dashboard.
 apps/server       Hono API: scans harness roots, classifies files, replays + tails JSONL over SSE.
-                  src/search = SQLite FTS5 (node:sqlite, trigram, detail=none) full-text index:
-                  store.ts schema, extract.ts record → docs (tool outputs capped at 4 KB),
-                  indexer.ts batched writes, query.ts the /api/search read (trigram-AND
-                  cover + JS verify/snippet/rank — FTS phrase, snippet and bm25 are unused).
+                  src/search = SQLite FTS5 (node:sqlite, trigram, detail=none, contentless)
+                  full-text index: store.ts schema (doc text deflate-compressed in
+                  docs.text, docs.file → files.id FK), extract.ts record → docs (tool
+                  outputs capped at 4 KB), indexer.ts batched writes, query.ts the
+                  /api/search read (trigram-AND cover + inflate/verify/snippet/rank in
+                  JS — FTS phrase, snippet and bm25 are unused).
                   Contract types live in core/src/search.ts.
+                  src/settings.ts = settings.json persistence + the /api/settings controller.
+                  indexer.shouldIndex enforces the retention window (searchMaxAgeDays,
+                  default 90, 0 = all) at registration; the startup sweep and
+                  applyMaxAgeDays purge what falls outside it.
 apps/web          Vite/React shell: sidebar, routes, harness registry (src/harnesses.tsx).
 ```
 
@@ -54,8 +60,9 @@ Both parsers are incremental and must never throw on a malformed or unknown reco
   exported classifier per harness. The search extractor
   (`apps/server/src/search/extract.ts`) is the fourth caller and must reuse the same
   classifiers — never re-derive human-vs-injected from the text.
-- The server writes exactly one file, `search.sqlite` under the cache dir
-  (`apps/server/src/cache.ts`). Harness roots stay read-only. The index is a cache:
+- The server writes only under the cache dir (`apps/server/src/cache.ts`):
+  `search.sqlite` and `settings.json` (`apps/server/src/settings.ts`). Harness roots stay
+  read-only. The index is a cache:
   bump `SEARCH_SCHEMA_VERSION` instead of migrating. A search hit addresses a record by
   `(kind, sessionId, fileId, line)`, where `line` is the 0-based index of the record among
   the file's non-blank lines — the same numbering `readLines` produces. SSE replay uses

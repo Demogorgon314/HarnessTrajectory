@@ -18,12 +18,13 @@
  * and not re-inserted.
  */
 
-import type { HarnessKind, SearchIndexing } from '@harness-trajectory/core'
+import { SETTINGS_DEFAULTS, type HarnessKind, type SearchIndexing } from '@harness-trajectory/core'
 import { extractSearchDocs, type SearchDocDraft } from './extract.ts'
 import type { SearchDoc, SearchFileKey, SearchStore } from './store.ts'
 
 const FLUSH_DELAY_MS = 250
-const MAX_BATCH_DOCS = 4_000
+const MAX_BATCH_DOCS = 8_000
+const DAY_MS = 86_400_000
 
 /** Progress of one file, written with the documents it produced. */
 interface FileProgress {
@@ -43,6 +44,10 @@ export interface SearchIndexerOptions {
   flushDelayMs?: number
   /** Commit immediately once the batch holds this many documents. */
   maxBatchDocs?: number
+  /** Retention window in days; older transcripts stay out of the index. 0 = all. */
+  maxAgeDays?: number
+  /** Clock for the retention cutoff; injectable for tests. */
+  now?: () => number
   /** Extractor override, for tests that count calls. */
   extract?: (kind: HarnessKind, line: string) => readonly SearchDocDraft[]
 }
@@ -52,6 +57,8 @@ export class SearchIndexer {
   private readonly flushDelayMs: number
   private readonly maxBatchDocs: number
   private readonly extract: (kind: HarnessKind, line: string) => readonly SearchDocDraft[]
+  private readonly now: () => number
+  private maxAgeDays: number
   private readonly batch: PendingDoc[] = []
   /** Latest known identity per path; a rebind updates it before the flush uses it. */
   private readonly keys = new Map<string, SearchFileKey>()
@@ -67,7 +74,45 @@ export class SearchIndexer {
     this.store = options.store
     this.flushDelayMs = options.flushDelayMs ?? FLUSH_DELAY_MS
     this.maxBatchDocs = options.maxBatchDocs ?? MAX_BATCH_DOCS
+    this.maxAgeDays = options.maxAgeDays ?? SETTINGS_DEFAULTS.searchMaxAgeDays
+    this.now = options.now ?? Date.now
     this.extract = options.extract ?? extractSearchDocs
+  }
+
+  /**
+   * Whether a transcript belongs in the index under the current retention
+   * window. The decision is made once per registration; a file that grows new
+   * lines afterwards keeps it until the next start reconsiders the file under
+   * its then-current mtime.
+   */
+  shouldIndex(file: { mtimeMs: number }): boolean {
+    if (this.maxAgeDays === 0) return true
+    return file.mtimeMs >= this.now() - this.maxAgeDays * DAY_MS
+  }
+
+  /**
+   * Change the retention window and purge what now falls outside it.
+   * Narrowing applies immediately; widening only affects files registered
+   * from now on — everything already indexed stays, and skipped files
+   * re-enter on the next start's sweep. Returns the files dropped.
+   */
+  applyMaxAgeDays(days: number): number {
+    this.maxAgeDays = days
+    if (days === 0) return 0
+    const stale = this.store.pathsOlderThan(this.now() - days * DAY_MS)
+    if (stale.length === 0) return 0
+    try {
+      this.store.transaction(() => {
+        for (const path of stale) this.store.deleteFile(path)
+      })
+    } catch {
+      // A locked database keeps the stale rows; the next startup tries again.
+      return 0
+    }
+    // Deleting hundreds of thousands of rows leaves their pages inside the
+    // file; hand them back to the OS so narrowing the window shows on disk.
+    this.store.compact()
+    return stale.length
   }
 
   /**
@@ -216,6 +261,8 @@ export class SearchIndexer {
         this.store.transaction(() => {
           for (const path of gone) this.store.deleteFile(path)
         })
+        // A retention purge can drop most of the database; return the pages.
+        this.store.compact()
       } catch {
         // Stale rows are harmless; the next startup tries again.
       }

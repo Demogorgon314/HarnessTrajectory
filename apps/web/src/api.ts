@@ -2,8 +2,8 @@
 
 import {
   SEARCH_INDEXING_IDLE, SEARCH_MIN_QUERY_LENGTH,
-  type HarnessKind, type SearchIndexing, type SearchResponse, type SessionDetail, type SessionLiveEvent,
-  type SessionSummary,
+  type HarnessKind, type SearchIndexing, type SearchResponse, type ServerSettings, type SessionDetail,
+  type SessionLiveEvent, type SessionSummary, type SettingsResponse, type SettingsUpdateResponse,
 } from '@harness-trajectory/core'
 
 /** A non-2xx answer, carrying the status so callers can act on it. */
@@ -66,6 +66,22 @@ export interface HealthResponse {
 
 export function fetchHealth(signal?: AbortSignal): Promise<HealthResponse> {
   return getJson('/api/health', signal)
+}
+
+/** Server settings, persisted server-side in `settings.json`. */
+export function fetchSettings(signal?: AbortSignal): Promise<SettingsResponse> {
+  return getJson('/api/settings', signal)
+}
+
+/** Persist a new settings value; the answer carries the value in effect. */
+export async function putSettings(value: ServerSettings): Promise<SettingsUpdateResponse> {
+  const response = await fetch('/api/settings', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify(value),
+  })
+  if (!response.ok) throw new HttpError(response.status, `${response.status} ${response.statusText} for /api/settings`)
+  return await response.json() as SettingsUpdateResponse
 }
 
 /**
