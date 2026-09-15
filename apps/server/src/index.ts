@@ -3,12 +3,13 @@
  * listing metadata, watches for appends, and fans live lines out to subscribers.
  */
 
+import { Buffer } from 'node:buffer'
 import { EventEmitter } from 'node:events'
 import { watch, type FSWatcher } from 'node:fs'
 import { readdir, readFile, stat } from 'node:fs/promises'
 import { basename, dirname, join, relative, sep } from 'node:path'
 import {
-  asString, isRecord,
+  asArray, asString, isRecord, GROK_SIDECAR_METHOD,
   type AgentFileMeta, type HarnessKind, type SessionChildSummary, type SessionDetail, type SessionFileRef,
   type SessionLiveEvent, type SessionSummary,
 } from '@harness-trajectory/core'
@@ -33,6 +34,24 @@ interface FileEntry {
   offset: number
   rest: string
   meta: MetaScanner | null
+  /** Grok only: mtime of the `summary.json` last read for this file. */
+  summaryMtimeMs?: number
+  /**
+   * Grok only: the facts of the sidecar last sent to subscribers
+   * (`grokSidecarKey`). `summary.json` is rewritten on essentially every
+   * appended line — `num_messages`, `updated_at` and the trace cursor are
+   * patched per write — so neither the mtime nor the rendered line is a usable
+   * gate: only what the sidecar actually tells the fold is.
+   */
+  sidecarKey?: string
+  /** Grok only: `summary.session_summary` as last read, so the title syncs only on a change. */
+  summaryTitle?: string | null
+  /**
+   * Grok only: this file registered as a main session although it may be a
+   * subagent child — its `summary.json` was unreadable, or it said "subagent"
+   * and no parent binding existed yet. Re-probed until it settles.
+   */
+  grokUnresolved?: boolean
 }
 
 interface SessionRecord {
@@ -96,6 +115,19 @@ export function classifyPath(
       ? { id: sessionId, role: 'main' }
       : { id: agentId, role: 'child', parentId: sessionId }
   }
+  if (kind === 'grok') {
+    // <encoded-cwd>/<session-id>/updates.jsonl is the only transcript grok
+    // writes (GROK-FORMAT §A.2, §C.0): `chat_history.jsonl` is a derived cache,
+    // `events.jsonl` is telemetry, `rewind_points.jsonl` a side store, and the
+    // cwd-level `prompt_history.jsonl` sits one level up. Session id is the
+    // directory name (a UUIDv7); the role is provisional, because a child
+    // session is a top-level directory too and only `summary.json` tells them
+    // apart (GROK-FORMAT §D.2, §D.5 — see `SessionIndex.register`).
+    if (parts.length !== 3 || name !== 'updates') return null
+    const sessionId = parts[1]
+    if (sessionId === undefined || sessionId === '') return null
+    return { id: sessionId, role: 'main' }
+  }
   return null
 }
 
@@ -104,6 +136,17 @@ export class SessionIndex extends EventEmitter {
   private readonly sessions = new Map<string, SessionRecord>()
   private readonly files = new Map<string, FileEntry>()
   private readonly subscribers = new Map<string, Set<Subscriber>>()
+  /**
+   * Grok child → parent bindings read from `<parent>/subagents/<childId>/meta.json`.
+   * A grok child is a top-level session directory that names no parent of its
+   * own, so this map is the only way a child registered before (or far away
+   * from) its parent finds it (GROK-FORMAT §D.2, §D.3).
+   */
+  private readonly grokChildren = new Map<string, GrokChildBinding>()
+  /** Bumped whenever a new grok binding is learned; see `grokParentOf`. */
+  private grokGeneration = 0
+  /** Grok root → the generation its whole-root sweep ran at (negative cache). */
+  private readonly grokSwept = new Map<string, number>()
   private readonly watchers: FSWatcher[] = []
   private readonly pending = new Map<string, NodeJS.Timeout>()
   private poll: NodeJS.Timeout | null = null
@@ -197,7 +240,16 @@ export class SessionIndex extends EventEmitter {
     const sources = await Promise.all(entries.map(async (entry) => {
       // Read up to the index's consumed offset; live events cover the rest.
       const lines = await readWholeFile(entry.path, entry.offset)
-      return { ref: refOf(entry), lines, times: lineTimes(lines) }
+      // Grok's session facts, system prompt and tool schemas live beside the
+      // transcript, so one synthetic line carries them into the fold
+      // (GROK-DESIGN §3). Its `timestamp` is the session's creation instant, so
+      // the chronological merge keeps it first.
+      const sidecar = entry.kind === 'grok' ? await readGrokSidecar(entry.path, entry.ref.id) : undefined
+      // The replay carries these facts, so a live tick only re-sends them when
+      // they actually differ from what this view already folded.
+      if (sidecar !== undefined) entry.sidecarKey = sidecar.key
+      const all = sidecar === undefined ? lines : [sidecar.line, ...lines]
+      return { ref: refOf(entry), lines: all, times: lineTimes(all) }
     }))
     for (const chunk of mergeChronologically(sources)) {
       emit({ type: 'lines', file: chunk.ref, lines: chunk.lines })
@@ -260,9 +312,26 @@ export class SessionIndex extends EventEmitter {
         // Unreadable head: keep the path-derived identity.
       }
     }
+    // Grok's role is not path-derived: a child session is a top-level directory
+    // like any other and only `summary.json` says otherwise (GROK-DESIGN §2).
+    let agent: AgentFileMeta | undefined
+    let grokSummary: Record<string, unknown> | null = null
+    let grokUnresolved = false
+    if (root.kind === 'grok') {
+      const probe = await this.probeGrokFile(root, path, id)
+      grokSummary = probe.summary
+      if (probe.parentId !== undefined) {
+        parentId = probe.parentId
+        agent = probe.agent
+      }
+      // Grok writes the child's directory and `updates.jsonl` before its
+      // `summary.json` and before the parent's `subagents/<id>/meta.json`, so
+      // an early probe has to be repeatable (see `refreshGrokBinding`).
+      grokUnresolved = probe.summary === null || (probe.child && probe.parentId === undefined)
+    }
     const role: 'main' | 'child' = parentId !== undefined ? 'child' : classified.role
     const sessionId = parentId ?? id
-    const agent = role === 'child' && root.kind === 'claude' ? await readAgentMeta(path) : undefined
+    if (agent === undefined && role === 'child' && root.kind === 'claude') agent = await readAgentMeta(path)
     const ref: SessionFileRef = {
       id,
       role,
@@ -279,7 +348,9 @@ export class SessionIndex extends EventEmitter {
       mtimeMs: info.mtimeMs,
       offset: 0,
       rest: '',
-      meta: role === 'main' ? createMetaScanner(root.kind) : null,
+      meta: role === 'main' ? createMetaScanner(root.kind, grokSummary) : null,
+      ...(root.kind === 'grok' ? { summaryTitle: grokSummaryTitle(grokSummary) } : {}),
+      ...(grokUnresolved && role === 'main' ? { grokUnresolved: true } : {}),
     }
     if (this.files.has(path)) return this.files.get(path)
     this.files.set(path, entry)
@@ -289,7 +360,140 @@ export class SessionIndex extends EventEmitter {
     if (role === 'child' && !initial) this.emitTo(session, { type: 'file', file: ref })
     await this.consume(entry, info.size, info.mtimeMs, initial)
     await this.syncKimiTitle(entry)
+    await this.syncGrokSummary(entry, true)
     return entry
+  }
+
+  /**
+   * Decide whether a grok session directory is a subagent child and bind it to
+   * its parent (GROK-DESIGN §2).
+   *
+   * The marker is `summary.json`: `hidden === true`, else a `session_kind`
+   * starting with `subagent` — a prefix match, since the flavors are
+   * `subagent`, `subagent_fork` and `subagent_resume` (GROK-FORMAT §D.5).
+   * The parent is named by `<parentDir>/subagents/<childId>/meta.json`, which
+   * carries the run's facts too; `summary.parent_session_id` is a fallback only
+   * for a `subagent_fork`, because on a `subagent_resume` it points at the
+   * previous CHILD rather than at the real parent. A child that binds to
+   * neither registers as a main session — an orphan is better than an
+   * invisible one.
+   *
+   * The parsed `summary.json` comes back with the verdict: it is also the
+   * listing metadata (`createMetaScanner`), so the file is read exactly once
+   * per registration.
+   */
+  private async probeGrokFile(root: HarnessRoot, path: string, id: string): Promise<GrokProbe> {
+    const sessionDir = dirname(path)
+    const summary = await readJsonRecord(join(sessionDir, 'summary.json'))
+    if (summary === null || !isGrokChildSummary(summary)) {
+      // A main session (or one whose summary is not written yet): publish its
+      // bindings so its children resolve from the cache however far away (and
+      // however much later) they are registered.
+      await this.cacheGrokBindings(sessionDir)
+      return { summary, child: false }
+    }
+    const binding = await this.grokParentOf(root.dir, sessionDir, id)
+    if (binding !== undefined) {
+      return { summary, child: true, parentId: binding.parentId, agent: binding.agent }
+    }
+    if (asString(summary['session_kind']) === 'subagent_fork') {
+      const parentId = asString(summary['parent_session_id'])
+      if (parentId !== undefined && parentId !== '' && parentId !== id) {
+        return { summary, child: true, parentId, agent: { agentId: id } }
+      }
+    }
+    return { summary, child: true }
+  }
+
+  /**
+   * Cached binding for a grok child, widening the search until one is found.
+   *
+   * The sibling group (the same encoded cwd) is always re-read: it is one
+   * `readdir` per session directory there and it is where a child normally
+   * lands. The whole-root fallback — for a child that got its own worktree cwd
+   * (GROK-FORMAT §D.2) — is swept at most once per generation, so a child that
+   * binds to nothing does not walk every session directory on every
+   * registration. Learning any new binding starts a new generation, and a new
+   * session directory can only contribute bindings through
+   * `cacheGrokBindings`, which is exactly what bumps it.
+   */
+  private async grokParentOf(rootDir: string, sessionDir: string, childId: string): Promise<GrokChildBinding | undefined> {
+    const cached = this.grokChildren.get(childId)
+    if (cached !== undefined) return cached
+    // Siblings under the same encoded cwd first: the common case.
+    await this.cacheGrokGroup(dirname(sessionDir))
+    const sibling = this.grokChildren.get(childId)
+    if (sibling !== undefined) return sibling
+    if (this.grokSwept.get(rootDir) === this.grokGeneration) return undefined
+    // A worktree or explicit cwd puts the child under a different group
+    // entirely (GROK-FORMAT §D.2), so fall back to the whole root.
+    for (const group of await subdirectories(rootDir)) await this.cacheGrokGroup(group)
+    this.grokSwept.set(rootDir, this.grokGeneration)
+    return this.grokChildren.get(childId)
+  }
+
+  private async cacheGrokGroup(groupDir: string): Promise<void> {
+    for (const sessionDir of await subdirectories(groupDir)) await this.cacheGrokBindings(sessionDir)
+  }
+
+  private async cacheGrokBindings(sessionDir: string): Promise<void> {
+    for (const binding of await readGrokSubagentMetas(join(sessionDir, 'subagents'))) {
+      this.noteGrokBinding(binding)
+    }
+  }
+
+  /** Remember one child → parent binding; a new one invalidates the swept generation. */
+  private noteGrokBinding(binding: GrokChildBinding): void {
+    if (this.grokChildren.has(binding.childId)) return
+    this.grokChildren.set(binding.childId, binding)
+    this.grokGeneration += 1
+  }
+
+  /**
+   * Re-probe a grok file that registered as a main session although it may be a
+   * child: grok creates the child's directory and starts appending to its
+   * `updates.jsonl` before it writes the child's `summary.json` and the
+   * parent's `subagents/<id>/meta.json`, so the probe in `register` can run too
+   * early and would otherwise leave the run as a top-level session forever.
+   * The grok counterpart of Claude's `refreshAgentMeta`: a no-op once the file
+   * has settled, either as a genuine main or under its parent.
+   */
+  private async refreshGrokBinding(root: HarnessRoot, entry: FileEntry): Promise<void> {
+    if (entry.kind !== 'grok' || entry.grokUnresolved !== true || entry.ref.role !== 'main') return
+    const probe = await this.probeGrokFile(root, entry.path, entry.ref.id)
+    if (probe.parentId !== undefined && probe.agent !== undefined) {
+      this.rehomeGrokChild(entry, probe.parentId, probe.agent)
+      return
+    }
+    // A readable summary that claims no subagent kind settles the question.
+    if (probe.summary !== null && !probe.child) entry.grokUnresolved = false
+  }
+
+  /**
+   * Move a grok file that was listed as its own session under the parent that
+   * has now claimed it: the session record, the file's ref and its membership
+   * all move together, and the parent's subscribers learn about the new child
+   * the same way they would about one that appeared while they watched.
+   */
+  private rehomeGrokChild(entry: FileEntry, parentId: string, agent: AgentFileMeta): void {
+    if (entry.ref.role !== 'main' || entry.sessionId === parentId) return
+    const previousKey = sessionKey(entry.kind, entry.sessionId)
+    const previous = this.sessions.get(previousKey)
+    if (previous !== undefined) {
+      if (previous.main === entry) previous.main = null
+      if (previous.main === null && previous.children.size === 0) this.sessions.delete(previousKey)
+    }
+    entry.ref = { ...entry.ref, role: 'child', parentId, agent }
+    entry.sessionId = parentId
+    // Listing metadata belongs to main files only; the child is served through
+    // its parent (and standalone from its lines) from here on.
+    entry.meta = null
+    entry.grokUnresolved = false
+    const parent = this.sessionFor(entry.kind, parentId)
+    parent.children.set(entry.ref.id, entry)
+    this.emitTo(parent, { type: 'file', file: entry.ref })
+    this.emitTo(parent, { type: 'meta', summary: this.summarize(parent), children: this.childSummaries(parent) })
+    this.emit('change', entry.kind, parentId)
   }
 
   /** Re-read a child's sidecar facts when they were missing at registration (written a moment later). */
@@ -312,6 +516,57 @@ export class SessionIndex extends EventEmitter {
     if (title !== undefined) entry.meta.state.aiTitle = title
   }
 
+  /**
+   * Grok keeps the session's title, cwd, model, system prompt and tool schemas
+   * beside `updates.jsonl` and rewrites `summary.json` as the session runs
+   * (GROK-FORMAT §B.1). Re-read the title the way Claude's `ai-title` record is
+   * surfaced, and — whenever the facts actually changed — re-send the sidecar
+   * line (GROK-DESIGN §3) as a one-line append, so an open view refolds them
+   * without a reconnect. The initial pass only records the baseline: the replay
+   * in `readAll` already carries a sidecar of its own.
+   *
+   * Three gates, cheapest first, because grok patches `num_messages` and
+   * `updated_at` into `summary.json` on essentially every appended line, so
+   * "changed" is the steady state of a live session:
+   *   1. the mtime, which costs one `stat`;
+   *   2. `session_summary`, which gates the title sync;
+   *   3. the facts the sidecar carries (`grokSidecarKey`), which gate the
+   *      ~60 KB line — and which are only assembled at all when somebody is
+   *      subscribed to the session.
+   */
+  private async syncGrokSummary(entry: FileEntry, initial = false): Promise<void> {
+    if (entry.kind !== 'grok') return
+    const dir = dirname(entry.path)
+    let mtimeMs: number
+    try {
+      mtimeMs = (await stat(join(dir, 'summary.json'))).mtimeMs
+    } catch {
+      // Written last (GROK-DESIGN §1): a session without it yet keeps its facts null.
+      return
+    }
+    if (entry.summaryMtimeMs === mtimeMs) return
+    entry.summaryMtimeMs = mtimeMs
+    // `register` already fed this very object to the meta scanner.
+    if (initial) return
+    const key = sessionKey(entry.kind, entry.sessionId)
+    const session = this.sessions.get(key)
+    if (session === undefined) return
+    const summary = await readJsonRecord(join(dir, 'summary.json'))
+    const title = grokSummaryTitle(summary)
+    const titleChanged = title !== entry.summaryTitle
+    entry.summaryTitle = title
+    if (titleChanged && title !== null && entry.meta !== null) entry.meta.state.aiTitle = title
+    if (this.subscribers.get(key) === undefined) return
+    const sidecar = await buildGrokSidecar(dir, entry.ref.id, summary)
+    if (sidecar !== undefined && sidecar.key !== entry.sidecarKey) {
+      entry.sidecarKey = sidecar.key
+      this.emitTo(session, { type: 'lines', file: entry.ref, lines: [sidecar.line] })
+    } else if (!titleChanged) {
+      return
+    }
+    this.emitTo(session, { type: 'meta', summary: this.summarize(session), children: this.childSummaries(session) })
+  }
+
   private sessionFor(kind: HarnessKind, id: string): SessionRecord {
     const key = sessionKey(kind, id)
     let session = this.sessions.get(key)
@@ -329,7 +584,12 @@ export class SessionIndex extends EventEmitter {
       // Truncated or rewritten: start over and tell subscribers to reset the file.
       entry.offset = 0
       entry.rest = ''
-      entry.meta = entry.ref.role === 'main' ? createMetaScanner(entry.kind) : null
+      entry.meta = entry.ref.role === 'main'
+        // Grok's listing facts come from `summary.json`, not from the lines.
+        ? createMetaScanner(entry.kind, entry.kind === 'grok'
+          ? await readJsonRecord(join(dirname(entry.path), 'summary.json'))
+          : null)
+        : null
       if (session !== undefined) this.emitTo(session, { type: 'file', file: entry.ref, reset: true })
     }
     entry.size = size
@@ -425,6 +685,8 @@ export class SessionIndex extends EventEmitter {
       const info = await stat(path)
       await this.consume(entry, info.size, info.mtimeMs)
       await this.syncKimiTitle(entry)
+      await this.syncGrokSummary(entry)
+      await this.refreshGrokBinding(root, entry)
     } catch {
       // Deleted or momentarily unreadable; keep the last known state.
     }
@@ -442,18 +704,53 @@ export class SessionIndex extends EventEmitter {
           if (info.size !== entry.size) await this.consume(entry, info.size, info.mtimeMs)
           await this.refreshAgentMeta(session, entry)
           await this.syncKimiTitle(entry)
+          await this.syncGrokSummary(entry)
+          const entryRoot = entry.grokUnresolved === true ? this.rootFor(entry.path) : undefined
+          if (entryRoot !== undefined) await this.refreshGrokBinding(entryRoot, entry)
         } catch {
           // Ignore transient errors.
         }
       }
       // Newly created child transcripts inside a session directory (subagents).
       const main = session.main
-      const childDir = main === null ? undefined : liveChildDir(session.kind, session.id, main.path)
       const root = main === null ? undefined : this.rootFor(main.path)
-      if (childDir !== undefined && root !== undefined) {
+      if (main === null || root === undefined) continue
+      if (session.kind === 'grok') {
+        await this.pollGrokChildren(root, main)
+        continue
+      }
+      const childDir = liveChildDir(session.kind, session.id, main.path)
+      if (childDir !== undefined) {
         for (const path of await walk(childDir)) {
           if (!this.files.has(path)) await this.register(root, path)
         }
+      }
+    }
+  }
+
+  /**
+   * Pick up subagent transcripts of a live grok session. `liveChildDir` names
+   * the only place a child is announced — `<session>/subagents/<childId>/`,
+   * which holds `meta.json`, not a transcript (GROK-FORMAT §D.3). Each meta
+   * names the child's own cwd, which resolves to a **top-level**
+   * `<encoded-cwd>/<childId>/updates.jsonl`; when it is absent (or the cwd is
+   * long enough that grok hashed the directory name), the parent's own group
+   * is the fallback (GROK-FORMAT §D.2, §A.3).
+   */
+  private async pollGrokChildren(root: HarnessRoot, main: FileEntry): Promise<void> {
+    const metaDir = liveChildDir('grok', main.ref.id, main.path)
+    if (metaDir === undefined) return
+    for (const binding of await readGrokSubagentMetas(metaDir)) {
+      this.noteGrokBinding(binding)
+      for (const candidate of grokChildPaths(root.dir, main.path, binding)) {
+        const existing = this.files.get(candidate)
+        if (existing !== undefined) {
+          // Registered before this meta.json existed, so it landed as a session
+          // of its own: the parent has claimed it now.
+          if (existing.grokUnresolved === true) this.rehomeGrokChild(existing, binding.parentId, binding.agent)
+          break
+        }
+        if (await this.register(root, candidate) !== undefined) break
       }
     }
   }
@@ -522,6 +819,11 @@ export function liveChildDir(kind: HarnessKind, sessionId: string, mainPath: str
   if (kind === 'claude') return join(dirname(mainPath), sessionId, 'subagents')
   // kimi: the main file is <session>/agents/main/wire.jsonl, siblings are <session>/agents/<agentId>/wire.jsonl
   if (kind === 'kimi') return dirname(dirname(mainPath))
+  // grok: only the child's METADATA nests under the parent, as
+  // <session>/subagents/<childId>/meta.json; the transcript itself is a
+  // top-level session directory, possibly under another encoded cwd
+  // (GROK-FORMAT §D.2, §D.3). `pollGrokChildren` resolves each meta to it.
+  if (kind === 'grok') return join(dirname(mainPath), 'subagents')
   return undefined
 }
 
@@ -540,6 +842,201 @@ export async function readKimiTitle(transcriptPath: string): Promise<string | un
   if (!isRecord(parsed)) return undefined
   const title = asString(parsed['title'])
   return title === undefined || title.trim() === '' ? undefined : title
+}
+
+/** Parse a small JSON sidecar file; unreadable or non-object means no facts. */
+async function readJsonRecord(file: string): Promise<Record<string, unknown> | null> {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(await readFile(file, 'utf8'))
+  } catch {
+    return null
+  }
+  return isRecord(parsed) ? parsed : null
+}
+
+/** Immediate subdirectories of a directory; a missing directory has none. */
+async function subdirectories(dir: string): Promise<string[]> {
+  try {
+    return (await readdir(dir, { withFileTypes: true }))
+      .filter(entry => entry.isDirectory())
+      .map(entry => join(dir, entry.name))
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Whether a grok `summary.json` describes a subagent child rather than a
+ * session of its own (GROK-FORMAT §D.5): `hidden` is the explicit override and
+ * wins when present, else a `session_kind` **starting with** `subagent`
+ * (`subagent`, `subagent_fork`, `subagent_resume`).
+ */
+function isGrokChildSummary(summary: Record<string, unknown>): boolean {
+  const hidden = summary['hidden']
+  if (typeof hidden === 'boolean') return hidden
+  return asString(summary['session_kind'])?.startsWith('subagent') === true
+}
+
+/** What `summary.json` (plus the binding search) says about one grok session directory. */
+interface GrokProbe {
+  /** The parsed `summary.json`, or `null` when grok has not written it yet. */
+  summary: Record<string, unknown> | null
+  /** Whether the summary marks this session as a subagent run (GROK-FORMAT §D.5). */
+  child: boolean
+  /** The parent it was bound to; unset for a main session and for an unbindable child. */
+  parentId?: string
+  agent?: AgentFileMeta
+}
+
+/** A parent's durable record of one subagent run (GROK-FORMAT §D.3). */
+export interface GrokChildBinding {
+  /** Child session id: the name of the top-level directory its transcript lives in. */
+  childId: string
+  parentId: string
+  agent: AgentFileMeta
+  /** The child's own working directory, when the meta recorded one. */
+  childCwd: string | null
+}
+
+/**
+ * Read `<session>/subagents/<childId>/meta.json` for every subagent a grok
+ * session spawned. This is the binding authority: a child transcript is a
+ * top-level session directory that names no parent of its own, and
+ * `summary.parent_session_id` is unreliable (GROK-FORMAT §D.3, §D.5).
+ */
+export async function readGrokSubagentMetas(subagentsDir: string): Promise<GrokChildBinding[]> {
+  const bindings: GrokChildBinding[] = []
+  for (const dir of await subdirectories(subagentsDir)) {
+    const meta = await readJsonRecord(join(dir, 'meta.json'))
+    if (meta === null) continue
+    const childId = asString(meta['child_session_id']) ?? asString(meta['subagent_id']) ?? basename(dir)
+    const parentId = asString(meta['parent_session_id'])
+    if (childId === '' || parentId === undefined || parentId === '') continue
+    const description = asString(meta['description'])
+    const agentType = asString(meta['subagent_type'])
+    const model = asString(meta['effective_model_id'])
+    bindings.push({
+      childId,
+      parentId,
+      // grok records no spawning tool-call id anywhere (GROK-FORMAT §D.4), so
+      // `toolUseId` stays unset and the adapter binds by prompt id and order.
+      agent: {
+        agentId: childId,
+        ...(description === undefined ? {} : { description }),
+        ...(agentType === undefined ? {} : { agentType }),
+        ...(model === undefined ? {} : { model }),
+      },
+      childCwd: asString(meta['child_cwd']) ?? null,
+    })
+  }
+  return bindings
+}
+
+/** Bytes that pass through grok's cwd encoding unescaped: the RFC 3986 unreserved set. */
+const GROK_UNRESERVED = /[A-Za-z0-9\-_.~]/
+
+/**
+ * Grok's encoded-cwd directory name (GROK-FORMAT §A.3): RFC 3986
+ * unreserved-set percent-encoding with **upper-case** hex — not
+ * `encodeURIComponent`, which leaves `!'()*` alone. A cwd whose encoding would
+ * exceed 255 bytes is stored under an irreversible `{slug}-{blake3}` name
+ * instead, which cannot be recomputed here; `undefined` says so.
+ */
+export function encodeGrokCwd(cwd: string): string | undefined {
+  let encoded = ''
+  for (const byte of Buffer.from(cwd, 'utf8')) {
+    const char = String.fromCharCode(byte)
+    encoded += GROK_UNRESERVED.test(char) ? char : `%${byte.toString(16).toUpperCase().padStart(2, '0')}`
+  }
+  return encoded.length > 255 ? undefined : encoded
+}
+
+/**
+ * Where a grok child's `updates.jsonl` can be: under its own cwd's group when
+ * the meta recorded one, else beside the parent (GROK-FORMAT §D.2, mirroring
+ * grok's own `ReplayPathHint`).
+ */
+export function grokChildPaths(rootDir: string, parentPath: string, binding: GrokChildBinding): string[] {
+  const paths: string[] = []
+  const encoded = binding.childCwd === null ? undefined : encodeGrokCwd(binding.childCwd)
+  if (encoded !== undefined) paths.push(join(rootDir, encoded, binding.childId, 'updates.jsonl'))
+  const sibling = join(dirname(dirname(parentPath)), binding.childId, 'updates.jsonl')
+  if (!paths.includes(sibling)) paths.push(sibling)
+  return paths
+}
+
+/**
+ * Grok's own generated session title: `summary.json`'s `session_summary`
+ * (GROK-FORMAT §B.1), verbatim like Kimi's `state.json` title — the meta
+ * scanner reads the same field the same way.
+ */
+export function grokSummaryTitle(summary: Record<string, unknown> | null): string | null {
+  const title = summary === null ? undefined : asString(summary['session_summary'])?.trim()
+  return title === undefined || title === '' ? null : title
+}
+
+/**
+ * The synthetic first line of a grok replay (GROK-DESIGN §3): the session facts
+ * (`summary.json`), the verbatim system prompt (`system_prompt.txt`, written
+ * for every session) and the tool schemas (`tool_definitions.json`, newest
+ * builds only) that grok keeps outside `updates.jsonl` (GROK-FORMAT §E.1,
+ * §E.3). `undefined` when the directory holds none of them — a transcript folds
+ * without a sidecar, it just has no system prompt and no schemas.
+ */
+export async function readGrokSidecar(transcriptPath: string, sessionId: string): Promise<GrokSidecarLine | undefined> {
+  const dir = dirname(transcriptPath)
+  return buildGrokSidecar(dir, sessionId, await readJsonRecord(join(dir, 'summary.json')))
+}
+
+/** A rendered sidecar line and the facts it carries, so an unchanged one is not re-sent. */
+export interface GrokSidecarLine {
+  line: string
+  key: string
+}
+
+/**
+ * `summary.json` fields grok patches on every appended line: write bookkeeping,
+ * not session facts (GROK-FORMAT §B.1). They ride along in the sidecar, so they
+ * are excluded from the key that decides whether a sidecar is news.
+ */
+const GROK_VOLATILE_SUMMARY_KEYS: ReadonlySet<string> = new Set([
+  'updated_at', 'num_messages', 'num_chat_messages', 'next_trace_turn',
+])
+
+/** The sidecar line for a session directory whose `summary.json` the caller already read. */
+async function buildGrokSidecar(
+  dir: string,
+  sessionId: string,
+  summary: Record<string, unknown> | null,
+): Promise<GrokSidecarLine | undefined> {
+  let systemPrompt: string | null
+  try {
+    systemPrompt = await readFile(join(dir, 'system_prompt.txt'), 'utf8')
+  } catch {
+    systemPrompt = null
+  }
+  let definitions: unknown
+  try {
+    definitions = JSON.parse(await readFile(join(dir, 'tool_definitions.json'), 'utf8'))
+  } catch {
+    definitions = undefined
+  }
+  const toolDefinitions = asArray(definitions) ?? null
+  if (summary === null && systemPrompt === null && toolDefinitions === null) return undefined
+  // `created_at` is RFC 3339; the envelope carries epoch SECONDS (GROK-FORMAT §C.1).
+  const created = Date.parse(asString(summary?.['created_at']) ?? '')
+  const stable = summary === null
+    ? null
+    : Object.fromEntries(Object.entries(summary).filter(([key]) => !GROK_VOLATILE_SUMMARY_KEYS.has(key)))
+  return {
+    line: JSON.stringify({
+      timestamp: Number.isNaN(created) ? 0 : Math.floor(created / 1000),
+      method: GROK_SIDECAR_METHOD,
+      params: { sessionId, summary, systemPrompt, toolDefinitions },
+    }),
+    key: JSON.stringify({ sessionId, stable, systemPrompt, toolDefinitions }),
+  }
 }
 
 async function readWholeFile(path: string, end: number): Promise<string[]> {
@@ -567,7 +1064,13 @@ function epochMs(raw: string | undefined): number | null {
   return numeric < 1e12 ? Math.round(numeric * 1000) : Math.round(numeric)
 }
 
-/** Epoch milliseconds of a raw JSONL line's `timestamp` (or Kimi's `time`), or `null`. */
+/**
+ * Epoch milliseconds of a raw JSONL line's `timestamp` (or Kimi's `time`), or
+ * `null`. Grok needs no branch of its own: its envelope's `"timestamp"` is
+ * numeric epoch **seconds** and is the first key on the line, while the
+ * millisecond stamp is spelled `agentTimestampMs` and never matches either
+ * pattern (GROK-FORMAT §C.1).
+ */
 export function lineTime(line: string): number | null {
   const match = TIMESTAMP_PATTERN.exec(line)
   if (match === null) return epochMs(TIME_PATTERN.exec(line)?.[1])

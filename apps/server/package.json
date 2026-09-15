@@ -2,7 +2,7 @@
   "name": "@harness-trajectory/server",
   "version": "0.1.0",
   "private": true,
-  "description": "Local server that scans Claude Code, Codex and Kimi Code transcripts and streams them to the trajectory web UI",
+  "description": "Local server that scans Claude Code, Codex, Kimi Code and Grok Build transcripts and streams them to the trajectory web UI",
   "type": "module",
   "bin": {
     "harness-trajectory": "./dist/main.js"

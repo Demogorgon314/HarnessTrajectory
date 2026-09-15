@@ -5,8 +5,8 @@
  */
 
 import {
-  asArray, asString, classifyInjectedUser, isCodexHumanPrompt, isRecord, kimiMessageClass, parseJsonLine,
-  parseTime, titleFrom, type HarnessKind,
+  asArray, asString, classifyInjectedUser, grokMessageClass, isCodexHumanPrompt, isRecord, kimiMessageClass,
+  parseGrokLine, parseJsonLine, parseTime, titleFrom, type HarnessKind,
 } from '@harness-trajectory/core'
 
 export interface FileHead {
@@ -35,11 +35,22 @@ export interface MetaScanner {
   push(line: string): void
 }
 
-export function createMetaScanner(kind: HarnessKind): MetaScanner {
+/**
+ * Scanner for one transcript. `summary` is only read by the grok scanner: it is
+ * the parsed `summary.json` sitting beside `updates.jsonl`, which carries the
+ * facts grok keeps out of the transcript (GROK-FORMAT §B.1). The caller reads
+ * that file — it already does, to decide whether the session is a subagent —
+ * so the scanner itself performs no I/O.
+ */
+export function createMetaScanner(
+  kind: HarnessKind,
+  summary?: Record<string, unknown> | null,
+): MetaScanner {
   switch (kind) {
     case 'claude': return claudeMetaScanner()
     case 'codex': return codexMetaScanner()
     case 'kimi': return kimiMetaScanner()
+    case 'grok': return grokMetaScanner(summary ?? null)
   }
 }
 
@@ -185,10 +196,71 @@ function kimiMetaScanner(): MetaScanner {
   }
 }
 
+/** Text of a grok `user_message_chunk`: the typed form when one was recorded (GROK-FORMAT §F.4). */
+function grokChunkText(update: Record<string, unknown>): string {
+  const content = update['content']
+  if (!isRecord(content)) return ''
+  const meta = isRecord(content['_meta']) ? content['_meta'] : undefined
+  return asString(meta?.['displayText']) ?? asString(content['text']) ?? ''
+}
+
+/**
+ * Grok keeps the session's title, cwd, model and creation instant in
+ * `summary.json` beside `updates.jsonl` rather than in it (GROK-FORMAT §B.1),
+ * so the scanner takes that object from its caller and then only counts prompts.
+ *
+ * `session_summary` is the harness's own generated title, so it lands on
+ * `aiTitle` the way Claude's `ai-title` record does — verbatim, like Kimi's
+ * `state.json` title, so the listing and the live sync agree; the first human
+ * prompt stays the fallback for a directory whose `summary.json` is not written
+ * yet (grok writes it last — GROK-DESIGN §1).
+ */
+function grokMetaScanner(summary: Record<string, unknown> | null): MetaScanner {
+  const state = emptyMeta()
+  if (summary !== null) {
+    const title = asString(summary['session_summary'])?.trim()
+    if (title !== undefined && title !== '') state.aiTitle = title
+    const info = isRecord(summary['info']) ? summary['info'] : undefined
+    state.cwd = asString(info?.['cwd']) ?? null
+    state.model = asString(summary['current_model_id']) ?? null
+    // `created_at` is RFC 3339 with microsecond precision; `parseTime` reads it as epoch ms.
+    noteTime(state, summary['created_at'])
+  }
+  return {
+    state,
+    push(line) {
+      const record = parseGrokLine(line)
+      if (record === null) return
+      noteTime(state, record.time)
+      const update = record.update
+      if (update === null) return
+      // The model of the turn rides on the user chunk; it is the only in-band
+      // source when `summary.json` has not been written yet.
+      if (record.sessionUpdate === 'user_message_chunk') {
+        const chunkMeta = isRecord(update['_meta']) ? update['_meta'] : undefined
+        state.model ??= asString(chunkMeta?.['modelId']) ?? null
+      } else if (record.sessionUpdate === 'model_changed') {
+        state.model ??= asString(update['model_id']) ?? null
+        return
+      }
+      // Human vs injected is decided by the `_meta` flags, never by the text.
+      if (grokMessageClass(update)?.kind !== 'human') return
+      // The prompt counts even when it carries no text (an image-only prompt),
+      // exactly as the adapter and the context synthesizer count it; the text
+      // only serves as the title fallback.
+      state.promptCount += 1
+      const text = grokChunkText(update)
+      if (state.title === null && text.trim() !== '') state.title = titleFrom(text)
+    },
+  }
+}
+
 /** Read identity facts from the first record of a transcript. */
 export function readHead(kind: HarnessKind, firstLine: string): FileHead {
   // Kimi identity is path-derived (`session_<id>/agents/<agentId>/wire.jsonl`); nothing to probe.
-  if (kind === 'kimi') return { id: null, parentId: null }
+  // Grok's is too (`<encoded-cwd>/<session-id>/updates.jsonl`), and its parent link lives in the
+  // parent's `subagents/<id>/meta.json`, not in the first record (GROK-FORMAT §D.4).
+  if (kind === 'kimi' || kind === 'grok') return { id: null, parentId: null }
   const record = parseJsonLine(firstLine)
   if (!isRecord(record)) return { id: null, parentId: null }
   if (kind === 'codex') {

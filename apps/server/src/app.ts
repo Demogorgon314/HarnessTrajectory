@@ -101,8 +101,14 @@ export function createApp({ index, staticDir }: AppOptions): Hono {
         replaying = false
         for (const event of queue.splice(0)) await send(event)
         await send({ type: 'ready' })
+        // Chrome's EventSource stops draining a large replay (~2 MB buffered) until the
+        // next write reaches the socket, so a multi-MB session used to settle only at
+        // the next keepalive — in 15 s multiples. A short burst of fast pings right
+        // after `ready` unsticks it; idle streams then fall back to the cheap cadence.
+        let burst = 20
         while (!closed) {
-          await stream.sleep(15_000)
+          await stream.sleep(burst > 0 ? 250 : 15_000)
+          if (burst > 0) burst -= 1
           if (!closed) await stream.writeSSE({ event: 'ping', data: '' })
         }
       } finally {

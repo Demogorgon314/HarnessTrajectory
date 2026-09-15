@@ -1,8 +1,8 @@
-import { mkdtemp, mkdir, rm, writeFile, appendFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, rm, utimes, writeFile, appendFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import type { SessionLiveEvent } from '@harness-trajectory/core'
+import { GROK_SIDECAR_METHOD, type SessionLiveEvent } from '@harness-trajectory/core'
 import { SessionIndex, classifyPath, lineTime, lineTimes, mergeChronologically, scopeToFile } from '../src/index.ts'
 import { createMetaScanner } from '../src/meta.ts'
 import { defaultRoots } from '../src/roots.ts'
@@ -71,6 +71,51 @@ function kimiMain(prompt: string): string {
   ])
 }
 
+const GROK_MAIN = '01a09b39-a469-7073-b766-83847750b352'
+const GROK_CHILD = '01a09b3a-1111-7073-b766-838477500001'
+const GROK_ORPHAN = '01a09b3b-2222-7073-b766-838477500002'
+
+/**
+ * Grok update envelopes (GROK-FORMAT §C.1): the envelope `timestamp` is epoch
+ * SECONDS, the millisecond stamp lives in `params._meta.agentTimestampMs`.
+ */
+function grok(update: Record<string, unknown>, offset: number, sessionId = GROK_MAIN, meta: Record<string, unknown> = {}) {
+  return {
+    timestamp: Math.floor((T0 + offset) / 1000),
+    method: 'session/update',
+    params: {
+      sessionId,
+      update,
+      _meta: { eventId: `${sessionId}-${offset}`, agentTimestampMs: T0 + offset, ...meta },
+    },
+  }
+}
+
+/** A genuine human chunk: `update._meta.promptIndex` is the flag that makes it one (§F.4). */
+function grokPrompt(text: string, promptIndex: number, offset: number, sessionId = GROK_MAIN) {
+  return grok({
+    sessionUpdate: 'user_message_chunk',
+    content: { type: 'text', text },
+    _meta: { modelId: 'grok-4.6', promptIndex },
+  }, offset, sessionId, { promptId: `prompt-${promptIndex}` })
+}
+
+/** The nine always-present `summary.json` keys (GROK-FORMAT §B.1), plus whatever a case needs. */
+function grokSummary(id: string, cwd: string, extra: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    info: { id, cwd },
+    session_summary: 'Grok status line',
+    created_at: iso(0),
+    updated_at: iso(30),
+    num_messages: 3,
+    num_chat_messages: 2,
+    current_model_id: 'grok-4.6',
+    next_trace_turn: 1,
+    chat_format_version: 1,
+    ...extra,
+  })
+}
+
 describe('classifyPath', () => {
   it('recognizes Claude main transcripts, agent files, and subagent directories', () => {
     const root = '/r'
@@ -99,24 +144,48 @@ describe('classifyPath', () => {
     expect(classifyPath('kimi', root, '/r/wd_project_ab12/session_k1/wire.jsonl')).toBeNull()
     expect(classifyPath('kimi', root, '/r/session_index.jsonl')).toBeNull()
   })
+
+  it('recognizes Grok update streams only, and never the side stores beside them', () => {
+    const root = '/r'
+    const dir = `/r/%2Fwork%2Fgrok/${GROK_MAIN}`
+    // A child session directory looks exactly like a main one here: only
+    // `summary.json` tells them apart, so the role stays provisional.
+    expect(classifyPath('grok', root, `${dir}/updates.jsonl`)).toEqual({ id: GROK_MAIN, role: 'main' })
+    expect(classifyPath('grok', root, `/r/%2Fwork%2Fgrok-wt/${GROK_CHILD}/updates.jsonl`))
+      .toEqual({ id: GROK_CHILD, role: 'main' })
+    // `chat_history.jsonl` is a derived cache, `events.jsonl` telemetry, the rest side stores.
+    expect(classifyPath('grok', root, `${dir}/chat_history.jsonl`)).toBeNull()
+    expect(classifyPath('grok', root, `${dir}/events.jsonl`)).toBeNull()
+    expect(classifyPath('grok', root, `${dir}/rewind_points.jsonl`)).toBeNull()
+    expect(classifyPath('grok', root, `${dir}/feedback.jsonl`)).toBeNull()
+    // Wrong depth: the cwd-level prompt log above, a per-tool store below.
+    expect(classifyPath('grok', root, '/r/%2Fwork%2Fgrok/prompt_history.jsonl')).toBeNull()
+    expect(classifyPath('grok', root, `${dir}/terminal/updates.jsonl`)).toBeNull()
+  })
 })
 
 describe('defaultRoots', () => {
-  it('resolves all three harness roots from harness homes and explicit overrides', () => {
+  it('resolves every harness root from harness homes and explicit overrides', () => {
     expect(defaultRoots({
       CLAUDE_CONFIG_DIR: join('/h', '.claude'),
       CODEX_HOME: join('/h', '.codex'),
       KIMI_CODE_HOME: join('/h', '.kimi-code'),
+      GROK_HOME: join('/h', '.grok'),
     })).toEqual([
       { kind: 'claude', dir: join('/h', '.claude', 'projects') },
       { kind: 'codex', dir: join('/h', '.codex', 'sessions') },
       { kind: 'kimi', dir: join('/h', '.kimi-code', 'sessions') },
+      { kind: 'grok', dir: join('/h', '.grok', 'sessions') },
     ])
     expect(defaultRoots({
       HARNESS_TRAJECTORY_CLAUDE_ROOT: join('/roots', 'c'),
       HARNESS_TRAJECTORY_CODEX_ROOT: join('/roots', 'x'),
       HARNESS_TRAJECTORY_KIMI_ROOT: join('/roots', 'k'),
-    }).map(root => root.dir)).toEqual([join('/roots', 'c'), join('/roots', 'x'), join('/roots', 'k')])
+      HARNESS_TRAJECTORY_GROK_ROOT: join('/roots', 'g'),
+    }).map(root => root.dir))
+      .toEqual([join('/roots', 'c'), join('/roots', 'x'), join('/roots', 'k'), join('/roots', 'g')])
+    // An empty `GROK_HOME` is not an override: grok itself falls back to the home default.
+    expect(defaultRoots({ GROK_HOME: '' }).at(-1)?.dir.endsWith(join('.grok', 'sessions'))).toBe(true)
   })
 })
 
@@ -150,6 +219,16 @@ describe('chronological merge', () => {
     expect(lineTime('{"type":"x","time":1789372800}')).toBe(1789372800_000)
     expect(lineTime(JSON.stringify({ timestamp: iso(1000), time: T0 + 9000 }))).toBe(T0 + 1000)
     expect(lineTime('{"type":"x"}')).toBeNull()
+  })
+
+  it('reads a Grok envelope timestamp as seconds and never mistakes agentTimestampMs for it', () => {
+    const line = JSON.stringify(grokPrompt('Hello there', 0, 1500))
+    // The envelope key is the first on the line and the millisecond stamp is
+    // spelled `agentTimestampMs`, which matches neither pattern.
+    expect(line.indexOf('"timestamp"')).toBeLessThan(line.indexOf('agentTimestampMs'))
+    expect(lineTime(line)).toBe(Math.floor((T0 + 1500) / 1000) * 1000)
+    // The sidecar the server prepends carries the same second-granular envelope.
+    expect(lineTime(JSON.stringify({ timestamp: 0, method: GROK_SIDECAR_METHOD, params: { sessionId: GROK_MAIN } }))).toBe(0)
   })
 })
 
@@ -209,6 +288,67 @@ describe('meta scanners', () => {
     for (const line of ['', '{ not json', 'null', '[]', JSON.stringify(kimi('mcp.tools_discovered', 1))]) {
       expect(() => { scanner.push(line) }).not.toThrow()
     }
+    expect(scanner.state).toMatchObject({ title: null, promptCount: 0 })
+  })
+
+  it('counts only genuine human Grok chunks, never hostTurn relays or the session preamble', () => {
+    // No path, so no `summary.json`: the scanner falls back to what the stream carries.
+    const scanner = createMetaScanner('grok')
+    const lines = [
+      // The preamble that opens every session: no `promptIndex`, so not a prompt.
+      grok({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text: '<environment>cwd</environment>' } }, 0),
+      grokPrompt('Port the viewer to Grok', 0, 10),
+      // A host-injected turn: flagged on the content, prompt index or not.
+      grok({
+        sessionUpdate: 'user_message_chunk',
+        content: { type: 'text', text: 'relayed', _meta: { hostTurn: true } },
+        _meta: { promptIndex: 1 },
+      }, 20),
+      grok({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'working on it' } }, 30),
+      grokPrompt('And a second one', 1, 40),
+    ]
+    for (const line of jsonl(lines).split('\n')) scanner.push(line)
+    expect(scanner.state).toMatchObject({
+      title: 'Port the viewer to Grok', aiTitle: null, cwd: null, model: 'grok-4.6',
+      promptCount: 2, startedAt: T0, lastTime: T0 + 40,
+    })
+  })
+
+  it('counts an image-only Grok prompt and keeps the next one as the title', () => {
+    const scanner = createMetaScanner('grok')
+    const lines = [
+      // A prompt whose only content is an image carries no text at all; it is
+      // still a turn, and the adapter and the synthesizer both count it.
+      grok({
+        sessionUpdate: 'user_message_chunk',
+        content: { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png' },
+        _meta: { modelId: 'grok-4.6', promptIndex: 0 },
+      }, 0),
+      grokPrompt('What is in it?', 1, 10),
+    ]
+    for (const line of jsonl(lines).split('\n')) scanner.push(line)
+    expect(scanner.state).toMatchObject({ title: 'What is in it?', promptCount: 2 })
+  })
+
+  it('takes the Grok title, cwd, model, and start from the summary the caller read', () => {
+    const scanner = createMetaScanner('grok', JSON.parse(grokSummary(GROK_MAIN, '/work/grok')) as Record<string, unknown>)
+    scanner.push(JSON.stringify(grokPrompt('Add Grok Build support', 0, 10)))
+    // `session_summary` lands on `aiTitle` verbatim, the way the live sync sets it.
+    expect(scanner.state).toMatchObject({
+      title: 'Add Grok Build support', aiTitle: 'Grok status line', cwd: '/work/grok',
+      model: 'grok-4.6', startedAt: T0, promptCount: 1,
+    })
+  })
+
+  it('tolerates malformed, legacy, and unknown Grok lines', () => {
+    const scanner = createMetaScanner('grok')
+    const lines = [
+      '', '{ not json', 'null', '[]',
+      JSON.stringify(grok({ sessionUpdate: 'hook_execution', hook_name: 'pre' }, 1)),
+      // A legacy line has no envelope at all: a bare ACP notification.
+      JSON.stringify({ sessionId: GROK_MAIN, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'x' } } }),
+    ]
+    for (const line of lines) expect(() => { scanner.push(line) }).not.toThrow()
     expect(scanner.state).toMatchObject({ title: null, promptCount: 0 })
   })
 })
@@ -438,5 +578,186 @@ describe('SessionIndex live children', () => {
     expect(scopeToFile(main, 'main-1/agent-a1')).toBeNull()
     expect(scopeToFile(child, 'main-1/agent-a1')).toMatchObject({ file: { id: 'main-1/agent-a1', role: 'main' } })
     expect(scopeToFile({ type: 'ready' }, 'main-1/agent-a1')).toEqual({ type: 'ready' })
+  })
+})
+
+describe('SessionIndex — Grok Build', () => {
+  let dir: string
+  let root: string
+  let mainDir: string
+  let index: SessionIndex
+
+  const systemPrompt = 'You are Grok released by xAI.'
+  const toolDefinitions = [{ type: 'function', function: { name: 'read_file', description: 'Read a file', parameters: {} } }]
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'harness-trajectory-grok-'))
+    root = join(dir, 'grok')
+    // The parent's group and the child's are different encoded cwds: a subagent
+    // gets its own top-level session directory under its own cwd (§D.2).
+    mainDir = join(root, '%2Fwork%2Fgrok', GROK_MAIN)
+    const childDir = join(root, '%2Fwork%2Fgrok-wt', GROK_CHILD)
+    const orphanDir = join(root, '%2Fwork%2Fgrok', GROK_ORPHAN)
+    await mkdir(join(mainDir, 'subagents', GROK_CHILD), { recursive: true })
+    await mkdir(childDir, { recursive: true })
+    await mkdir(orphanDir, { recursive: true })
+    await writeFile(join(mainDir, 'summary.json'), grokSummary(GROK_MAIN, '/work/grok'))
+    await writeFile(join(mainDir, 'system_prompt.txt'), systemPrompt)
+    await writeFile(join(mainDir, 'tool_definitions.json'), JSON.stringify(toolDefinitions))
+    await writeFile(join(mainDir, 'updates.jsonl'), jsonl([
+      grokPrompt('Add Grok Build support', 0, 0),
+      grok({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'On it' } }, 1000),
+    ]))
+    // Derived caches and side stores sit right beside the transcript.
+    await writeFile(join(mainDir, 'chat_history.jsonl'), jsonl([{ type: 'system', content: systemPrompt }]))
+    await writeFile(join(mainDir, 'events.jsonl'), jsonl([{ event: 'turn_started' }]))
+    await writeFile(join(root, '%2Fwork%2Fgrok', 'prompt_history.jsonl'), jsonl([
+      { timestamp: iso(0), session_id: GROK_MAIN, prompt: 'Add Grok Build support', is_bash: false },
+    ]))
+    await writeFile(join(mainDir, 'subagents', GROK_CHILD, 'meta.json'), JSON.stringify({
+      subagent_id: GROK_CHILD, parent_session_id: GROK_MAIN, child_session_id: GROK_CHILD,
+      subagent_type: 'general-purpose', description: 'Find the parser', prompt: 'find it',
+      status: 'completed', started_at: iso(200), child_cwd: '/work/grok-wt',
+      effective_model_id: 'grok-4.6-fast',
+    }))
+    await writeFile(join(childDir, 'summary.json'), grokSummary(GROK_CHILD, '/work/grok-wt', {
+      created_at: iso(500), session_kind: 'subagent', session_summary: 'Find the parser',
+    }))
+    await writeFile(join(childDir, 'updates.jsonl'), jsonl([grokPrompt('Find the parser', 0, 500, GROK_CHILD)]))
+    // A child whose parent never wrote a binding: better an orphan than invisible.
+    await writeFile(join(orphanDir, 'summary.json'), grokSummary(GROK_ORPHAN, '/work/grok', {
+      created_at: iso(2000), session_kind: 'subagent', session_summary: 'Unbound helper',
+    }))
+    await writeFile(join(orphanDir, 'updates.jsonl'), jsonl([grokPrompt('Orphaned work', 0, 2000, GROK_ORPHAN)]))
+    index = new SessionIndex({ roots: [{ kind: 'grok', dir: root }], watch: false, now: () => T0 + 60_000 })
+    await index.start()
+  })
+
+  afterEach(async () => {
+    index.stop()
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('titles a session from summary.json and binds a subagent under another encoded cwd', () => {
+    const session = index.get('grok', GROK_MAIN)
+    expect(session).toMatchObject({
+      id: GROK_MAIN, kind: 'grok', title: 'Grok status line', cwd: '/work/grok',
+      model: 'grok-4.6', startedAt: T0, childCount: 1, promptCount: 1,
+    })
+    expect(session?.files.map(file => `${file.role}:${file.id}`)).toEqual([`main:${GROK_MAIN}`, `child:${GROK_CHILD}`])
+    // grok records no spawning tool-call id, so `toolUseId` stays unset (§D.4).
+    expect(session?.files[1]).toMatchObject({
+      parentId: GROK_MAIN,
+      agent: { agentId: GROK_CHILD, description: 'Find the parser', agentType: 'general-purpose', model: 'grok-4.6-fast' },
+    })
+    expect(session?.files[1]?.agent?.toolUseId).toBeUndefined()
+    expect(index.hasChild('grok', GROK_MAIN, GROK_CHILD)).toBe(true)
+    expect(index.get('grok', GROK_CHILD)).toBeUndefined()
+  })
+
+  it('registers an unbindable subagent as a session of its own', () => {
+    expect(index.list().map(session => session.id).sort())
+      .toEqual([GROK_MAIN, GROK_ORPHAN].sort())
+    expect(index.get('grok', GROK_ORPHAN)).toMatchObject({
+      title: 'Unbound helper', cwd: '/work/grok', childCount: 0, promptCount: 1,
+    })
+  })
+
+  it('re-homes a child that registered before its parent wrote the binding', async () => {
+    const orphanPath = join(root, '%2Fwork%2Fgrok', GROK_ORPHAN, 'updates.jsonl')
+    // Grok creates the child's directory and appends to `updates.jsonl` before
+    // it writes `subagents/<id>/meta.json`, so the first probe finds no parent.
+    expect(index.list().map(session => session.id)).toContain(GROK_ORPHAN)
+    const events: SessionLiveEvent[] = []
+    const unsubscribe = index.subscribe('grok', GROK_MAIN, event => events.push(event))
+    await mkdir(join(mainDir, 'subagents', GROK_ORPHAN), { recursive: true })
+    await writeFile(join(mainDir, 'subagents', GROK_ORPHAN, 'meta.json'), JSON.stringify({
+      subagent_id: GROK_ORPHAN, parent_session_id: GROK_MAIN, child_session_id: GROK_ORPHAN,
+      subagent_type: 'explore', description: 'Unbound helper', status: 'running', started_at: iso(2000),
+    }))
+    await index.refreshPath(orphanPath)
+    expect(index.list().map(session => session.id)).toEqual([GROK_MAIN])
+    expect(index.get('grok', GROK_ORPHAN)).toBeUndefined()
+    expect(index.hasChild('grok', GROK_MAIN, GROK_ORPHAN)).toBe(true)
+    const session = index.get('grok', GROK_MAIN)
+    expect(session?.childCount).toBe(2)
+    expect(session?.files.find(file => file.id === GROK_ORPHAN)).toMatchObject({
+      role: 'child',
+      parentId: GROK_MAIN,
+      agent: { agentId: GROK_ORPHAN, description: 'Unbound helper', agentType: 'explore' },
+    })
+    // The parent's watchers learn about the new child file, as for one that
+    // appeared while they were watching.
+    const announced = events.find(event => event.type === 'file')
+    expect(announced?.type === 'file' && announced.file.id).toBe(GROK_ORPHAN)
+    unsubscribe()
+  })
+
+  it('re-homes a child whose summary.json did not exist yet either', async () => {
+    const lateId = '01a09b3c-3333-7073-b766-838477500003'
+    const lateDir = join(root, '%2Fwork%2Fgrok', lateId)
+    await mkdir(lateDir, { recursive: true })
+    await writeFile(join(lateDir, 'updates.jsonl'), jsonl([grokPrompt('Late helper', 0, 3000, lateId)]))
+    // Registered with no `summary.json` at all: nothing says it is a subagent.
+    await index.refreshPath(join(lateDir, 'updates.jsonl'))
+    expect(index.list().map(session => session.id)).toContain(lateId)
+    await writeFile(join(lateDir, 'summary.json'), grokSummary(lateId, '/work/grok', {
+      created_at: iso(3000), session_kind: 'subagent', session_summary: 'Late helper', hidden: true,
+    }))
+    await mkdir(join(mainDir, 'subagents', lateId), { recursive: true })
+    await writeFile(join(mainDir, 'subagents', lateId, 'meta.json'), JSON.stringify({
+      subagent_id: lateId, parent_session_id: GROK_MAIN, child_session_id: lateId,
+      subagent_type: 'general-purpose', description: 'Late helper', status: 'running', started_at: iso(3000),
+    }))
+    await index.refreshPath(join(lateDir, 'updates.jsonl'))
+    expect(index.get('grok', lateId)).toBeUndefined()
+    expect(index.hasChild('grok', GROK_MAIN, lateId)).toBe(true)
+  })
+
+  it('replays the sidecar first, carrying the system prompt, the tool schemas, and the summary', async () => {
+    const replay: SessionLiveEvent[] = []
+    await index.readAll('grok', GROK_MAIN, event => replay.push(event))
+    const first = replay.find(event => event.type === 'lines')
+    expect(first?.type === 'lines' && first.file.id).toBe(GROK_MAIN)
+    const line: unknown = JSON.parse((first?.type === 'lines' && first.lines[0]) || '{}')
+    expect(line).toMatchObject({
+      timestamp: Math.floor(T0 / 1000),
+      method: GROK_SIDECAR_METHOD,
+      params: {
+        sessionId: GROK_MAIN,
+        systemPrompt,
+        toolDefinitions,
+        summary: { info: { cwd: '/work/grok' }, session_summary: 'Grok status line', current_model_id: 'grok-4.6' },
+      },
+    })
+  })
+
+  it('re-sends the sidecar and the title when summary.json is rewritten', async () => {
+    const events: SessionLiveEvent[] = []
+    const unsubscribe = index.subscribe('grok', GROK_MAIN, event => events.push(event))
+    const summaryPath = join(mainDir, 'summary.json')
+    await writeFile(summaryPath, grokSummary(GROK_MAIN, '/work/grok', {
+      session_summary: 'Renamed mid-session', updated_at: iso(9000),
+    }))
+    // Force a distinct mtime so the change is unambiguous on every filesystem.
+    await utimes(summaryPath, new Date(T0 + 3_600_000), new Date(T0 + 3_600_000))
+    await index.refreshPath(join(mainDir, 'updates.jsonl'))
+    expect(events.map(event => event.type)).toEqual(['lines', 'meta'])
+    const [lines] = events
+    expect(lines?.type === 'lines' && lines.lines).toHaveLength(1)
+    const sidecar: unknown = JSON.parse((lines?.type === 'lines' && lines.lines[0]) || '{}')
+    expect(sidecar).toMatchObject({ method: GROK_SIDECAR_METHOD, params: { summary: { session_summary: 'Renamed mid-session' } } })
+    expect(index.get('grok', GROK_MAIN)?.title).toBe('Renamed mid-session')
+    // grok patches `num_messages`/`updated_at` into summary.json on essentially
+    // every appended line, so a fresh mtime is the steady state: the ~60 KB
+    // sidecar is only re-sent when its content actually differs.
+    events.length = 0
+    await writeFile(summaryPath, grokSummary(GROK_MAIN, '/work/grok', {
+      session_summary: 'Renamed mid-session', updated_at: iso(9000), num_messages: 9,
+    }))
+    await utimes(summaryPath, new Date(T0 + 7_200_000), new Date(T0 + 7_200_000))
+    await index.refreshPath(join(mainDir, 'updates.jsonl'))
+    expect(events).toEqual([])
+    unsubscribe()
   })
 })

@@ -2,9 +2,9 @@
 
 import type { ImageAttachmentRef, TrajectorySnapshot } from './contract.ts'
 
-export type HarnessKind = 'claude' | 'codex' | 'kimi'
+export type HarnessKind = 'claude' | 'codex' | 'kimi' | 'grok'
 
-export const HARNESS_KINDS: readonly HarnessKind[] = ['claude', 'codex', 'kimi']
+export const HARNESS_KINDS: readonly HarnessKind[] = ['claude', 'codex', 'kimi', 'grok']
 
 /** Facts about a subagent transcript recorded next to it (Claude Code `agent-<id>.meta.json`). */
 export interface AgentFileMeta {

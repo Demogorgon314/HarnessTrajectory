@@ -30,11 +30,12 @@ async function main(): Promise<void> {
   if (process.argv.includes('--help') || process.argv.includes('-h')) {
     console.log(`harness-trajectory [--port N] [--host H] [--static DIR]
 
-Scans Claude Code (~/.claude/projects), Codex (~/.codex/sessions) and Kimi Code
-(~/.kimi-code/sessions) transcripts on this machine and serves the trajectory viewer.
-Harness home overrides (CLAUDE_CONFIG_DIR / CODEX_HOME / KIMI_CODE_HOME) are honoured;
-override a root directly with HARNESS_TRAJECTORY_CLAUDE_ROOT /
-HARNESS_TRAJECTORY_CODEX_ROOT / HARNESS_TRAJECTORY_KIMI_ROOT.`)
+Scans Claude Code (~/.claude/projects), Codex (~/.codex/sessions), Kimi Code
+(~/.kimi-code/sessions) and Grok Build (~/.grok/sessions) transcripts on this machine
+and serves the trajectory viewer. Harness home overrides (CLAUDE_CONFIG_DIR /
+CODEX_HOME / KIMI_CODE_HOME / GROK_HOME) are honoured; override a root directly with
+HARNESS_TRAJECTORY_CLAUDE_ROOT / HARNESS_TRAJECTORY_CODEX_ROOT /
+HARNESS_TRAJECTORY_KIMI_ROOT / HARNESS_TRAJECTORY_GROK_ROOT.`)
     return
   }
   const port = Number(argValue('--port') ?? process.env['HARNESS_TRAJECTORY_PORT'] ?? 5170)

@@ -31,6 +31,19 @@ describe('parseHash / routeHash', () => {
     for (const route of routes) expect(parseHash(routeHash(route))).toStrictEqual(route)
   })
 
+  test('grok addresses round-trip like every other harness kind', () => {
+    // Grok ids are bare UUIDv7s and a child is a session id of its own.
+    const grokId = '01a09b39-a469-7073-b766-83847750b352'
+    const grokFile = '01a09b3a-1111-7073-b766-838477500001'
+    const routes: Route[] = [
+      { kind: 'grok', id: grokId },
+      { kind: 'grok', id: grokId, file: grokFile },
+      { kind: 'grok', id: grokId, tab: 'context' },
+      { kind: 'grok', id: grokId, tab: 'context', agent: grokFile },
+    ]
+    for (const route of routes) expect(parseHash(routeHash(route))).toStrictEqual(route)
+  })
+
   test('ids and agent ids survive the slashes and spaces in them', () => {
     expect(routeHash({ kind: K, id: ID, tab: 'context', agent: FILE }))
       .toBe('#/claude/sess%201/context/sess%201%2Fagent-a1b2')

@@ -312,8 +312,8 @@ export function App() {
             <div className={css.empty}>
               <div className={css.emptyTitle}>Pick a session</div>
               <div className={css.emptyHint}>
-                Sessions are scanned from <code>~/.claude/projects</code>, <code>~/.codex/sessions</code>, and{' '}
-                <code>~/.kimi-code/sessions</code> on this machine.
+                Sessions are scanned from <code>~/.claude/projects</code>, <code>~/.codex/sessions</code>,{' '}
+                <code>~/.kimi-code/sessions</code>, and <code>~/.grok/sessions</code> on this machine.
                 Running sessions update live.
               </div>
             </div>

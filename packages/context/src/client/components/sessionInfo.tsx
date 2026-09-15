@@ -70,8 +70,11 @@ export function makeSessionInfo(kit: ViewKit): (props: SessionInfoProps) => Reac
     if (info.reportedCostUsd !== undefined && Number.isFinite(info.reportedCostUsd)) {
       // The one figure on this card that is NOT about the shown agent: the
       // harness bills a session, subagents included, so the row says whose
-      // number it is and what it covers. It is always ≥ the Context Stats
-      // estimate, which can only price the calls the transcript records.
+      // number it is and what it covers. It can land EITHER SIDE of the Context
+      // Stats estimate: it covers calls the transcript never records (so it
+      // runs higher for Claude), but it settles at the vendor's own prices
+      // while the estimate only knows the models.dev list (xAI bills
+      // `grok-4.6-build` 66–71% BELOW list, so grok's runs far lower).
       const name = info.harnessName
       rows.push(
         <div key="cost" className="lc-pi-row lc-pi-cost">
