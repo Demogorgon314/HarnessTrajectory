@@ -24,13 +24,22 @@
  * includes. Everything else on the board stays per-agent — those cards
  * describe one context window.
  *
+ * PORT ADDITION — a SECOND row of six cells (peak occupancy, wall-clock
+ * duration, compactions, subagents, cost per human prompt, live images) fills
+ * the card to its neighbour's height and answers what the count row cannot:
+ * how full the window ever got, how long the session stayed open (idle time
+ * included, unlike the Timing card's active time), what maintenance it took,
+ * and what one prompt cost. The two derived cells read the request records
+ * (peak `prompt`, first/last stamp) — the only collections this card touches.
+ *
  * The counts arrive precomputed: the split-generation wire head carries them
  * (shared/types.ts `TimelineCounts` — computed over the retained records),
  * and the caller derives them from the collections on the inline generation
- * (`countsOfRecords`). The card itself never touches the collections.
+ * (`countsOfRecords`). The count cells themselves never touch the
+ * collections — only the two derived cells above do.
  */
 
-import { type ReactElement, type ReactNode } from 'react'
+import { type ReactElement, type ReactNode, useId } from 'react'
 import type { ContextEventRecord, RequestRecord, SessionCostUsage, TimelineCounts, TokenUsage } from '../../shared/types'
 import { estimateSessionCost, formatCost, formatPriceRate, offPeakOf, priceOf, toCurrency, unpricedCostModels, write1hOf } from '../cost'
 import type { CostCurrency, ModelPrices, PriceTriple } from '../cost'
@@ -56,6 +65,11 @@ interface PriceRow {
 }
 
 /** Whether any of a model's pricing periods booked a 1-hour cache write. */
+/** Stable id fragment for a cell's tooltip, so its badge can point at it with `aria-describedby`. */
+function slug(label: string): string {
+  return label.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'tip'
+}
+
 function wrote1h(periods: Record<string, unknown> | null): boolean {
   if (periods === null) return false
   for (const period of ['peak', 'off'] as const) {
@@ -137,7 +151,63 @@ export function countsOfRecords(requests: readonly RequestRecord[], events: read
   return { turns: turns.size, steps: requests.length, injects, compactions, prunes }
 }
 
-export function makeStatsContext(kit: ViewKit): (props: {
+/**
+ * PORT ADDITION — the largest prompt this agent ever sent, in tokens:
+ * `RequestRecord.prompt` is the provider-reported prompt size (input +
+ * cacheRead + cacheWrite), so the peak is the high-water mark of the context
+ * window's occupancy. Rows folded before the fold carried `prompt` fall back
+ * to their heuristic `total`. Null when no record carries a usable figure —
+ * a peak of zero is not a measurement.
+ */
+export function peakContextOf(requests: readonly RequestRecord[]): number | null {
+  let peak = 0
+  for (const req of requests) {
+    const value = req.prompt ?? req.total
+    if (!Number.isFinite(value)) continue
+    if (value > peak) peak = value
+  }
+  return peak > 0 ? peak : null
+}
+
+/**
+ * PORT ADDITION — the session's WALL-CLOCK span: the first request's stamp to
+ * the last stamp the log carries (the last request, or a later context event —
+ * a compaction can land after the final request). Unlike the Timing card's
+ * active time this counts the gaps, so it answers "how long was this session
+ * open", not "how long did it work". Null when the log holds fewer than two
+ * distinct stamps (nothing elapsed to report).
+ */
+export function durationOf(
+  requests: readonly RequestRecord[],
+  events: readonly ContextEventRecord[] = [],
+): number | null {
+  let first: number | null = null
+  let last: number | null = null
+  for (const req of requests) {
+    if (!Number.isFinite(req.time)) continue
+    if (first === null || req.time < first) first = req.time
+    if (last === null || req.time > last) last = req.time
+  }
+  if (first === null || last === null) return null
+  for (const ev of events) {
+    if (Number.isFinite(ev.time) && ev.time > last) last = ev.time
+  }
+  const ms = last - first
+  return ms > 0 ? ms : null
+}
+
+/**
+ * PORT ADDITION — what one human prompt cost on average: the card's own cost
+ * estimate over the whole-session human-input tally. Null when either half is
+ * missing (no priced cost, or a session the user never prompted — dividing by
+ * zero would print an infinity).
+ */
+export function costPerPromptOf(cost: number | null, humanInputs: number): number | null {
+  if (cost === null || !(humanInputs > 0)) return null
+  return cost / humanInputs
+}
+
+export interface StatsContextProps {
   /** The session-shape tally (host-precomputed on the split generation). */
   counts: TimelineCounts
   /** The whole-session human-input tally (the user's messages + question answers; absent on older hosts). */
@@ -149,20 +219,28 @@ export function makeStatsContext(kit: ViewKit): (props: {
   cost?: SessionCostUsage | undefined
   /** PORT ADDITION — per-agent cost shares; two or more entries itemize the bubble. */
   costParts?: readonly CostPart[] | undefined
+  /**
+   * PORT ADDITION — the shown agent's request records, read ONLY by the two
+   * derived cells (peak occupancy, wall-clock span). Empty/absent dashes them.
+   */
+  requests?: readonly RequestRecord[] | undefined
+  /** PORT ADDITION — the shown agent's context events; only their stamps are read (a trailing compaction extends the span). */
+  events?: readonly ContextEventRecord[] | undefined
+  /** PORT ADDITION — the route's context window, when the log records one: it turns the peak into a share. */
+  contextWindow?: number | undefined
+  /** PORT ADDITION — image blocks live in the current context (Snapshot.images; absent reads as zero). */
+  images?: number | undefined
+  /** PORT ADDITION — child agents of the session, main agent excluded. Absent (not zero) dashes the cell. */
+  subagents?: number | undefined
   locale: string
-}) => ReactElement {
-  const { t, fmt } = kit
-  return function StatsContext(props: {
-    counts: TimelineCounts
-    humanInputs?: number | undefined
-    toolCalls?: number | undefined
-    usage: TokenUsage | null
-    cost?: SessionCostUsage | undefined
-    costParts?: readonly CostPart[] | undefined
-    locale: string
-  }): ReactElement {
+}
+
+export function makeStatsContext(kit: ViewKit): (props: StatsContextProps) => ReactElement {
+  const { t, fmt, fmtDuration } = kit
+  return function StatsContext(props: StatsContextProps): ReactElement {
     const currency: CostCurrency = props.locale === 'zh' ? 'cny' : 'usd'
     const { prices, failed } = useModelPrices()
+    const tipIdBase = useId()
     const cost = estimateSessionCost(props.cost, prices, currency)
     const fmtRate = (usd: number): string => formatPriceRate(toCurrency(usd, currency), currency)
     const rows = priceRowsOf(props.cost, prices)
@@ -250,17 +328,40 @@ export function makeStatsContext(kit: ViewKit): (props: {
       if (shown.length === 0) return undefined
       return shown.map(line => <span key={line} className="lc-stat-note" title={line}>{line}</span>)
     }
-    const cell = (label: string, value: string | number, tip?: ReactNode, note?: ReactNode): ReactElement => (
-      <div className={'lc-stat' + (tip === undefined ? '' : ' lc-stat-tipped group/tip')}>
-        <span className="lc-stat-label">
-          {label}
-          {tip !== undefined && <i className="lc-stat-q group-hover/tip:text-(--dsw-alias-label-primary) group-hover/tip:border-(--dsw-alias-label-primary)" aria-hidden="true">?</i>}
-        </span>
-        <b className="lc-stat-value">{typeof value === 'number' ? fmt(value) : value}</b>
-        {note !== undefined && note}
-        {tip !== undefined && <span className="lc-tip lc-stat-tip group-hover/tip:opacity-100" role="tooltip">{tip}</span>}
-      </div>
-    )
+    // PORT ADDITION — the second row's derived figures. The peak prompt reads
+    // as a SHARE whenever the route's window is known (the figure the reader
+    // actually judges: "how full did this get"), and falls back to the token
+    // count when it is not.
+    const peak = peakContextOf(props.requests ?? [])
+    const window = props.contextWindow
+    const peakValue = peak === null ? '—'
+      : window !== undefined && window > 0 ? `${Math.round((peak / window) * 100)}%`
+        : fmt(peak)
+    const durationMs = durationOf(props.requests ?? [], props.events ?? [])
+    const prunes = props.counts.prunes
+    const compactionsTip = t('stats.compactionsTip') + (prunes > 0 ? ' ' + t('stats.compactionsPrunes', { n: prunes }) : '')
+    const perPrompt = costPerPromptOf(cost, props.humanInputs ?? 0)
+    // PORT CHANGE — dsh reveals a cell's bubble on hover anywhere over the cell. With
+    // nine of twelve cells tipped and the bubble spanning the card, that flashed a
+    // bubble over the cards below on any mouse movement, so the reveal now rides the
+    // '?' badge only: hover or keyboard focus on the badge (stats.css `:has()` rules),
+    // and the badge is a real button so it is reachable without a mouse.
+    const cell = (label: string, value: string | number, tip?: ReactNode, note?: ReactNode): ReactElement => {
+      const tipId = tip === undefined ? undefined : `${tipIdBase}-${slug(label)}`
+      return (
+        <div className={'lc-stat' + (tip === undefined ? '' : ' lc-stat-tipped')}>
+          <span className="lc-stat-label">
+            {label}
+            {tipId !== undefined && (
+              <button type="button" className="lc-stat-q" aria-label={t('stats.tipBadge')} aria-describedby={tipId}>?</button>
+            )}
+          </span>
+          <b className="lc-stat-value">{typeof value === 'number' ? fmt(value) : value}</b>
+          {note !== undefined && note}
+          {tipId !== undefined && <span id={tipId} className="lc-tip lc-stat-tip" role="tooltip">{tip}</span>}
+        </div>
+      )
+    }
     return (
       <div className="lc-card lc-col-stats flex-1 min-w-[min(360px,100%)]">
         <div className="lc-card-title">
@@ -287,6 +388,20 @@ export function makeStatsContext(kit: ViewKit): (props: {
               partial ? t('stats.costPartial', { n: unpricedModels.length, models: unpricedModels.join(', ') }) : null,
             ]),
           )}
+          {/* The second row: the same six-cell rhythm, answering what the shape
+              figures above cannot — how full the window ever got, how long the
+              session was open, what maintenance it took, how many agents and
+              images it carried, and what one prompt cost. */}
+          {cell(t('stats.peakContext'), peakValue, t('stats.peakContextTip'))}
+          {cell(t('stats.duration'), durationMs === null ? '—' : fmtDuration(durationMs), t('stats.durationTip'))}
+          {cell(t('stats.compactions'), props.counts.compactions, compactionsTip)}
+          {cell(t('stats.subagents'), props.subagents ?? '—', t('stats.subagentsTip'))}
+          {cell(
+            t('stats.costPerPrompt'),
+            perPrompt === null ? '—' : formatCost(perPrompt, currency),
+            t('stats.costPerPromptTip'),
+          )}
+          {cell(t('stats.images'), props.images ?? 0, t('stats.imagesTip'))}
         </div>
       </div>
     )

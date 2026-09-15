@@ -12,10 +12,22 @@
 .lc-stat-value { color: var(--dsw-alias-label-primary); font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: center; }
 .lc-stat-sub { color: var(--dsw-alias-label-secondary); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 /*
- Stats cell tooltip (cost cell): styled DOM bubble because native `title` can't hold the multi-row price breakdown; a '?' signals the affordance and hovering anywhere on the cell reveals the bubble below (the cell is the tip's position frame). Chrome rides the shared `.lc-tip`; the reveal and the badge's brighten ride `group-hover/tip` variants (`group/tip` on the cell).
+ Stats cell tooltip (cost cell): styled DOM bubble because native `title` can't hold the multi-row price breakdown; a '?' badge is the affordance and, in this port, the only reveal target (see the PORT CHANGE below). Chrome rides the shared `.lc-tip`.
  */
 .lc-stat-tipped { position: relative; }
 .lc-stat-q { display: inline-block; margin-left: 4px; width: 11px; height: 11px; line-height: 11px; border-radius: 50%; text-align: center; font-size: 9px; font-weight: 700; font-style: normal; color: var(--dsw-alias-label-secondary); background: var(--dsw-alias-bg-layer-1); border: 1px solid var(--dsw-alias-border-l2); cursor: help; transition: color var(--ds-transition-duration, 0.2s) var(--ds-ease-in-out, ease-in-out), border-color var(--ds-transition-duration, 0.2s) var(--ds-ease-in-out, ease-in-out); }
+/*
+ PORT CHANGE — dsh reveals the bubble on hover anywhere over the cell (a `group-hover/tip`
+ variant on the cell). Nine of the twelve cells now carry a bubble that spans the card, so
+ that flashed a bubble over the cards below on any mouse movement. The reveal now rides the
+ badge only — hover or keyboard focus — and the badge is a button with a ~20px hit area
+ (`::before` pads the 11px dot) so it is easy to hit and reachable from the keyboard.
+ */
+.lc-stat-q { appearance: none; padding: 0; font-family: inherit; position: relative; }
+.lc-stat-q::before { content: ''; position: absolute; inset: -5px; border-radius: 50%; }
+.lc-stat-q:hover, .lc-stat-q:focus-visible { color: var(--dsw-alias-label-primary); border-color: var(--dsw-alias-label-primary); }
+.lc-stat-q:focus-visible { outline: 2px solid var(--dsw-alias-state-business-primary); outline-offset: 1px; }
+.lc-stat-tipped:has(.lc-stat-q:hover) .lc-stat-tip, .lc-stat-tipped:has(.lc-stat-q:focus-visible) .lc-stat-tip { opacity: 1; }
 .lc-stat-tip { top: calc(100% + 6px); left: 0; max-width: 280px; line-height: 1.5; font-weight: 400; }
 .lc-stat-tip-prices { display: block; margin-top: 5px; border-top: 1px dashed var(--dsw-alias-border-l1); padding-top: 5px; }
 .lc-stat-tip-head { display: block; font-weight: 600; }
@@ -34,6 +46,16 @@
 .lc-stats { position: relative; }
 .lc-stats .lc-stat-tipped { position: static; }
 .lc-stats .lc-stat-tip { top: 100%; right: 0; left: 0; width: auto; max-width: none; }
+/*
+ PORT ADDITION (follow-up) — un-positioning the cell above also un-anchored the
+ corner-pinned '?' badge, so every badge landed at the GRID's top-right corner,
+ stacked under the last cell's. The badge sits inside the label span, so the label
+ becomes its anchor: it keeps the corner pin (per cell, as in dsh) while the
+ bubble stays anchored to the grid. The label reserves the badge's width so a
+ long label ellipsizes before the badge instead of under it.
+ */
+.lc-stats .lc-stat-tipped .lc-stat-label { position: relative; padding-right: 14px; }
+.lc-stats .lc-stat-tipped .lc-stat-q { top: 0; right: 0; }
 .lc-card-sub { font-weight: 400; color: var(--dsw-alias-label-secondary); font-size: 12px; margin-left: auto; }
 .lc-overview-num { display: flex; align-items: baseline; gap: 6px; margin-bottom: 8px; }
 .lc-overview-num > b { font-size: 20px; }

@@ -97,9 +97,13 @@
  donut row (it drops the context stats / plugin info row — see
  contextView.tsx); the same wrap then stacks the pair in the narrow pane.
  */
-/* The context card's cell grid stretches to the plugin card's height, so the row reads as one level band. */
-.lc-head > .lc-card:has(.lc-stats) { display: flex; flex-direction: column; }
-.lc-head .lc-stats { flex: 1; align-content: stretch; }
+/* PORT CHANGE — dsh stretched the context card's cell grid to the plugin card's height so the row read
+   as one level band. Here the Session Info card beside it is much taller (cwd, model, resume command,
+   reported cost), so stretched cells became ~300px of blank tile around one number. The card now
+   hugs its cell grid (the cells keep their natural two-line height) and lets the band sit uneven
+   rather than carrying a blank area under the grid. */
+.lc-head > .lc-card:has(.lc-stats) { display: flex; flex-direction: column; align-self: flex-start; }
+.lc-head .lc-stats { align-content: start; }
 .lc-head .lc-stat { justify-content: center; }
 .lc-empty { color: var(--dsw-alias-label-secondary); padding: 18px 0; text-align: center; }
 .lc-error { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 40px 16px; }
