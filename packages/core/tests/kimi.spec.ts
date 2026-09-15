@@ -473,6 +473,44 @@ describe('kimi adapter', () => {
     expect(toolResults(parser)).toHaveLength(1)
   })
 
+  it('nests child events that outran their task.started record', () => {
+    // A background child's first lines can be written before the parent
+    // flushes `task.started`: they buffer, then nest when it lands.
+    const parser = createKimiParser()
+    for (const item of [
+      metadata(),
+      profileBind(10),
+      turnPrompt(100, 'fix the bug'),
+      appendMessage(110, 'fix the bug', { kind: 'user' }),
+      stepBegin(200, '0', 1),
+      toolCall(300, '0', 1, 'call-agent', 'Agent', {
+        subagent_type: 'coder', prompt: 'fix the bug in a.ts', description: 'Fix the bug',
+        run_in_background: true,
+      }),
+      stepEnd(310, '0', 1, { finishReason: 'tool_use', usage: usage(10, 0, 0, 5) }),
+    ]) parser.push(item, MAIN)
+    for (const item of [
+      stepBegin(350, '0', 1, CHILD_ID),
+      toolCall(360, '0', 1, 'child-call-1', 'Read', { path: '/tmp/a.ts' }, CHILD_ID),
+      toolResult(370, 'child-call-1', { output: 'export const a = 1' }, CHILD_ID),
+    ]) parser.push(item, CHILD)
+    for (const item of [
+      line('task.started', {
+        info: {
+          kind: 'agent', taskId: 'task-1', agentId: CHILD_ID, parentToolCallId: 'call-agent',
+          description: 'Fix the bug', subagentType: 'coder', status: 'running', startedAt: at(340),
+        },
+      }, 400),
+      toolResult(410, 'call-agent', { output: `task_id: task-1\nstatus: running\nagent_id: ${CHILD_ID}\n` }),
+    ]) parser.push(item, MAIN)
+    const [run] = parser.subagents()
+    expect(run).toMatchObject({ agentId: CHILD_ID, callId: 'call-agent', toolCalls: 1 })
+    const [agentResult] = toolResults(parser)
+    expect(agentResult?.callId).toBe('call-agent')
+    expect(agentResult?.subCalls.map(call => call.callId)).toEqual(['child-call-1'])
+    expect(toolResults(parser)).toHaveLength(1)
+  })
+
   it('falls back to the agent_id line of an Agent result when no task.started was seen', () => {
     const parser = feed([
       metadata(),
@@ -530,6 +568,89 @@ describe('kimi adapter', () => {
     expect(parser.meta().promptCount).toBe(1)
   })
 
+  it('binds a foreground Agent run whose transcript streamed in before its result', () => {
+    // The real foreground order: the Agent call, the child's WHOLE wire file,
+    // and only then the result whose header names the child.
+    const parser = createKimiParser()
+    for (const item of [
+      metadata(),
+      profileBind(10),
+      turnPrompt(100, 'review it'),
+      appendMessage(110, 'review it', { kind: 'user' }),
+      stepBegin(200, '0', 1),
+      toolCall(300, '0', 1, 'call-agent', 'Agent', {
+        subagent_type: 'explore', prompt: 'review the diff carefully', description: 'Review the diff',
+      }),
+      stepEnd(310, '0', 1, { finishReason: 'tool_use', usage: usage(10, 0, 0, 5) }),
+    ]) parser.push(item, MAIN)
+    for (const item of [
+      JSON.stringify({ type: 'metadata', created_at: at(320), protocol_version: '1.5' }),
+      stepBegin(400, '0', 1, CHILD_ID),
+      toolCall(500, '0', 1, 'child-call-1', 'Read', { path: '/tmp/a.ts' }, CHILD_ID),
+      toolResult(600, 'child-call-1', { output: 'export const a = 1' }, CHILD_ID),
+      loop(700, { type: 'step.end', finishReason: 'stop', step: 1, turnId: '0' }, CHILD_ID),
+    ]) parser.push(item, CHILD)
+    for (const item of [
+      toolResult(800, 'call-agent', {
+        output: `agent_id: ${CHILD_ID}\nactual_subagent_type: explore\nstatus: completed\nstop_reason: completed\n\n[summary]\nReviewed.`,
+      }),
+      turnEnded(900, 0),
+    ]) parser.push(item, MAIN)
+    expect(parser.subagents()).toEqual([{
+      agentId: CHILD_ID,
+      fileId: CHILD_ID,
+      callId: 'call-agent',
+      description: 'Review the diff',
+      agentType: 'explore',
+      model: null,
+      status: 'completed',
+      startedAt: at(320),
+      endedAt: at(800),
+      lastTime: at(700),
+      toolCalls: 1,
+    }])
+    // The events the child buffered while unbound nest under the Agent call now.
+    const [agentResult] = toolResults(parser)
+    expect(agentResult?.callId).toBe('call-agent')
+    expect(agentResult?.subCalls.map(call => call.callId)).toEqual(['child-call-1'])
+    expect(toolResults(parser)).toHaveLength(1)
+  })
+
+  it('binds every agent an AgentSwarm result announces', () => {
+    const parser = feed([
+      metadata(),
+      profileBind(10),
+      turnPrompt(100, 'swarm review'),
+      appendMessage(110, 'swarm review', { kind: 'user' }),
+      stepBegin(200, '0', 1),
+      toolCall(300, '0', 1, 'call-swarm', 'AgentSwarm', {
+        prompt_template: 'Review {{item}}', items: ['src/a.ts', 'src/b.ts'],
+      }),
+      stepEnd(310, '0', 1, { finishReason: 'tool_use', usage: usage(10, 0, 0, 5) }),
+      toolResult(400, 'call-swarm', {
+        output: [
+          '<agent_swarm_result>',
+          '<summary>1 completed, 1 failed, 0 aborted</summary>',
+          '<subagent agent_id="agent-3" item="Review src/a.ts" outcome="completed">looks fine</subagent>',
+          '<subagent agent_id="agent-4" item="Review src/b.ts &amp; friends" outcome="failed" stop_reason="error">boom</subagent>',
+          '</agent_swarm_result>',
+        ].join('\n'),
+      }),
+    ])
+    expect(parser.subagents()).toEqual([
+      {
+        agentId: 'agent-3', fileId: 'agent-3', callId: 'call-swarm',
+        description: 'Review src/a.ts', agentType: null, model: null,
+        status: 'completed', startedAt: at(400), endedAt: at(400), lastTime: null, toolCalls: 0,
+      },
+      {
+        agentId: 'agent-4', fileId: 'agent-4', callId: 'call-swarm',
+        description: 'Review src/b.ts & friends', agentType: null, model: null,
+        status: 'failed', startedAt: at(400), endedAt: at(400), lastTime: null, toolCalls: 0,
+      },
+    ])
+  })
+
   it('records a compaction as a summary node and a compaction request', () => {
     const parser = feed([
       ...twoStepFixture(),
@@ -573,6 +694,124 @@ describe('kimi adapter', () => {
       shadowedItemCount: 3,
       shadowedTokenCount: null,
     })
+  })
+
+  it('ignores a compaction llm.request instead of opening a phantom step', () => {
+    // The real compaction sequence: the summary request carries no `turnStep`
+    // and its `maxTokens` is the summary model's 128k cap, not the 1M window.
+    const parser = feed([
+      ...twoStepFixture(),
+      line('full_compaction.begin', {}, 2_500),
+      line('llm.request', {
+        kind: 'compaction', model: 'k3', modelAlias: 'kimi-code/k3', provider: 'openai',
+        maxTokens: 131_072, toolSelect: false, messageCount: 12,
+      }, 2_510),
+      usageRecord(2_520, usage(50, 0, 0, 30)),
+      line('context.apply_compaction', {
+        summary: 'Earlier context summarized.', compactedCount: 12,
+        tokensBefore: 5_000, tokensAfter: 800, wireLines: { start: 1, end: 16 },
+      }, 2_530),
+      turnPrompt(3_000, 'next question'),
+      appendMessage(3_010, 'next question', { kind: 'user' }),
+      stepBegin(3_100, '1', 1),
+      llmRequest(3_110, '1.1'),
+      textPart(3_200, '1', 1, 'answer'),
+      stepEnd(3_210, '1', 1, { usage: usage(10, 0, 0, 2) }),
+      turnEnded(3_300, 1),
+    ])
+    // Exactly the fixture's two steps plus the new turn's: the compaction
+    // request opened nothing.
+    expect(assistants(parser).map(node => [node.turn, node.step])).toEqual([[1, 1], [1, 2], [2, 1]])
+    expect(parser.snapshot().requests.filter(item => item.purpose === 'assistant')).toHaveLength(3)
+    expect(parser.snapshot().requests.find(item => item.purpose === 'compaction')).toBeDefined()
+    // The 128k cap never replaced the context window on later requests.
+    expect(assistants(parser).at(-1)?.requestConfig?.maxTokens).toBe(1_048_576)
+  })
+
+  it('counts a delegated subagent prompt as the human prompt of its own transcript', () => {
+    // A child file served standalone (`role: 'main'`): its first prompt is a
+    // `system_trigger`/`subagent` record whose text opens with a git brief.
+    const parser = createKimiParser()
+    const standalone: SessionFileRef = { ...CHILD, role: 'main' }
+    const delegated = '<git-context>\nWorking directory: /work/project\nBranch: main\n</git-context>\n\nReview the diff carefully.'
+    for (const item of [
+      JSON.stringify({ type: 'metadata', created_at: T0, protocol_version: '1.5' }),
+      profileBind(10, { profileName: 'explore' }),
+      line('turn.prompt', {
+        promptId: 'prompt-sub', input: [{ type: 'text', text: delegated }],
+        origin: { kind: 'system_trigger', name: 'subagent' },
+      }, 100, CHILD_ID),
+      line('context.append_message', {
+        message: {
+          role: 'user', content: [{ type: 'text', text: delegated }], toolCalls: [],
+          origin: { kind: 'system_trigger', name: 'subagent' },
+        },
+      }, 110, CHILD_ID),
+      stepBegin(200, '0', 1, CHILD_ID),
+      textPart(300, '0', 1, 'Done.'),
+      stepEnd(310, '0', 1, { usage: usage(5, 0, 0, 1) }),
+      line('turn.ended', { durationMs: 100, reason: 'completed', turnId: 0 }, 400, CHILD_ID),
+    ]) parser.push(item, standalone)
+    expect(parser.meta()).toEqual({
+      title: 'Review the diff carefully.',
+      cwd: '/work/project',
+      model: 'k3',
+      startedAt: T0,
+      promptCount: 1,
+    })
+    expect(parser.snapshot().eventNodes[0]?.kind).toBe('user')
+  })
+
+  it('folds image_url parts of prompts and tool results into image blocks', () => {
+    const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+    const blobref = `blobref:image/png;${'a'.repeat(64)}`
+    const parser = feed([
+      metadata(),
+      profileBind(10),
+      turnPrompt(100, 'what is in this image?'),
+      line('context.append_message', {
+        message: {
+          role: 'user',
+          content: [
+            { type: 'image_url', imageUrl: { url: `data:image/png;base64,${png}`, name: 'shot.png' } },
+            { type: 'text', text: 'what is in this image?' },
+          ],
+          toolCalls: [],
+          origin: { kind: 'user' },
+        },
+      }, 110),
+      stepBegin(200, '0', 1),
+      toolCall(300, '0', 1, 'call-media', 'ReadMediaFile', { path: '/tmp/shot.png' }),
+      stepEnd(310, '0', 1, { finishReason: 'tool_use', usage: usage(10, 0, 0, 5) }),
+      toolResult(400, 'call-media', {
+        output: [
+          { type: 'text', text: '<image path="/tmp/shot.png">' },
+          { type: 'image_url', imageUrl: { url: blobref } },
+        ],
+      }),
+      stepBegin(500, '0', 2),
+      textPart(600, '0', 2, 'It is a dot.'),
+      stepEnd(610, '0', 2, { usage: usage(5, 0, 0, 1) }),
+    ])
+    // The prompt's inline image resolves from the store, bytes and all.
+    const user = parser.snapshot().eventNodes[0]
+    expect(user?.kind).toBe('user')
+    const userImage = user?.kind === 'user'
+      ? user.content.find(block => block.type === 'image')
+      : undefined
+    expect(userImage).toMatchObject({ type: 'image', attachment: { mediaType: 'image/png', name: 'shot.png' } })
+    if (userImage?.type === 'image') {
+      expect(parser.imageUrl(userImage.attachment)).toBe(`data:image/png;base64,${png}`)
+    }
+    // The result keeps its text part and its image; the blobref attachment is
+    // attributed to the main file so the client can route the resolution.
+    const [result] = toolResults(parser)
+    expect(result?.content.map(block => block.type)).toEqual(['text', 'image'])
+    const resultImage = result?.content.find(block => block.type === 'image')
+    if (resultImage?.type === 'image') {
+      expect(resultImage.attachment.fileId).toBe(SESSION_ID)
+      expect(parser.imageUrl(resultImage.attachment)).toBe(blobref)
+    }
   })
 
   it('closes an interrupted step without usage', () => {
@@ -667,6 +906,13 @@ describe('kimiMessageClass', () => {
 
   it('keeps an unknown origin out of the human bucket', () => {
     expect(kimiMessageClass({ kind: 'future_kind' })).toEqual({ kind: 'injection', name: 'future_kind' })
+  })
+
+  it('counts only the subagent trigger as human among the system triggers', () => {
+    expect(kimiMessageClass({ kind: 'system_trigger', name: 'subagent' })).toEqual({ kind: 'human' })
+    expect(kimiMessageClass({ kind: 'system_trigger', name: 'stop_hook' }))
+      .toEqual({ kind: 'injection', name: 'system_trigger' })
+    expect(kimiMessageClass({ kind: 'system_trigger' })).toEqual({ kind: 'injection', name: 'system_trigger' })
   })
 })
 

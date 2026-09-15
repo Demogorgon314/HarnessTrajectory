@@ -127,6 +127,32 @@ export function createApp({ index, staticDir, search: searchService, settings }:
   })
 
   /**
+   * One offloaded image of a kimi transcript: `blobref:<mime>;<sha256>` refs
+   * whose bytes live in the agent's per-file `blobs/` store. The hash is
+   * content-addressed, so the response is immutable.
+   */
+  app.get('/api/sessions/:kind/:id/blob', async (c) => {
+    const kind = c.req.param('kind')
+    if (!isKind(kind)) return c.json({ error: 'unknown harness kind' }, 404)
+    const match = /^blobref:([^;,]+);([0-9a-f]{16,64})$/.exec(c.req.query('ref') ?? '')
+    if (match === null || match[1] === undefined || match[2] === undefined) {
+      return c.json({ error: 'bad blobref' }, 400)
+    }
+    const fileId = c.req.query('file') ?? c.req.param('id')
+    const path = index.blobPath(kind, c.req.param('id'), fileId, match[2])
+    if (path === null) return c.json({ error: 'blob not found' }, 404)
+    try {
+      const body = await readFile(path)
+      return c.body(body, 200, {
+        'content-type': match[1],
+        'cache-control': 'public, max-age=31536000, immutable',
+      })
+    } catch {
+      return c.json({ error: 'blob not found' }, 404)
+    }
+  })
+
+  /**
    * One stream per open session: existing content first (file + lines events,
    * chunked), then live appends until the client disconnects. `?file=<childId>`
    * narrows the stream to one subagent transcript, served as its own session.

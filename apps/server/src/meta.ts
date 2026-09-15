@@ -6,7 +6,7 @@
 
 import {
   asArray, asString, classifyInjectedUser, grokMessageClass, isCodexHumanPrompt, isRecord, kimiMessageClass,
-  parseGrokLine, parseJsonLine, parseTime, titleFrom, type HarnessKind,
+  kimiTitleText, parseGrokLine, parseJsonLine, parseTime, titleFrom, type HarnessKind,
 } from '@harness-trajectory/core'
 
 export interface FileHead {
@@ -183,7 +183,8 @@ function kimiMetaScanner(): MetaScanner {
           if (!isRecord(message) || message['role'] !== 'user') break
           // Human vs injected/task/skill/plugin/compaction is decided by the origin, never by text.
           if (kimiMessageClass(message['origin']).kind !== 'human') break
-          const text = kimiText(message['content'])
+          // A delegated prompt's `<git-context>` prelude is not its title.
+          const text = kimiTitleText(kimiText(message['content']))
           if (text.trim() === '') break
           state.promptCount += 1
           if (state.title === null) state.title = titleFrom(text)

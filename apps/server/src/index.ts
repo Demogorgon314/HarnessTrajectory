@@ -301,6 +301,20 @@ export class SessionIndex extends EventEmitter {
   }
 
   /**
+   * Absolute path of one agent blob (`agents/<agentId>/blobs/<hash>`), when the
+   * file id names a transcript of the session and the hash is well-formed. Kimi
+   * offloads media above ~4 KB into this per-agent, content-addressed store.
+   */
+  blobPath(kind: HarnessKind, id: string, fileId: string, hash: string): string | null {
+    if (!/^[0-9a-f]{16,64}$/.test(hash)) return null
+    const session = this.sessions.get(sessionKey(kind, id))
+    if (session === undefined) return null
+    const entry = fileId === id ? session.main : (session.children.get(fileId) ?? null)
+    if (entry === null || entry === undefined) return null
+    return join(dirname(entry.path), 'blobs', hash)
+  }
+
+  /**
    * Stream the existing content of every file of a session, chunked. Lines
    * from the main transcript and child (subagent) transcripts are merged in
    * timestamp order so adapters see children where they actually happened.

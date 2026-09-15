@@ -22,17 +22,32 @@
  *   The vendor comes from `modelAlias`: `kimi-code/…` is the subscription
  *   provider `kimi-for-coding`, anything else falls back to `moonshotai`.
  * - `llm.request.maxTokens` is the **context window** (1048576 / 262144), not a
- *   generation cap; it rides `AssistantRequestConfig.maxTokens` for want of a
- *   better field.
+ *   generation cap — but only on `kind: 'loop'` requests. A `kind: 'compaction'`
+ *   request carries no `turnStep` and its `maxTokens` is the summary model's cap
+ *   (131072): it must neither open a step nor replace the window.
  * - Human vs injected input is decided by `message.origin`, never by the text
  *   (see `kimiMessageClass`, which the server scanner and the context
- *   synthesizer share).
+ *   synthesizer share). A subagent's delegated prompt is
+ *   `{ kind: 'system_trigger', name: 'subagent' }` — the one trigger the CLI
+ *   itself displays as a prompt (`isDisplayablePromptOrigin`) — and its text
+ *   opens with a `<git-context>` prelude that titles skip (`kimiTitleText`).
  *
- * Subagents live in sibling files: `task.started` with `info.kind === 'agent'`
- * binds the parent's `Agent`/`AgentSwarm` tool call (`info.parentToolCallId`)
- * to the child directory name (`info.agentId`), which is also the child file's
- * id. A child's tool calls are folded into that parent call as sub-calls; its
- * prompts and assistant text stay in its own transcript.
+ * Subagents live in sibling files: `agents/<agentId>/wire.jsonl`. The parent
+ * names a child in exactly two durable places (kimi-code writes no durable
+ * spawn record): a `task.started` with `info.kind === 'agent'` (background
+ * launches, carrying `info.parentToolCallId`), and the `Agent`/`AgentSwarm`
+ * tool RESULT TEXT — a foreground header of `agent_id:` /
+ * `actual_subagent_type:` / `status:` lines, or one
+ * `<subagent agent_id="…" item="…" outcome="…">` element per swarm item
+ * (`agentMentions`). A foreground result arrives AFTER the child's whole
+ * transcript, so an unbound child's loop events are buffered per run and
+ * replayed into sub-calls when the result finally binds it.
+ *
+ * Images travel as `{ type: 'image_url', imageUrl: { url } }` parts — in user
+ * messages and in `tool.result.output` ARRAYS (ReadMediaFile). The url is an
+ * inline `data:` URL below ~4 KB, else a `blobref:<mime>;<sha256>` whose bytes
+ * sit in the agent's `blobs/<sha256>` store; the image store keeps the ref and
+ * the client resolves it through the server (`DataUrlImageStore.addImageUrl`).
  */
 
 import type {
@@ -45,14 +60,14 @@ import type {
 } from '../session.ts'
 import { DataUrlImageStore, TrajectoryAssembler, textOf, titleFrom } from './shared.ts'
 
-/** Tools whose result announces a subagent (`agent_id: <id>`) when no `task.started` was seen. */
+/** Tools whose result announces one or more subagents. */
 const SUBAGENT_TOOL_NAMES: ReadonlySet<string> = new Set(['Agent', 'AgentSwarm'])
 /** `step.end.finishReason` values that mean the response did not run to completion. */
 const ABORTED_FINISH_REASONS: ReadonlySet<string> = new Set([
   'aborted', 'abort', 'cancelled', 'canceled', 'interrupted', 'error',
 ])
-/** Launch receipt of a foreground or background agent tool call. */
-const AGENT_ID_LINE = /^[ \t]*agent_id:[ \t]*(\S+)/m
+/** Cap on one run's buffered loop events; past it nesting is lost but counters stay exact. */
+const CHILD_BUFFER_MAX = 512
 
 /**
  * How a `context.append_message` reached the context. The origin record decides
@@ -69,8 +84,13 @@ export type KimiMessageClass =
 /**
  * Classify one `context.append_message` by its `message.origin`.
  *
- * A missing origin is a person (early records omitted it); everything else is
- * harness-injected context that must neither open a turn nor count as a prompt.
+ * A missing origin is a person (early records omitted it). A subagent's
+ * delegated prompt (`system_trigger`/`subagent`) is the one harness-written
+ * prompt the CLI itself displays as one (`isDisplayablePromptOrigin`), so it
+ * counts exactly like a human prompt — that is what gives a subagent
+ * transcript viewed on its own one prompt and a title. Everything else is
+ * harness-injected context that must neither open a turn nor count as a
+ * prompt.
  */
 export function kimiMessageClass(origin: unknown): KimiMessageClass {
   if (!isRecord(origin)) return { kind: 'human' }
@@ -87,9 +107,106 @@ export function kimiMessageClass(origin: unknown): KimiMessageClass {
       return { kind: 'plugin', name: 'plugin-command' }
     case 'compaction_summary':
       return { kind: 'compaction', name: 'compaction' }
+    case 'system_trigger':
+      if (asString(origin['name']) === 'subagent') return { kind: 'human' }
+      return { kind: 'injection', name: kind }
     default:
       return { kind: 'injection', name: kind }
   }
+}
+
+/** The `<git-context>…</git-context>` prelude a delegated prompt opens with. */
+const GIT_CONTEXT_PRELUDE = /^<git-context>[\s\S]*?<\/git-context>\s*/
+
+/**
+ * The title-worthy text of a Kimi prompt. The harness prepends a git brief to
+ * a subagent's delegated prompt; it is context, not the task, so titles and
+ * search documents skip it. Human prompts never carry one.
+ */
+export function kimiTitleText(text: string): string {
+  return text.replace(GIT_CONTEXT_PRELUDE, '')
+}
+
+/** One agent a tool result announces, parsed from its text (see the module header). */
+export interface KimiAgentMention {
+  readonly agentId: string
+  readonly description: string | null
+  readonly agentType: string | null
+  /** Terminal state the result reports, when it reports one. */
+  readonly status: SubagentStatus | null
+}
+
+/** Launch receipt lines of a single-agent result; `status`/`type` are read from the header only. */
+const AGENT_ID_LINE = /^[ \t]*agent_id:[ \t]*(\S+)[ \t]*$/m
+const AGENT_TYPE_LINE = /^[ \t]*actual_subagent_type:[ \t]*(\S+)[ \t]*$/m
+const AGENT_STATUS_LINE = /^[ \t]*status:[ \t]*(\w+)[ \t]*$/m
+/** One single-line `<subagent …>` element per AgentSwarm item. */
+const SWARM_ELEMENT = /<subagent\b([^>\n]*)>/g
+const SWARM_ATTRIBUTE = /(\w+)="([^"]*)"/g
+
+/**
+ * The agents an `Agent`/`AgentSwarm` result announces. Two on-disk shapes: the
+ * line-oriented header of a single-agent result (foreground or background),
+ * and the XML-ish `<agent_swarm_result>` of a swarm, one `<subagent>` element
+ * per item. The header ends at the first blank line: the body is the agent's
+ * own text and may quote any of these shapes.
+ */
+export function agentMentions(output: string): KimiAgentMention[] {
+  const mentions: KimiAgentMention[] = []
+  const header = output.split(/\n[ \t]*\n/, 1)[0] ?? ''
+  const agentId = AGENT_ID_LINE.exec(output)?.[1]
+  if (agentId !== undefined) {
+    mentions.push({
+      agentId,
+      description: null,
+      agentType: AGENT_TYPE_LINE.exec(header)?.[1] ?? null,
+      status: mentionStatus(AGENT_STATUS_LINE.exec(header)?.[1]),
+    })
+  }
+  for (const element of output.matchAll(SWARM_ELEMENT)) {
+    const attrs = new Map<string, string>()
+    for (const attr of element[1]?.matchAll(SWARM_ATTRIBUTE) ?? []) {
+      const [, key, value] = attr
+      if (key !== undefined && value !== undefined) attrs.set(key, unescapeXml(value))
+    }
+    const id = attrs.get('agent_id')
+    if (id === undefined || id === '') continue
+    mentions.push({
+      agentId: id,
+      description: attrs.get('item') ?? null,
+      agentType: null,
+      status: mentionStatus(attrs.get('outcome')),
+    })
+  }
+  return mentions
+}
+
+/** A terminal status a result text can report; anything else leaves the run's lifecycle alone. */
+function mentionStatus(value: string | undefined): SubagentStatus | null {
+  switch (value) {
+    case 'completed':
+      return 'completed'
+    case 'failed':
+    case 'error':
+      return 'failed'
+    case 'aborted':
+    case 'killed':
+    case 'stopped':
+    case 'cancelled':
+    case 'canceled':
+      return 'stopped'
+    default:
+      return null
+  }
+}
+
+/** The four escapes kimi-code's `escapeXmlAttribute` applies, undone (the ampersand last). */
+function unescapeXml(value: string): string {
+  return value
+    .replaceAll('&quot;', '"')
+    .replaceAll('&lt;', '<')
+    .replaceAll('&gt;', '>')
+    .replaceAll('&amp;', '&')
 }
 
 /** One model response in progress: blocks accumulate until `step.end` closes it. */
@@ -127,6 +244,14 @@ interface AgentRun {
   endedAt: number | null
   lastTime: number | null
   toolCalls: number
+  /** Loop events seen before the parent call was known; replayed into sub-calls on binding. */
+  buffered: BufferedChildEvent[]
+}
+
+/** One loop event of a not-yet-bound child transcript. */
+interface BufferedChildEvent {
+  event: Record<string, unknown>
+  time: number
 }
 
 function mapUsage(value: unknown): TokenUsage | undefined {
@@ -190,7 +315,11 @@ function stringifyArgs(input: unknown): string {
   }
 }
 
-function contentBlocks(items: readonly unknown[]): ContentBlock[] {
+function contentBlocks(
+  items: readonly unknown[],
+  images?: DataUrlImageStore,
+  fileId?: string,
+): ContentBlock[] {
   const blocks: ContentBlock[] = []
   for (const item of items) {
     if (typeof item === 'string') {
@@ -202,6 +331,16 @@ function contentBlocks(items: readonly unknown[]): ContentBlock[] {
     if (type === 'think') {
       const text = asString(item['think']) ?? asString(item['text'])
       if (text !== undefined) blocks.push({ type: 'reasoning', text })
+      continue
+    }
+    // `{ type: 'image_url', imageUrl: { url, name? } }` — the only media part
+    // kimi writes (ReadMediaFile results, image attachments).
+    if (type === 'image_url' && images !== undefined) {
+      const imageUrl = isRecord(item['imageUrl']) ? item['imageUrl'] : undefined
+      const url = asString(imageUrl?.['url'])
+      if (url === undefined) continue
+      const attachment = images.addImageUrl(url, asString(imageUrl?.['name']), fileId)
+      if (attachment !== undefined) blocks.push({ type: 'image', attachment })
       continue
     }
     const text = asString(item['text'])
@@ -277,6 +416,8 @@ class KimiParser implements SessionParser {
   private startedAt: number | null = null
   private title: string | null = null
   private promptCount = 0
+  /** The main transcript's file id, which main-flow image attachments are attributed to. */
+  private mainFileId: string | null = null
 
   push(line: string, file: SessionFileRef, lineIndex?: number): void {
     this.assembler.beginLine(file.id, lineIndex)
@@ -291,6 +432,7 @@ class KimiParser implements SessionParser {
       this.handleChild(file, type, record, time)
       return
     }
+    this.mainFileId ??= file.id
     switch (type) {
       case 'metadata':
         // The only record without `time`: it carries `created_at` (ms) instead.
@@ -421,6 +563,11 @@ class KimiParser implements SessionParser {
   }
 
   private handleRequest(record: Record<string, unknown>, time: number): void {
+    // A compaction request is no loop step: it has no `turnStep`, and its
+    // `maxTokens` is the summary model's cap, not the context window. Folding
+    // it like a loop request would open a phantom step (an empty assistant
+    // node at the compaction boundary) and corrupt the window figure.
+    if (asString(record['kind']) === 'compaction') return
     const model = asString(record['model'])
     if (model !== undefined && model !== '') {
       this.model = model
@@ -458,7 +605,7 @@ class KimiParser implements SessionParser {
     const raw = message['content']
     const content = typeof raw === 'string'
       ? [{ type: 'text' as const, text: raw }]
-      : contentBlocks(asArray(raw) ?? [])
+      : contentBlocks(asArray(raw) ?? [], this.images, this.mainFileId ?? undefined)
     const classified = kimiMessageClass(message['origin'])
     if (classified.kind !== 'human') {
       this.pushContext(content, classified, time)
@@ -471,7 +618,7 @@ class KimiParser implements SessionParser {
     }
     this.turnOpenPending = false
     this.promptCount += 1
-    const text = textOf(content)
+    const text = kimiTitleText(textOf(content))
     if (this.title === null && text.trim() !== '') this.title = titleFrom(text)
     const seq = this.assembler.seq.next()
     this.assembler.pushNode({ kind: 'user', seq, time, content, source: { kind: 'user' } })
@@ -697,7 +844,7 @@ class KimiParser implements SessionParser {
     const result = isRecord(event['result']) ? event['result'] : {}
     const note = asString(result['note'])
     const content: ContentBlock[] = [
-      { type: 'text', text: asString(result['output']) ?? '' },
+      ...this.resultBlocks(result['output']),
       ...(note === undefined || note === '' ? [] : [{ type: 'text' as const, text: note }]),
     ]
     const pending: PendingResult = { callId, time, content, isError: result['isError'] === true }
@@ -707,6 +854,12 @@ class KimiParser implements SessionParser {
       return
     }
     this.emitToolResult(pending)
+  }
+
+  /** A result's `output`: a plain string, or a content-part array (ReadMediaFile images). */
+  private resultBlocks(output: unknown): ContentBlock[] {
+    if (typeof output === 'string') return [{ type: 'text', text: output }]
+    return contentBlocks(asArray(output) ?? [], this.images, this.mainFileId ?? undefined)
   }
 
   private emitToolResult(result: PendingResult): void {
@@ -746,6 +899,8 @@ class KimiParser implements SessionParser {
     run.startedAt = parseTime(info['startedAt']) ?? run.startedAt ?? time
     if (run.status === 'launching') run.status = 'running'
     if (run.taskId !== null) this.runByTask.set(run.taskId, agentId)
+    // The child's first lines can outrun this record: replay what they buffered.
+    if (run.callId !== null) this.flushChildBuffer(run)
   }
 
   private handleTaskTerminated(record: Record<string, unknown>, time: number): void {
@@ -762,21 +917,35 @@ class KimiParser implements SessionParser {
   }
 
   /**
-   * Fallback binding: an `Agent`/`AgentSwarm` result whose output opens with
-   * `agent_id: <id>` (foreground) or carries one after `task_id:` (background).
+   * Bind the agent(s) an `Agent`/`AgentSwarm` result announces (`agentMentions`
+   * parses the two on-disk shapes). The child's transcript usually streamed in
+   * BEFORE this result — a foreground result is written only when the run ends
+   * — so the run typically exists already and binding fills its facts; the
+   * events it buffered are then replayed under this call. A run already bound
+   * (a `task.started` won the race, or this is an `Agent(resume=…)` result
+   * naming the same child again) keeps its first binding.
    */
   private bindAgentFromResult(argsRaw: string, callId: string, output: string, time: number): void {
-    const agentId = AGENT_ID_LINE.exec(output)?.[1]
-    if (agentId === undefined || this.runs.has(agentId)) return
-    const run = this.runFor(agentId, time)
-    run.callId ??= callId
+    const mentions = agentMentions(output)
+    if (mentions.length === 0) return
     const args: unknown = parseJsonLine(argsRaw)
-    if (isRecord(args)) {
-      run.description ??= asString(args['description'])
-        ?? (asString(args['prompt'])?.slice(0, 80) ?? null)
-      run.agentType ??= asString(args['subagent_type']) ?? null
+    const fallbackDescription = isRecord(args)
+      ? asString(args['description']) ?? (asString(args['prompt'])?.slice(0, 80) ?? null)
+      : null
+    const fallbackType = isRecord(args) ? asString(args['subagent_type']) ?? null : null
+    for (const mention of mentions) {
+      const run = this.runFor(mention.agentId, time)
+      if (run.callId !== null) continue
+      run.callId = callId
+      run.description ??= mention.description ?? fallbackDescription
+      run.agentType ??= mention.agentType ?? fallbackType
+      if (run.status === 'launching') run.status = 'running'
+      if (mention.status !== null) {
+        run.status = mention.status
+        run.endedAt ??= time
+      }
+      this.flushChildBuffer(run)
     }
-    if (run.status === 'launching') run.status = 'running'
   }
 
   private runFor(agentId: string, time: number): AgentRun {
@@ -794,6 +963,7 @@ class KimiParser implements SessionParser {
       endedAt: null,
       lastTime: null,
       toolCalls: 0,
+      buffered: [],
     }
     this.runs.set(agentId, run)
     return run
@@ -803,6 +973,10 @@ class KimiParser implements SessionParser {
    * A child transcript contributes its counters and, when the parent call is
    * known, its tool calls as sub-calls of that call. Its prompts and assistant
    * text stay in the child's own view, which the server serves standalone.
+   *
+   * While the parent call is NOT known (a foreground `Agent` result is written
+   * only when the run ends), the loop events are buffered, so the bind that
+   * arrives later can still nest them.
    */
   private handleChild(
     file: SessionFileRef,
@@ -815,9 +989,29 @@ class KimiParser implements SessionParser {
     if (run.status === 'launching') run.status = 'running'
     if (type !== 'context.append_loop_event') return
     const event = loopEvent(record)
+    if (asString(event['type']) === 'tool.call') run.toolCalls += 1
+    if (run.callId === null) {
+      if (run.buffered.length < CHILD_BUFFER_MAX) run.buffered.push({ event, time })
+      return
+    }
+    this.applyChildLoopEvent(file.id, run, event, time)
+  }
+
+  /** Replay the events an unbound child buffered, nesting them under the now-known parent call. */
+  private flushChildBuffer(run: AgentRun): void {
+    const buffered = run.buffered
+    run.buffered = []
+    for (const { event, time } of buffered) this.applyChildLoopEvent(run.agentId, run, event, time)
+  }
+
+  private applyChildLoopEvent(
+    fileId: string,
+    run: AgentRun,
+    event: Record<string, unknown>,
+    time: number,
+  ): void {
     switch (asString(event['type'])) {
       case 'tool.call': {
-        run.toolCalls += 1
         const callId = asString(event['toolCallId'])
         if (callId === undefined || run.callId === null) return
         const name = asString(event['name']) ?? 'tool'
@@ -839,10 +1033,13 @@ class KimiParser implements SessionParser {
         const callId = asString(event['toolCallId'])
         if (callId === undefined || !this.childCalls.has(callId)) return
         const result = isRecord(event['result']) ? event['result'] : {}
+        const output = result['output']
         this.emitToolResult({
           callId,
           time,
-          content: [{ type: 'text', text: asString(result['output']) ?? '' }],
+          content: typeof output === 'string'
+            ? [{ type: 'text', text: output }]
+            : contentBlocks(asArray(output) ?? [], this.images, fileId),
           isError: result['isError'] === true,
         })
         return

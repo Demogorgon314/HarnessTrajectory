@@ -248,7 +248,9 @@ export function SessionPane({ route, summary: listSummary, onNavigate, t, locale
   const agent = agentFile === null
     ? undefined
     : (state.files.find(known => known.id === agentFile)?.agent ?? self?.file.agent)
-  const agentTitle = agentFile === null ? null : (agent?.description ?? shortAgentId(agentFile))
+  // A subagent's own title: its sidecar description when one exists, else the
+  // title its transcript reports (a kimi child's delegated prompt), else the id.
+  const agentTitle = agentFile === null ? null : (agent?.description ?? state.meta.title ?? shortAgentId(agentFile))
   // Opening a child keeps the reader in the tab they are reading.
   const openChild = (fileId: string) => {
     onNavigate(tab === 'context' ? { kind, id, tab: 'context', agent: fileId } : { kind, id, file: fileId })

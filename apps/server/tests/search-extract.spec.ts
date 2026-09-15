@@ -218,6 +218,37 @@ describe('extractSearchDocs — Kimi Code', () => {
     }, 33)))).toEqual(['tool: apps/server/src/meta.ts:45\ntruncated to 1 match'])
   })
 
+  it('indexes a delegated subagent prompt as a human document, stripped of its git prelude', () => {
+    const delegated = '<git-context>\nWorking directory: /work/project\n</git-context>\n\nReview the diff carefully.'
+    expect(docs('kimi', wire('context.append_message', 10, {
+      message: {
+        role: 'user', content: [{ type: 'text', text: delegated }], toolCalls: [],
+        origin: { kind: 'system_trigger', name: 'subagent' },
+      },
+    }))).toEqual([{ role: 'human', text: 'Review the diff carefully.', timeMs: T0 + 10 }])
+    // Every other system trigger stays harness chatter.
+    expect(docs('kimi', wire('context.append_message', 20, {
+      message: {
+        role: 'user', content: [{ type: 'text', text: 'hook text' }], toolCalls: [],
+        origin: { kind: 'system_trigger', name: 'stop_hook' },
+      },
+    }))).toEqual([])
+  })
+
+  it('indexes the text of a media tool result and drops the image part', () => {
+    expect(pairs(docs('kimi', wire('context.append_loop_event', 30, {
+      event: {
+        type: 'tool.result', parentUuid: 't-1', toolCallId: 'tool_k1',
+        result: {
+          output: [
+            { type: 'text', text: '<image path="/tmp/shot.png">' },
+            { type: 'image_url', imageUrl: { url: `blobref:image/png;${'a'.repeat(64)}` } },
+          ],
+        },
+      },
+    })))).toEqual(['tool: <image path="/tmp/shot.png">'])
+  })
+
   it('skips bookkeeping records and the prompt mirror that would double-count', () => {
     expect(docs('kimi', wire('llm.request', 1, { model: 'k3', provider: 'openai', maxTokens: 1048576 }))).toEqual([])
     expect(docs('kimi', wire('usage.record', 2, { tokens: 10, kind: 'input' }))).toEqual([])

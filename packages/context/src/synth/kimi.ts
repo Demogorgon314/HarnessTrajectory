@@ -39,11 +39,13 @@
 
 import type { KimiMessageClass, SessionFileRef } from '@harness-trajectory/core'
 import {
+  agentMentions,
   asArray,
   asNumber,
   asString,
   isRecord,
   kimiMessageClass,
+  kimiTitleText,
   parseJsonLine,
   parseTime,
   titleFrom,
@@ -454,7 +456,7 @@ class KimiSynthesizer implements EventSynthesizer {
         this.step = 0
         this.turnOpen = true
       }
-      const text = textOf(content)
+      const text = kimiTitleText(textOf(content))
       if (this.label === undefined && text.trim() !== '') this.label = titleFrom(text, LABEL_MAX)
       const seq = this.emitSurface(out, 'user/message', time, {
         content,
@@ -560,14 +562,18 @@ class KimiSynthesizer implements EventSynthesizer {
     const callId = asString(event['toolCallId'])
     if (callId === undefined || callId === '') return
     const result = isRecord(event['result']) ? event['result'] : {}
-    const output = asString(result['output']) ?? ''
+    // `output` is a plain string, or a content-part array when the result
+    // carries media (ReadMediaFile's `{ type: 'image_url' }` parts).
+    const raw = result['output']
+    const content: ContentBlock[] = typeof raw === 'string'
+      ? [{ type: 'text', text: raw }]
+      : contentBlocksOf(asArray(raw) ?? [])
     const note = asString(result['note'])
-    const content: ContentBlock[] = [{ type: 'text', text: output }]
     // `result.note` is the harness's own annotation on the output (truncation,
     // a permission remark); it is context the model saw, so it is sized as a
     // second text block rather than folded into the output string.
     if (note !== undefined && note !== '') content.push({ type: 'text', text: note })
-    this.bindAgentFromResult(callId, output, time)
+    this.bindAgentFromResult(callId, textOf(content), time)
     const open = this.open
     // A result belonging to THIS step rides its settle (so the fold sees
     // call-then-result in order); one whose call came from an already-settled
@@ -712,33 +718,34 @@ class KimiSynthesizer implements EventSynthesizer {
   }
 
   /**
-   * Fallback binding when no `task.started` was seen (a resumed session whose
-   * task log rotated, a build that omits it): an `Agent`/`AgentSwarm` result
-   * whose output carries a line `agent_id: <id>` — the foreground form starts
-   * with it, the background form prints it after `task_id:`.
+   * Fallback binding when no `task.started` was seen (a foreground launch only
+   * ever names the child in its result text): `agentMentions` parses the
+   * single-agent `agent_id:` header and the swarm's `<subagent>` elements.
    */
   private bindAgentFromResult(callId: string, output: string, time: number): void {
     if (this.boundCalls.has(callId)) return
     const call = this.calls.get(callId)
     if (call === undefined || !AGENT_TOOLS.has(call.name)) return
-    const match = /^[ \t]*agent_id:[ \t]*(\S+)/m.exec(output)
-    const agentId = match?.[1]
-    if (agentId === undefined || agentId === '') return
-    // A resumed swarm can echo THIS file's own id (`runtime.set_binding`); an
-    // agent is never its own child.
-    if (agentId === this.agentId) return
-    if (this.children.has(agentId)) return
-    const args = call.args
-    const label = asString(args?.['description']) ?? asString(args?.['prompt']) ?? 'subagent'
-    const agentType = asString(args?.['subagent_type'])
-    this.children.set(agentId, {
-      key: agentId,
-      label: titleFrom(label, LABEL_MAX),
-      ...(agentType === undefined ? {} : { agentType }),
-      callId,
-      startedAt: time,
-    })
+    const mentions = agentMentions(output)
+    if (mentions.length === 0) return
     this.boundCalls.add(callId)
+    const fallbackLabel = asString(call.args?.['description']) ?? asString(call.args?.['prompt']) ?? 'subagent'
+    const fallbackType = asString(call.args?.['subagent_type'])
+    for (const mention of mentions) {
+      // A resumed swarm can echo THIS file's own id (`runtime.set_binding`); an
+      // agent is never its own child.
+      if (mention.agentId === this.agentId) continue
+      if (this.children.has(mention.agentId)) continue
+      const agentType = mention.agentType ?? fallbackType
+      this.children.set(mention.agentId, {
+        key: mention.agentId,
+        label: titleFrom(mention.description ?? fallbackLabel, LABEL_MAX),
+        ...(agentType === undefined ? {} : { agentType }),
+        callId,
+        startedAt: time,
+        ...(mention.status === null ? {} : { completedAt: time }),
+      })
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -931,7 +938,9 @@ function contentBlocksOf(items: readonly unknown[]): ContentBlock[] {
   for (const item of items) {
     if (!isRecord(item)) continue
     const type = asString(item['type'])
-    if (type === 'image' || type === 'input_image') {
+    // Kimi's own spelling is `image_url`; `image`/`input_image` are the other
+    // harnesses' habits, kept for forward compatibility.
+    if (type === 'image_url' || type === 'image' || type === 'input_image') {
       blocks.push({ type: 'image' })
       continue
     }

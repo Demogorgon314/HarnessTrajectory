@@ -21,6 +21,11 @@ export interface ImageAttachmentRef {
   width: number
   height: number
   name?: string
+  /**
+   * Transcript file the image was read from, when resolving its bytes needs to
+   * know it (a Kimi `blobref:` — the blob store is per agent transcript file).
+   */
+  fileId?: string
   originalDimensions?: {
     width: number
     height: number

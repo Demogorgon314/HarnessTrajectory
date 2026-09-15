@@ -49,7 +49,7 @@
 
 import {
   asArray, asNumber, asString, classifyInjectedUser, grokMessageClass, isCodexHumanPrompt,
-  isRecord, kimiMessageClass, parseGrokLine, parseJsonLine, parseTime,
+  isRecord, kimiMessageClass, kimiTitleText, parseGrokLine, parseJsonLine, parseTime,
   GROK_SIDECAR_METHOD, type HarnessKind, type SearchRole,
 } from '@harness-trajectory/core'
 
@@ -358,7 +358,8 @@ function kimiDocs(line: string): SearchDocDraft[] {
     // Injections, task notifications, skill activations and compaction
     // summaries are all user-role records; only the origin tells them apart.
     else if (role === 'user' && kimiMessageClass(message['origin']).kind === 'human') {
-      builder.add('human', blockText(message['content']))
+      // The git brief prepended to a delegated prompt is boilerplate, not the task.
+      builder.add('human', kimiTitleText(blockText(message['content'])))
     }
     return builder.docs
   }
@@ -381,7 +382,9 @@ function kimiDocs(line: string): SearchDocDraft[] {
     case 'tool.result': {
       const result = isRecord(event['result']) ? event['result'] : {}
       const note = asString(result['note']) ?? ''
-      const output = asString(result['output']) ?? ''
+      const raw = result['output']
+      // `output` is a plain string, or a content-part array when media ride along.
+      const output = typeof raw === 'string' ? raw : blockText(raw)
       builder.add('tool', note === '' ? output : `${output}\n${note}`, MAX_TOOL_OUTPUT_CHARS)
       break
     }

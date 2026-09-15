@@ -8,8 +8,9 @@
 import { ContextSession } from '@harness-trajectory/context'
 import {
   createSessionParser, EMPTY_TRAJECTORY_SNAPSHOT,
-  type HarnessKind, type ImageAttachmentRef, type SessionChildSummary, type SessionFileRef,
-  type SessionLiveEvent, type SessionParser, type SessionSummary, type SubagentRun, type TrajectorySnapshot,
+  type HarnessKind, type ImageAttachmentRef, type ParsedSessionMeta, type SessionChildSummary,
+  type SessionFileRef, type SessionLiveEvent, type SessionParser, type SessionSummary, type SubagentRun,
+  type TrajectorySnapshot,
 } from '@harness-trajectory/core'
 import { createSnapshotStore, type MessageImageLoader, type SnapshotStore } from '@harness-trajectory/ui'
 import { openSessionStream, type LiveStream } from './api.ts'
@@ -21,6 +22,8 @@ export interface SessionRuntimeState {
   /** Lines consumed so far (all files). */
   lines: number
   summary: SessionSummary | null
+  /** Session facts the folded transcript itself reports (a subagent view's title lives here). */
+  meta: ParsedSessionMeta
   /** Files feeding this view, as announced by the server. */
   files: readonly SessionFileRef[]
   /** Child (subagent) transcripts of the session, whichever file this view folds. */
@@ -38,6 +41,9 @@ export interface SessionRuntimeState {
 }
 
 const PUBLISH_INTERVAL_MS = 80
+
+/** Kimi offloads large media into a per-agent blob store; the server serves it by content hash. */
+const BLOBREF_PREFIX = 'blobref:'
 
 export class SessionRuntime {
   readonly store: SnapshotStore<SessionRuntimeState>
@@ -62,6 +68,7 @@ export class SessionRuntime {
       loading: true,
       lines: 0,
       summary: null,
+      meta: this.parser.meta(),
       files: [],
       children: [],
       subagents: [],
@@ -69,7 +76,15 @@ export class SessionRuntime {
       error: null,
       connected: false,
     })
-    const resolve = (attachment: ImageAttachmentRef): string | undefined => this.parser.imageUrl(attachment)
+    const resolve = (attachment: ImageAttachmentRef): string | undefined => {
+      const url = this.parser.imageUrl(attachment)
+      if (url === undefined || !url.startsWith(BLOBREF_PREFIX)) return url
+      // A blobref's bytes sit in the blob store of the transcript that produced
+      // the image; the server serves them by content hash.
+      const file = attachment.fileId ?? this.fileId ?? this.id
+      return `/api/sessions/${encodeURIComponent(this.kind)}/${encodeURIComponent(this.id)}/blob`
+        + `?file=${encodeURIComponent(file)}&ref=${encodeURIComponent(url)}`
+    }
     this.loadImage = Object.assign(
       async (attachment: ImageAttachmentRef): Promise<string> => {
         const url = resolve(attachment)
@@ -148,6 +163,7 @@ export class SessionRuntime {
     this.stream?.close()
     this.patch({
       snapshot: EMPTY_TRAJECTORY_SNAPSHOT, loading: true, lines: 0, files: [], subagents: [],
+      meta: this.parser.meta(),
       contextRevision: this.context.revision,
     })
     this.start()
@@ -166,6 +182,7 @@ export class SessionRuntime {
     this.patch({
       snapshot: this.parser.snapshot(),
       lines: this.lineCount,
+      meta: this.parser.meta(),
       subagents: this.parser.subagents(),
       contextRevision: this.context.revision,
     })

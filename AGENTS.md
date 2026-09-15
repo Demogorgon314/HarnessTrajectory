@@ -93,7 +93,19 @@ README roots and limits, and specs in core, context, server, and web.
   A main session's cost includes its subagents. Subagent files bind through `.meta.json`.
 - Codex: children are top-level rollouts with `parent_thread_id`.
 - Kimi: `time` is epoch ms; loop events are flushed after the response, so tool
-  durations are not recoverable; `message.origin` decides human vs injected.
+  durations are not recoverable; `message.origin` decides human vs injected, with one
+  exception that looks wrong but isn't: a subagent's delegated prompt is
+  `system_trigger`/`subagent`, the one trigger the CLI itself displays as a prompt, so
+  `kimiMessageClass` counts it as human (titles skip its `<git-context>` prelude via
+  `kimiTitleText`). An `llm.request` with `kind: 'compaction'` is not a loop step: it
+  has no `turnStep` and its `maxTokens` is the summary model's cap, not the context
+  window. There is no durable spawn record for subagents: a background launch binds
+  through `task.started` (`info.parentToolCallId`), a foreground one only through the
+  `Agent` result's `agent_id:` header (arriving after the child's whole transcript —
+  child loop events are buffered until it lands), an `AgentSwarm` through the result's
+  `<subagent agent_id="…">` XML. Images are `image_url` parts: inline `data:` URLs
+  below ~4 KB, else `blobref:<mime>;<sha256>` whose bytes sit in `agents/<id>/blobs/`
+  and are served by the server's blob route.
 - Grok: parse only `updates.jsonl` (`chat_history.jsonl` is a derived cache, `events.jsonl`
   is telemetry). Envelope `timestamp` is seconds, `_meta.agentTimestampMs` is ms. Usage
   arrives per turn in `turn_completed`; per-call split uses each stream's first

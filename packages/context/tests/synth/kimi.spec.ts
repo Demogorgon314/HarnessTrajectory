@@ -474,6 +474,103 @@ describe('kimi synthesizer', () => {
     }])
   })
 
+  it('binds every agent of a swarm result, with its item as the label', () => {
+    const { synth } = run([
+      profileBind(0),
+      appendMessage(1, 'go', { kind: 'user' }),
+      stepBegin(2, '0', 1),
+      toolsSnapshot(2),
+      toolCall(3, 'c_swarm', 'AgentSwarm', { prompt_template: 'Review {{item}}', items: ['a.ts', 'b.ts'] }),
+      toolResult(4, 'c_swarm', {
+        output: [
+          '<agent_swarm_result>',
+          '<summary>1 completed, 1 failed, 0 aborted</summary>',
+          '<subagent agent_id="agent-3" item="Review a.ts" outcome="completed">fine</subagent>',
+          '<subagent agent_id="agent-4" item="Review b.ts &amp; co" outcome="failed">boom</subagent>',
+          '</agent_swarm_result>',
+        ].join('\n'),
+      }),
+      stepEnd(4),
+    ])
+    expect([...synth.meta().children.values()]).toEqual([
+      { key: 'agent-3', label: 'Review a.ts', callId: 'c_swarm', startedAt: ms(4), completedAt: ms(4) },
+      { key: 'agent-4', label: 'Review b.ts & co', callId: 'c_swarm', startedAt: ms(4), completedAt: ms(4) },
+    ])
+  })
+
+  it('treats a delegated subagent prompt as the human message of its own transcript', () => {
+    const delegated = '<git-context>\nWorking directory: /tmp/work\n</git-context>\n\nsurvey the repo'
+    const { events, synth } = run([
+      line(0, 'metadata', { created_at: ms(0), protocol_version: '1.5' }),
+      profileBind(0),
+      line(1, 'turn.prompt', {
+        promptId: 'p1', input: [{ type: 'text', text: delegated }],
+        origin: { kind: 'system_trigger', name: 'subagent' },
+      }),
+      line(1, 'context.append_message', {
+        message: {
+          role: 'user', content: [{ type: 'text', text: delegated }], toolCalls: [],
+          origin: { kind: 'system_trigger', name: 'subagent' },
+        },
+      }),
+      stepBegin(2, '0', 1),
+      toolsSnapshot(2),
+      llmRequest(2),
+      contentPart(6, { type: 'text', text: 'on it' }),
+      stepEnd(7),
+    ])
+    const prompt = firstOf(events, 'user/message')
+    expect(sourceOf(prompt)).toEqual({ kind: 'user' })
+    // The `<git-context>` prelude is boilerplate; the label is the task itself.
+    expect(synth.meta().label).toBe('survey the repo')
+  })
+
+  it('folds a media result into text and image blocks', () => {
+    const { events } = run([
+      profileBind(0),
+      appendMessage(1, 'look', { kind: 'user' }),
+      stepBegin(2, '0', 1),
+      toolsSnapshot(2),
+      toolCall(3, 'c_media', 'ReadMediaFile', { path: '/tmp/shot.png' }),
+      toolResult(4, 'c_media', {
+        output: [
+          { type: 'text', text: '<image path="/tmp/shot.png">' },
+          { type: 'image_url', imageUrl: { url: `blobref:image/png;${'a'.repeat(64)}` } },
+        ],
+      }),
+      stepEnd(5),
+    ])
+    const block = blocksOf(firstOf(events, 'tool/result'))[0]
+    expect(block?.type).toBe('tool-result')
+    expect(block?.content).toEqual([
+      { type: 'text', text: '<image path="/tmp/shot.png">' },
+      { type: 'image' },
+    ])
+  })
+
+  it('keeps an image part of a prompt as an image block', () => {
+    const { events } = run([
+      profileBind(0),
+      line(1, 'context.append_message', {
+        message: {
+          role: 'user',
+          content: [
+            { type: 'image_url', imageUrl: { url: 'data:image/png;base64,iVBORw0KGgo=' } },
+            { type: 'text', text: 'what is this?' },
+          ],
+          toolCalls: [],
+          origin: { kind: 'user' },
+        },
+      }),
+      stepBegin(2, '0', 1),
+      stepEnd(3),
+    ])
+    expect(blocksOf(firstOf(events, 'user/message'))).toEqual([
+      { type: 'image' },
+      { type: 'text', text: 'what is this?' },
+    ])
+  })
+
   it('shadows everything but the kept tail on a compaction', () => {
     const { events } = run([
       ...TYPICAL_TURN,

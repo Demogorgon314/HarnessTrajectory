@@ -155,6 +155,29 @@ export class DataUrlImageStore implements ImageStore {
   keys(): IterableIterator<string> {
     return this.urls.keys()
   }
+
+  /**
+   * Store an image from the URL a transcript gives it: a `data:` URL (bytes
+   * inline) or a `blobref:<mime>;<hash>` (bytes in the agent's blob store,
+   * which the client resolves through the server). Unknown shapes yield no
+   * attachment.
+   */
+  addImageUrl(url: string, name?: string, fileId?: string): ImageAttachmentRef | undefined {
+    const inline = /^data:([^;,]+);base64,(.*)$/s.exec(url)
+    if (inline !== null) return this.add(inline[2] ?? '', normalizeImageMediaType(inline[1]), name)
+    if (/^blobref:[^;,]+;[0-9a-f]{16,64}$/.test(url)) {
+      const mediaType = normalizeImageMediaType(url.slice('blobref:'.length, url.indexOf(';')))
+      this.counter += 1
+      const attachmentId = `img-${this.counter}`
+      this.urls.set(attachmentId, url)
+      return {
+        attachmentId, mediaType, bytes: 0, width: 0, height: 0,
+        ...(name === undefined ? {} : { name }),
+        ...(fileId === undefined ? {} : { fileId }),
+      }
+    }
+    return undefined
+  }
 }
 
 export function normalizeImageMediaType(value: unknown): ImageMediaType {
