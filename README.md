@@ -43,6 +43,12 @@ stopped needing a flag. There is no native dependency to build.)
 npx @demogorgon314/harness-trajectory@latest
 ```
 
+Skip the search index (faster first start, no `search.sqlite`):
+
+```sh
+HARNESS_TRAJECTORY_SEARCH=0 npx @demogorgon314/harness-trajectory@latest
+```
+
 That starts the API and the built UI together at `http://127.0.0.1:5170`. From a
 checkout, with pnpm 12:
 
