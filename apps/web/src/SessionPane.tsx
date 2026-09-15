@@ -1,9 +1,9 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import type {
   HarnessKind, SessionChildSummary, SessionSummary, SubagentRun, SubagentStatus,
 } from '@harness-trajectory/core'
 import {
-  Menu, TrajectoryView, Tooltip, useSnapshotSelector,
+  Menu, TrajectoryView, Tooltip, icons, useSnapshotSelector, writeClipboard,
   type MenuEntry, type SnapshotStore, type TrajectoryInspectLine, type TrajectoryTranslate,
 } from '@harness-trajectory/ui'
 import type { Route, SessionTab } from './App.tsx'
@@ -29,6 +29,8 @@ const TAB_LABELS: Record<'en' | 'zh', Record<SessionTab, string>> = {
   en: { trajectory: 'Trajectory', context: 'Context' },
   zh: { trajectory: '轨迹', context: '上下文' },
 }
+
+const { IconCheckOutline16, IconCopyOutline16 } = icons
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
@@ -124,6 +126,38 @@ export function subagentRows(
 
 /** A run counts as active only while its transcript keeps being written. */
 const ACTIVE_WINDOW_MS = 2 * 60_000
+
+/**
+ * Compact header control: the "resume" label plus the same icon-only copy
+ * the Context card uses (`lc-rich-copy`). The command itself lives on the
+ * tooltip — the meta row is too tight to show it.
+ */
+function ResumeCopy({ command }: { command: string }) {
+  const [copied, setCopied] = useState(false)
+  const onCopy = useCallback(() => {
+    if (copied) return
+    void writeClipboard(command).then((ok) => {
+      if (!ok) return
+      setCopied(true)
+      window.setTimeout(() => { setCopied(false) }, 1200)
+    })
+  }, [copied, command])
+  const label = copied ? 'copied' : `Copy the command that resumes this session: ${command}`
+  return (
+    <span className={css.paneResume}>
+      <span>resume</span>
+      <button
+        type="button"
+        className={'lc-rich-copy' + (copied ? ' lc-rich-copy-on' : '')}
+        title={copied ? 'copied' : command}
+        aria-label={label}
+        onClick={onCopy}
+      >
+        {copied ? <IconCheckOutline16 size={13} /> : <IconCopyOutline16 size={13} />}
+      </button>
+    </span>
+  )
+}
 
 function isActive(row: SubagentRow, sessionLive: boolean, now: number): boolean {
   if (row.status !== 'running' && row.status !== 'launching') return false
@@ -229,7 +263,6 @@ export function SessionPane({ route, summary: listSummary, onNavigate, t, locale
     setInspectLine({ line: route.line, fileId: route.file ?? route.id })
   }, [route, state.loading])
   const summary = state.summary ?? listSummary
-  const [copied, setCopied] = useState(false)
   const started = summary?.startedAt ?? null
   const resumeCommand = harnessMeta(kind).resumeCommand({ id, cwd: summary?.cwd ?? null })
   const rows = useMemo(() => subagentRows(state.subagents, state.children), [state.subagents, state.children])
@@ -327,22 +360,7 @@ export function SessionPane({ route, summary: listSummary, onNavigate, t, locale
           )}
           <span className={css.paneMetaItem}>{state.lines} lines</span>
           <span className={css.paneMetaItem} title={agentFile ?? id}>{agentFile === null ? shortSessionId(id) : shortAgentId(agentFile)}</span>
-          {agentFile === null && (
-            <button
-              type="button"
-              className={css.paneCopy}
-              title={resumeCommand}
-              aria-label={`Copy the command that resumes this session: ${resumeCommand}`}
-              onClick={() => {
-                void navigator.clipboard?.writeText(resumeCommand).then(() => {
-                  setCopied(true)
-                  setTimeout(() => { setCopied(false) }, 1500)
-                })
-              }}
-            >
-              {copied ? 'copied' : 'copy resume command'}
-            </button>
-          )}
+          {agentFile === null && <ResumeCopy command={resumeCommand} />}
         </div>
         {state.error !== null && <div className={css.paneError}>{state.error}</div>}
         {tabs.length > 1 && (
