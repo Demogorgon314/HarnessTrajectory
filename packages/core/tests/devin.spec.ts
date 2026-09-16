@@ -253,7 +253,7 @@ describe('devin adapter', () => {
     const parser = createDevinParser()
     parser.push(human('spawn it', 2, 1, 10), MAIN, 0)
     parser.push(assistant(3, 2, 20, {
-      calls: [{ id: 'spawn-1', name: 'run_subagent', args: { task: 'survey', profile: 'explore' } }],
+      calls: [{ id: 'spawn-1', name: 'run_subagent', args: { task: 'survey', profile: 'explore', is_background: true } }],
     }), MAIN, 1)
     // A background spawn result names the agent but not its chain — the
     // chain id lands on the completion notification.
@@ -264,10 +264,46 @@ describe('devin adapter', () => {
     expect(unbound).toBeDefined()
     // Null — NOT 'a0be46c6': opening that as a file id 404s the events route.
     expect(unbound?.fileId).toBeNull()
+    expect(unbound).toMatchObject({ status: 'running', startedAt: at(20), endedAt: null })
+    parser.push(JSON.stringify({
+      t: 'devin.tool', id: 'spawn-1', time: at(40), update: { status: 'completed' },
+    }), MAIN, -1)
+    expect(parser.subagents()[0]?.status).toBe('running')
     // The sidecar's agent list lands when the server claims the chain.
     parser.push(sidecar({ agents: [{ id: 'a0be46c6', fileId: 'agent-a0be46c6' }] }), MAIN, -1)
     const bound = parser.subagents().find(run => run.agentId === 'a0be46c6')
     expect(bound?.fileId).toBe('agent-a0be46c6')
+    expect(bound?.endedAt).toBeNull()
+    const beforeCompletion = parser.snapshot()
+    const notification = msgRecord(5, 4, {
+      message_id: 'completion-1', role: 'system',
+      content: '<subagent_completion_notification>Agent completed</subagent_completion_notification>',
+      metadata: { extensions: {
+        'subagent/agent_id': 'a0be46c6', 'subagent/chain_node_id': 90,
+        'subagent/profile_name': 'Explore', 'subagent/model': 'test-model',
+      } },
+    }, 5030)
+    parser.push(notification, MAIN, 3)
+    expect(parser.subagents()[0]).toMatchObject({
+      status: 'completed', startedAt: at(20), endedAt: at(5030), model: 'test-model',
+    })
+    expect(parser.snapshot()).not.toBe(beforeCompletion)
+    const afterCompletion = parser.snapshot()
+    parser.push(notification, MAIN, 4)
+    expect(parser.snapshot()).toBe(afterCompletion)
+  })
+
+  it('settles a failed background launch immediately', () => {
+    const parser = createDevinParser()
+    parser.push(assistant(3, 2, 20, {
+      calls: [{ id: 'spawn-1', name: 'run_subagent', args: { is_background: true } }],
+    }), MAIN, 0)
+    parser.push(toolResult(4, 3, 'spawn-1', 'launch failed', 30, {
+      'subagent/agent_id': 'abc123', 'chisel/tool_result_meta': { success: false },
+    }), MAIN, 1)
+    expect(parser.subagents()[0]).toMatchObject({
+      status: 'failed', startedAt: at(20), endedAt: at(30),
+    })
   })
 
   it('binds a child stream by its ref agent and nests its tool calls', () => {

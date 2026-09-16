@@ -806,7 +806,107 @@ describe('DevinSource', () => {
     expect(bMsgs[1]).toContain('survey beta')
   })
 
-  it('binds a background chain at completion — invisible while running, backlog after', async () => {
+  it.each(['receipt', 'child'] as const)('opens a running child when the %s arrives late, preserving replay at completion', async late => {
+    const db = fixture()
+    createStore(db)
+    insertSession(db, 'alpha', { main_chain_id: 1 })
+    insertNode(db, 'alpha', 1, null, userMsg('u1', 'delegate'))
+    insertNode(db, 'alpha', 2, 1, assistantMsg('a1', '', [{
+      id: 'spawn-1', name: 'run_subagent', args: { title: 'Live survey', task: 'survey', is_background: true },
+    }]))
+    const receipt = (db: DevinDb): void => insertNode(db, 'alpha', 3, 2, toolMsg('r1', 'spawn-1', 'started', {
+      'subagent/agent_id': 'cc0003',
+    }))
+    const child = (db: DevinDb): void => {
+      insertNode(db, 'alpha', 10, null, userMsg('task', 'survey'))
+      insertNode(db, 'alpha', 11, null, { message_id: 'sys', role: 'system', content: 'prompt' })
+      insertNode(db, 'alpha', 12, 11, userMsg('task', 'survey'), undefined, priorMeta(10))
+      insertNode(db, 'alpha', 13, 12, assistantMsg('working', 'investigating'))
+    }
+    if (late === 'receipt') child(db)
+    else receipt(db)
+    db.close()
+    const src = await start()
+    expect(src.hasChild('devin', 'alpha', 'agent-cc0003')).toBe(false)
+    const events: SessionLiveEvent[] = []
+    const unsubscribe = src.subscribe('devin', 'alpha', event => events.push(event))
+    const write = new DevinDb(dbPath, { readOnly: false })
+    if (late === 'receipt') receipt(write)
+    else child(write)
+    await src.refresh()
+    expect(src.hasChild('devin', 'alpha', 'agent-cc0003')).toBe(true)
+    expect(src.get('devin', 'alpha')?.files.find(file => file.role === 'child')?.agent).toMatchObject({
+      agentId: 'cc0003', toolUseId: 'spawn-1', description: 'Live survey',
+    })
+    expect(events.some(event => event.type === 'file' && event.file.id === 'agent-cc0003')).toBe(true)
+    const before = linesOf(await replay(src, 'alpha', 'agent-cc0003')).flatMap(chunk => chunk.lines)
+    expect(before.filter(line => line.includes('devin.msg'))).toHaveLength(3)
+    expect(before.some(line => line.includes('investigating'))).toBe(true)
+    insertNode(write, 'alpha', 14, 13, assistantMsg('more', 'still working'))
+    await src.refresh()
+    insertNode(write, 'alpha', 4, 3, {
+      message_id: 'done', role: 'system', content: 'completion',
+      metadata: { extensions: { 'subagent/agent_id': 'cc0003', 'subagent/chain_node_id': 14 } },
+    })
+    write.close()
+    await src.refresh()
+    const after = linesOf(await replay(src, 'alpha', 'agent-cc0003')).flatMap(chunk => chunk.lines)
+    expect(after).toHaveLength(before.length + 1)
+    expect(after.slice(0, before.length)).toEqual(before)
+    expect(src.get('devin', 'alpha')?.files.filter(file => file.role === 'child')).toHaveLength(1)
+    unsubscribe()
+  })
+
+  it.each(['spawns', 'chains', 'later message', 'main'] as const)('does not infer ownership from ambiguous %s', async ambiguity => {
+    const db = fixture()
+    createStore(db)
+    insertSession(db, 'alpha', { main_chain_id: 1 })
+    insertNode(db, 'alpha', 1, null, userMsg('u1', ambiguity === 'main' ? 'survey' : 'delegate'))
+    const calls = [{ id: 'spawn-1', name: 'run_subagent', args: { task: 'survey' } }]
+    if (ambiguity === 'spawns') calls.push({ id: 'spawn-2', name: 'run_subagent', args: { task: 'survey' } })
+    insertNode(db, 'alpha', 2, 1, assistantMsg('a1', '', calls))
+    insertNode(db, 'alpha', 3, 2, toolMsg('r1', 'spawn-1', 'started', { 'subagent/agent_id': 'cc0003' }))
+    if (ambiguity !== 'main') {
+      insertNode(db, 'alpha', 10, null, userMsg('task', ambiguity === 'later message' ? 'other task' : 'survey'))
+      if (ambiguity === 'later message') insertNode(db, 'alpha', 11, 10, userMsg('later', 'survey'))
+      if (ambiguity === 'chains') insertNode(db, 'alpha', 20, null, userMsg('other', 'survey'))
+    }
+    db.close()
+    const src = await start()
+    expect(src.get('devin', 'alpha')?.files.filter(file => file.role === 'child')).toHaveLength(0)
+  })
+
+  it('replaces an inferred chain when a later explicit claim identifies a different chain', async () => {
+    const db = fixture()
+    createStore(db)
+    insertSession(db, 'alpha', { main_chain_id: 1 })
+    insertNode(db, 'alpha', 1, null, userMsg('u1', 'delegate'))
+    insertNode(db, 'alpha', 2, 1, assistantMsg('a1', '', [{
+      id: 'spawn-1', name: 'run_subagent', args: { task: 'survey' },
+    }]))
+    insertNode(db, 'alpha', 3, 2, toolMsg('r1', 'spawn-1', 'started', { 'subagent/agent_id': 'cc0003' }))
+    insertNode(db, 'alpha', 10, null, userMsg('task', 'survey'))
+    db.close()
+    const src = await start()
+    expect(src.hasChild('devin', 'alpha', 'agent-cc0003')).toBe(true)
+    const events: SessionLiveEvent[] = []
+    const unsubscribe = src.subscribe('devin', 'alpha', event => events.push(event))
+    const write = new DevinDb(dbPath, { readOnly: false })
+    insertNode(write, 'alpha', 20, null, userMsg('actual-task', 'different task'))
+    insertNode(write, 'alpha', 4, 3, {
+      message_id: 'claim', role: 'system', content: 'completion',
+      metadata: { extensions: { 'subagent/agent_id': 'cc0003', 'subagent/chain_node_id': 20 } },
+    })
+    write.close()
+    await src.refresh()
+    expect(events.some(event => event.type === 'file' && event.file.id === 'agent-cc0003' && event.reset)).toBe(true)
+    const lines = linesOf(await replay(src, 'alpha', 'agent-cc0003')).flatMap(chunk => chunk.lines)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toContain('actual-task')
+    unsubscribe()
+  })
+
+  it('waits for an explicit completion claim when the child has no human task opener', async () => {
     const db = fixture()
     createStore(db)
     insertSession(db, 'alpha', { main_chain_id: 1 })

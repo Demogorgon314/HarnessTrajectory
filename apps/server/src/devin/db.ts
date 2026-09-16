@@ -22,7 +22,8 @@
  *   practice). A background `run_subagent` binds its chain late: the spawn
  *   result carries `subagent/agent_id` only, and a
  *   `<subagent_completion_notification>` system node on the main chain later
- *   adds `subagent/chain_node_id` — the child stream appears at completion.
+ *   adds `subagent/chain_node_id`. Before then, the source can infer ownership
+ *   from a unique exact match between the spawn task and a chain's opener.
  * - `tool_call_state` — `(session_id, tool_call_id)` → serialized ACP
  *   `ToolCall` + `ToolCallUpdate` (status/title/kind/locations), update column
  *   filled when the call settles.

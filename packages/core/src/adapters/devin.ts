@@ -253,6 +253,7 @@ interface DevinSpawn {
   task: string | null
   title: string | null
   profile: string | null
+  background: boolean
   time: number
 }
 
@@ -401,6 +402,18 @@ class DevinParser implements SessionParser {
   }
 
   private handleSystem(msg: Record<string, unknown>, time: number): void {
+    // Background completion notifications carry the chain binding; the earlier
+    // spawn receipt only acknowledges launch and must not end the agent run.
+    const ext = msgExt(msg)
+    const agentId = asString(ext?.['subagent/agent_id'])
+    if (agentId !== undefined && asNumber(ext?.['subagent/chain_node_id']) !== undefined) {
+      const run = this.runFor(agentId, time)
+      run.status = 'completed'
+      run.endedAt = time
+      run.agentType = asString(ext?.['subagent/profile_name']) ?? run.agentType
+      run.model = asString(ext?.['subagent/model']) ?? run.model
+      this.assembler.touch()
+    }
     const text = msgText(msg)
     if (text.trim() === '') return
     this.assembler.systemPrompts.push({
@@ -518,7 +531,8 @@ class DevinParser implements SessionParser {
         const task = isRecord(args) ? asString(args['task']) ?? null : null
         const title = isRecord(args) ? asString(args['title']) ?? null : null
         const profile = isRecord(args) ? asString(args['profile']) ?? null : null
-        this.spawns.push({ callId: call.id, task, title, profile, time })
+        const background = isRecord(args) && args['is_background'] === true
+        this.spawns.push({ callId: call.id, task, title, profile, background, time })
       }
     }
     this.assembler.touch()
@@ -558,16 +572,25 @@ class DevinParser implements SessionParser {
       run.description = spawn?.title ?? spawn?.task ?? run.description
       run.agentType = asString(ext?.['subagent/profile_name']) ?? spawn?.profile ?? run.agentType
       run.model = asString(ext?.['subagent/model']) ?? run.model
-      run.status = isError ? 'failed' : 'completed'
-      run.endedAt = time
+      run.startedAt = spawn?.time ?? run.startedAt
+      if (isError || !spawn?.background) {
+        run.status = isError ? 'failed' : 'completed'
+        run.endedAt = time
+      } else if (run.endedAt === null) {
+        run.status = 'running'
+      }
       const fileId = this.agentFiles.get(agentId)
       if (fileId !== undefined) run.fileId = fileId
       this.runByCall.set(callId, run)
     } else {
       const bound = this.runByCall.get(callId)
       if (bound !== undefined) {
-        bound.status = isError ? 'failed' : 'completed'
-        bound.endedAt = time
+        if (isError || !this.spawnOf(callId)?.background) {
+          bound.status = isError ? 'failed' : 'completed'
+          bound.endedAt = time
+        } else if (bound.endedAt === null) {
+          bound.status = 'running'
+        }
       }
     }
   }

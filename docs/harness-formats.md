@@ -83,17 +83,29 @@ known.
 
 The group holding `main_chain_id` is the main stream. Other groups are NOT automatically
 children — compactor/render chains look identical to subagent chains — so unclaimed groups
-buffer as `pending` and surface only when a `subagent_heads` row or a spawn result's
+buffer as `pending` and surface when a `subagent_heads` row or a spawn result's
 `subagent/agent_id`/`chain_node_id`/`profile_name` extensions claim them (claims can land after
 the child's lines; the child file is `agent-<agentId>`). A background `run_subagent` result
 carries `subagent/agent_id` only — the `chain_node_id` arrives on a
-`<subagent_completion_notification>` system node on the main chain, so the child materializes
-at completion; while unclaimed the run's `fileId` stays null in the catalog (the agent id is
-never a stream id). The child ref's `agent` facts are assembled from the `run_subagent` call's
+`<subagent_completion_notification>` system node on the main chain. Before that, the source
+can bind a running child by exact task text: one spawn call must match one non-main chain's
+opening human user message (only system ancestors allowed), after merging render copies.
+The launch receipt supplies the agent id. Repeated task arguments, multiple matching chains,
+and later/injected user messages do not qualify. Explicit claims take precedence; a later
+ambiguity or conflicting claim rebuilds inferred attribution so live and replay agree.
+While unclaimed the run's `fileId` stays null in the catalog (the agent id is never a stream
+id). The child ref's `agent` facts are assembled from the `run_subagent` call's
 `title`/`task`/`profile` arguments joined through the result's `tool_call_id` →
 `subagent/agent_id` (so `agent.description` is the spawn title even in a child view that never
 folded the parent's calls), plus `subagent/profile_name` and `subagent/model` from the claim —
 late facts re-emit the `file` event.
+
+`run_subagent` with `is_background: true` returns a launch receipt: a successful tool
+result (or ACP `completed` state) does not mean the agent finished. The run stays
+`running`, with no end time, until the main stream's system notification supplies
+`subagent/agent_id` and `subagent/chain_node_id`. That notification completes the run;
+foreground results and failed spawn results settle immediately. Run duration starts
+at the spawn call, not its result receipt.
 
 ### Store rewrites and compaction
 

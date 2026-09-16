@@ -27,7 +27,9 @@
  * claimed — by a `subagent_heads` row or a `subagent/agent_id` +
  * `chain_node_id` pair (a spawn result's extensions for a synchronous run,
  * the `<subagent_completion_notification>` system node on the main chain for
- * a background one). Unclaimed chains (context renders, compactor/summarizer
+ * a background one), or a unique exact match between a spawn's task and a
+ * chain's opening human message, joined to the launch receipt's agent id.
+ * Unclaimed chains (context renders, compactor/summarizer
  * passes) buffer as `pending` and never appear: a claim drains the backlog in
  * order, a merge into the main chain drains it there.
  *
@@ -277,12 +279,14 @@ interface DevinSessionState {
   spawnArgs: Map<string, { title: string | null; task: string | null; profile: string | null }>
   /** agent_id → the `run_subagent` call that spawned it (result's tool_call_id). */
   agentCall: Map<string, string>
+  /** Human task nodes; exact task matching is only a fallback to explicit claims. */
+  taskNodes: Map<number, string>
+  inferredAgents: Map<number, string>
   /**
    * Nodes of chain groups nothing has claimed yet (group root → rows, in row
    * order). Devin renders extra context chains — compactor and summarizer
-   * passes — in the same forest, and only a spawn result's `subagent/*`
-   * extensions (or a `subagent_heads` row) prove a group is a real agent
-   * transcript. Unclaimed groups buffer here instead of becoming child files;
+   * passes — in the same forest. Explicit claims or a unique spawn/task match
+   * identify agent transcripts. Unclaimed groups buffer here instead of becoming child files;
    * a group that merges into the main chain drains to the main stream, and a
    * never-claimed one stays invisible.
    */
@@ -667,6 +671,8 @@ export class DevinSource extends EventEmitter implements SessionSource {
       chainAgent: new Map(),
       spawnArgs: new Map(),
       agentCall: new Map(),
+      taskNodes: new Map(),
+      inferredAgents: new Map(),
       pending: new Map(),
     }
   }
@@ -900,6 +906,7 @@ export class DevinSource extends EventEmitter implements SessionSource {
     const learned = [...state.chainAgent.entries()].find(([chainNode]) =>
       state.groups.find(chainNode) === state.groups.find(node.nodeId))
     const agentId = named?.[1] ?? learned?.[1].agentId
+      ?? state.inferredAgents.get(state.groups.find(node.nodeId))
     if (agentId === undefined) return null
     const learnedFacts = learned?.[1]
     // The file is named by the claimed agent id, not a row-derived group key:
@@ -1027,6 +1034,8 @@ export class DevinSource extends EventEmitter implements SessionSource {
       state.epochs.clear()
       state.nodes.clear()
       state.pending.clear()
+      state.taskNodes.clear()
+      state.inferredAgents.clear()
       state.maxRowId = 0
       // `file reset` makes subscribers refold from empty, so every fact
       // folded from the old rows must re-derive: rebuild each meta scanner
@@ -1060,7 +1069,12 @@ export class DevinSource extends EventEmitter implements SessionSource {
     const rows = state.replayRows ?? (full
       ? db.nodes(state.row.id)
       : db.nodesAfter(state.row.id, state.maxRowId))
-    if (rows.length === 0) return
+    if (rows.length === 0) {
+      // Heads can change without any new messages, including overriding an
+      // inferred owner. Apply the same attribution check as a message batch.
+      if (!this.inferTaskAgents(state)) this.materialize(state, true)
+      return
+    }
     if (state.maxRowId === 0) state.earliestNode = rows[0]?.node_id ?? 0
     const parsed = rows.map(row => this.parseNode(row))
     // Pass 1 — structure: parent + prior + identity edges before any line is
@@ -1113,6 +1127,14 @@ export class DevinSource extends EventEmitter implements SessionSource {
       // first so a node carrying all three extensions resolves in one pass.
       this.learnSpawnFacts(state, node)
       this.learnChainAgent(state, node)
+      const meta = isRecord(node.record['metadata']) ? node.record['metadata'] : undefined
+      if (node.record['role'] === 'user' && meta?.['is_user_input'] === true) {
+        const content = node.record['content']
+        const text = typeof content === 'string' ? content : (asArray(content) ?? [])
+          .flatMap(part => isRecord(part) && part['type'] === 'text' ? [asString(part['text']) ?? ''] : [])
+          .join('\n')
+        if (text.trim() !== '') state.taskNodes.set(node_id, text)
+      }
     }
     // Shared message_id is object identity, not conversation membership — the
     // same boilerplate object (the subagent system prompt is one mid) opens
@@ -1125,6 +1147,7 @@ export class DevinSource extends EventEmitter implements SessionSource {
       if (!state.groups.union(nodeId, anchor)) return this.materialize(state, true)
       state.groups.markMid(nodeId)
     }
+    if (!this.inferTaskAgents(state)) return this.materialize(state, true)
     // Pass 2 — emit first occurrences in insertion order. Chains nothing has
     // claimed yet (context renders, compactor passes) buffer until a claim or
     // a merge into the main chain resolves them.
@@ -1159,6 +1182,66 @@ export class DevinSource extends EventEmitter implements SessionSource {
     // batch landed. A mid-batch throw must leave it behind so the next tick
     // refetches and retries these rows instead of skipping them.
     state.maxRowId = Math.max(state.maxRowId, rows[rows.length - 1]?.row_id ?? 0)
+  }
+
+  /**
+   * Background receipts omit the chain id, but the delegated task is already
+   * persisted as the child's first user message. Infer only a one-to-one exact
+   * match across both spawns and independent chains. Render copies collapse by
+   * lineage first; shared prompts and arbitrary later user text prove nothing.
+   */
+  private inferTaskAgents(state: DevinSessionState): boolean {
+    const callsByTask = new Map<string, string[]>()
+    for (const [callId, spawn] of state.spawnArgs) {
+      if (spawn.task === null || spawn.task.trim() === '') continue
+      const calls = callsByTask.get(spawn.task) ?? []
+      calls.push(callId)
+      callsByTask.set(spawn.task, calls)
+    }
+    const groupsByTask = new Map<string, Set<number>>()
+    for (const [nodeId, task] of state.taskNodes) {
+      if (!callsByTask.has(task) || this.isMainGroup(state, nodeId)) continue
+      let parent = state.nodes.get(nodeId)?.parentId ?? null
+      const seen = new Set<number>([nodeId])
+      let opener = true
+      while (parent !== null) {
+        const ancestor = state.nodes.get(parent)
+        const message = ancestor === undefined ? undefined : jsonString(ancestor.chatMessage)
+        if (seen.has(parent) || !isRecord(message) || message['role'] !== 'system') {
+          opener = false
+          break
+        }
+        seen.add(parent)
+        parent = ancestor?.parentId ?? null
+      }
+      if (!opener) continue
+      const groups = groupsByTask.get(task) ?? new Set<number>()
+      groups.add(state.groups.find(nodeId))
+      groupsByTask.set(task, groups)
+    }
+    const explicit = new Map<number, string>()
+    for (const [nodeId, facts] of state.chainAgent) explicit.set(state.groups.find(nodeId), facts.agentId)
+    for (const [nodeId, agentId] of state.heads) explicit.set(state.groups.find(nodeId), agentId)
+    const claimedAgents = new Set(explicit.values())
+    const inferred = new Map<number, string>()
+    for (const [task, calls] of callsByTask) {
+      const callId = calls[0]
+      const groups = groupsByTask.get(task)
+      if (calls.length !== 1 || callId === undefined || groups?.size !== 1) continue
+      const root = groups.values().next().value
+      const agents = [...state.agentCall].filter(([, spawnId]) => spawnId === callId)
+      const agentId = agents.length === 1 ? agents[0]?.[0] : undefined
+      if (root === undefined || agentId === undefined || explicit.has(root) || claimedAgents.has(agentId)) continue
+      inferred.set(root, agentId)
+    }
+    // A later conflicting claim or duplicate task can invalidate a fallback.
+    // Rebuild before emitting more so live attribution agrees with fresh replay.
+    for (const [nodeId, agentId] of state.inferredAgents) {
+      const root = state.groups.find(nodeId)
+      if ((explicit.get(root) ?? inferred.get(root)) !== agentId) return false
+    }
+    state.inferredAgents = inferred
+    return true
   }
 
   /**
