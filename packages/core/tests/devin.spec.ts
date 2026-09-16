@@ -249,6 +249,27 @@ describe('devin adapter', () => {
     expect(runs[0]?.status).toBe('completed')
   })
 
+  it('keeps fileId null until a real child file binds — the agent id is not a stream id', () => {
+    const parser = createDevinParser()
+    parser.push(human('spawn it', 2, 1, 10), MAIN, 0)
+    parser.push(assistant(3, 2, 20, {
+      calls: [{ id: 'spawn-1', name: 'run_subagent', args: { task: 'survey', profile: 'explore' } }],
+    }), MAIN, 1)
+    // A background spawn result names the agent but not its chain — the
+    // chain id lands on the completion notification.
+    parser.push(toolResult(4, 3, 'spawn-1', 'Background subagent started with agent_id=a0be46c6.', 30, {
+      'subagent/agent_id': 'a0be46c6',
+    }), MAIN, 2)
+    const unbound = parser.subagents().find(run => run.agentId === 'a0be46c6')
+    expect(unbound).toBeDefined()
+    // Null — NOT 'a0be46c6': opening that as a file id 404s the events route.
+    expect(unbound?.fileId).toBeNull()
+    // The sidecar's agent list lands when the server claims the chain.
+    parser.push(sidecar({ agents: [{ id: 'a0be46c6', fileId: 'agent-a0be46c6' }] }), MAIN, -1)
+    const bound = parser.subagents().find(run => run.agentId === 'a0be46c6')
+    expect(bound?.fileId).toBe('agent-a0be46c6')
+  })
+
   it('binds a child stream by its ref agent and nests its tool calls', () => {
     const parser = createDevinParser()
     parser.push(human('spawn', 2, 1, 10), MAIN, 0)

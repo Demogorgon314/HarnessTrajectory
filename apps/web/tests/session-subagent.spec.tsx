@@ -113,6 +113,25 @@ describe('subagentRows titles', () => {
     expect(subagentRows([run('agent-12')], [])[0]?.title).toBe('12')
   })
 
+  test('an unbound run keeps a null fileId — no invented stream id', () => {
+    const rows = subagentRows([run('a0be46c6', { fileId: null, callId: 'c1' })], [])
+    expect(rows[0]?.fileId).toBeNull()
+  })
+
+  test('an unbound run opens once its child file is announced', () => {
+    const rows = subagentRows(
+      [run('a0be46c6', { fileId: null, callId: 'c1' })],
+      [{
+        file: {
+          id: 'agent-a0be46c6', role: 'child', path: 'devin://sessions/x/agent-a0be46c6',
+          agent: { agentId: 'a0be46c6' },
+        },
+        updatedAt: 200, bytes: 10,
+      }],
+    )
+    expect(rows[0]?.fileId).toBe('agent-a0be46c6')
+  })
+
   test('a child file without a run uses sidecar description, not the directory id', () => {
     const rows = subagentRows(
       [],
@@ -134,6 +153,33 @@ describe('subagentRows titles', () => {
       { fileId: 'agent-1', title: 'Survey the repo structure' },
     )
     expect(rows[0]?.title).toBe('Survey the repo structure')
+  })
+
+  test('a child view titles every sibling from the server-provided descriptions', () => {
+    // The child-view parser folds only the selected stream, so no parent
+    // run_subagent calls exist — every row is a catalog row and its title is
+    // the child ref's `agent.description` (the spawn call's title).
+    const child = (id: string, description: string) => ({
+      file: {
+        id, role: 'child' as const, path: `devin://sessions/x/${id}`,
+        agent: { agentId: id.slice('agent-'.length), description, agentType: 'Explore' },
+      },
+      updatedAt: 200, bytes: 10,
+    })
+    const rows = subagentRows(
+      [],
+      [
+        child('agent-10d29d86', 'Review context devin synth + fold'),
+        child('agent-a0be46c6', 'Review new replay/heal/routing code'),
+        child('agent-d644a097', 'Review core devin adapter'),
+      ],
+      { fileId: 'agent-a0be46c6', title: 'a0be46c6 own transcript title' },
+    )
+    expect(rows.map(row => row.title)).toEqual([
+      'Review context devin synth + fold',
+      'Review new replay/heal/routing code',
+      'Review core devin adapter',
+    ])
   })
 })
 

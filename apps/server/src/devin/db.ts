@@ -11,12 +11,18 @@
  * - `message_nodes` — a persistent forest. Each row is one chat message node:
  *   `node_id`/`parent_node_id` form trees, and every context render copies the
  *   surviving chain into a NEW tree — the copies carry the same `message_id`
- *   and, on render-boundary nodes, `extensions."compact/prior_node_ids"`
- *   pointing at the nodes they replace. So the logical transcript is the
+ *   and the ROW's `metadata.extensions."compact/prior_node_ids"` points at the
+ *   nodes it replaces (older stores carried the same links inside
+ *   `chat_message.metadata.extensions`). So the logical transcript is the
  *   first-occurrence node of each `message_id`; chain membership is decided by
- *   a union-find over parent edges, prior edges, and shared message ids (a
- *   subagent's repeated render trees share mids with each other but never with
- *   the main chain — `subagent_heads` exists but is empty in practice).
+ *   a union-find over parent + prior edges, with shared message ids gluing
+ *   only prior-free components — `message_id` is object identity, and the
+ *   subagent boilerplate (one shared system-prompt object) carries a single
+ *   mid across every agent chain (`subagent_heads` exists but is empty in
+ *   practice). A background `run_subagent` binds its chain late: the spawn
+ *   result carries `subagent/agent_id` only, and a
+ *   `<subagent_completion_notification>` system node on the main chain later
+ *   adds `subagent/chain_node_id` — the child stream appears at completion.
  * - `tool_call_state` — `(session_id, tool_call_id)` → serialized ACP
  *   `ToolCall` + `ToolCallUpdate` (status/title/kind/locations), update column
  *   filled when the call settles.

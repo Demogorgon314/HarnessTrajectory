@@ -128,6 +128,12 @@ export function openSessionStream(
     onEvent: (event: SessionLiveEvent) => void
     onError?: (error: Event) => void
     /**
+     * Every successful open — the first connect and each reconnect alike.
+     * `onReconnect` covers only the reconnect case, so a caller tracking
+     * "is the stream alive right now" hooks here.
+     */
+    onOpen?: () => void
+    /**
      * The connection dropped and EventSource re-established it — the server
      * replays the whole stream on the new socket, so folded state must be
      * rebuilt before the replayed events land or every record counts twice.
@@ -140,6 +146,7 @@ export function openSessionStream(
   const source = new EventSource(`/api/sessions/${kind}/${encodeURIComponent(id)}/events${suffix}`)
   let opened = false
   source.onopen = () => {
+    handlers.onOpen?.()
     if (opened) handlers.onReconnect?.()
     opened = true
   }

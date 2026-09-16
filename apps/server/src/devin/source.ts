@@ -24,18 +24,29 @@
  *
  * Stream layout: `devin://sessions/<id>` is the main stream; a disjoint chain
  * becomes the child stream `devin://sessions/<id>/agent-<agentId>` once
- * claimed — by a `subagent_heads` row or a spawn result's `subagent/*`
- * extensions. Unclaimed chains (context renders, compactor/summarizer passes)
- * buffer as `pending` and never appear: a claim drains the backlog in order,
- * a merge into the main chain drains it there.
+ * claimed — by a `subagent_heads` row or a `subagent/agent_id` +
+ * `chain_node_id` pair (a spawn result's extensions for a synchronous run,
+ * the `<subagent_completion_notification>` system node on the main chain for
+ * a background one). Unclaimed chains (context renders, compactor/summarizer
+ * passes) buffer as `pending` and never appear: a claim drains the backlog in
+ * order, a merge into the main chain drains it there.
  *
  * Chain membership (see db.ts header): a union-find over `parent_node_id`,
  * `compact/prior_node_ids` and shared `message_id`s groups render trees into
- * logical chains. A logical chain only ever grows — a render's links land in
+ * logical chains. The edges are NOT equally trustworthy: parent/prior links
+ * are conversation lineage — a re-render points at the nodes it replaces —
+ * while `message_id` is OBJECT identity, and the CLI inserts the same message
+ * object into many conversations (every subagent's context opens with one
+ * shared system-prompt object, one mid across every agent chain). So a mid
+ * edge glues components only when NEITHER side carries prior structure —
+ * prior-free fragments of older stores where mid is the only render link.
+ * A logical chain only ever grows — a render's links land in
  * one transaction — but if a union ever merges two groups that both already
  * emitted lines, the earlier attribution was wrong, so the session is
  * re-materialized with `file reset` (deterministic rebuild, cheap at this
- * size).
+ * size). The same rebuild covers the converse: a prior edge landing inside a
+ * mid-glued component proves the mid merge was a shared object, and the full
+ * pass re-derives the grouping with every prior known up front.
  *
  * Compaction epochs: a `system` node carrying `extensions['devin-rs/summary']`
  * closes one render and opens the next ON ITS OWN STREAM — each owner entry
@@ -61,8 +72,11 @@
  */
 
 import { EventEmitter } from 'node:events'
-import { existsSync, watch, type FSWatcher } from 'node:fs'
-import { asString, isRecord, type HarnessKind, type SessionFileRef, type SessionLiveEvent } from '@harness-trajectory/core'
+import { existsSync, statSync, watch, type FSWatcher } from 'node:fs'
+import {
+  asArray, asString, isRecord, parseJsonLine,
+  type AgentFileMeta, type HarnessKind, type SessionFileRef, type SessionLiveEvent,
+} from '@harness-trajectory/core'
 import { createMetaScanner } from '../meta.ts'
 import type { SearchIndexer } from '../search/indexer.ts'
 import {
@@ -92,12 +106,18 @@ interface DevinEntry extends SourceEntry {
 
 /**
  * Union-find over message nodes. Roots carry the entry already emitting the
- * group, so an emitted-lines merge is detectable. (The child file id comes
- * from the claiming agent id, not the group — see `childEntry`.)
+ * group, so an emitted-lines merge is detectable. Two flag sets ride the
+ * roots: `prior` marks components containing a `compact/prior_node_ids` edge
+ * (reliable lineage — shared objects must not glue them), `mid` marks
+ * components a `message_id` edge glued (a later prior edge into one voids the
+ * merge). (The child file id comes from the claiming agent id, not the group
+ * — see `childEntry`.)
  */
 class ChainGroups {
   private readonly parent = new Map<number, number>()
   private readonly emitted = new Map<number, DevinEntry>()
+  private readonly prior = new Set<number>()
+  private readonly mid = new Set<number>()
 
   find(node: number): number {
     // An unknown node is its own group until `add`/`union` place it.
@@ -129,6 +149,26 @@ class ChainGroups {
     this.emitted.set(this.find(node), entry)
   }
 
+  /** The node's component contains a `compact/prior_node_ids` edge. */
+  hasPrior(node: number): boolean {
+    return this.prior.has(this.find(node))
+  }
+
+  /** The node's component was glued together by a `message_id` edge. */
+  hasMid(node: number): boolean {
+    return this.mid.has(this.find(node))
+  }
+
+  /** Mark the node's component as containing a prior edge. */
+  markPrior(node: number): void {
+    this.prior.add(this.find(node))
+  }
+
+  /** Mark the node's component as containing a mid merge. */
+  markMid(node: number): void {
+    this.mid.add(this.find(node))
+  }
+
   /**
    * Union two nodes. Returns `false` when the merge joined two groups that
    * each already emitted lines — the earlier attribution is void, caller must
@@ -145,6 +185,8 @@ class ChainGroups {
     const eb = this.emitted.get(rb)
     if (ea !== undefined && eb !== undefined && ea !== eb) return false
     this.parent.set(ra, rb)
+    if (this.prior.delete(ra)) this.prior.add(rb)
+    if (this.mid.delete(ra)) this.mid.add(rb)
     const entry = ea ?? eb
     if (entry !== undefined) this.emitted.set(rb, entry)
     return true
@@ -209,6 +251,12 @@ interface DevinSessionState {
   epochs: Map<DevinEntry, number>
   /** Highest row_id consumed; a regression means the store was rebuilt. */
   maxRowId: number
+  /**
+   * A materialization batch aborted midway: `nodes`/structure maps hold rows
+   * that never emitted, so an incremental retry would skip them (`fresh`
+   * comes up empty). The next materialize for this session must rebuild.
+   */
+  needsRebuild: boolean
   /** node_id of the session's first row — the main-chain fallback root. */
   earliestNode: number
   /** node_id → retained row facts, for walking a render chain's ancestry. */
@@ -224,7 +272,11 @@ interface DevinSessionState {
    * `subagent/*` metadata extensions — the reliable binding (`subagent_heads`
    * is empty in observed stores).
    */
-  chainAgent: Map<number, { agentId: string; profile: string | null }>
+  chainAgent: Map<number, { agentId: string; profile: string | null; model: string | null }>
+  /** `run_subagent` call id → its `title`/`task`/`profile` arguments. */
+  spawnArgs: Map<string, { title: string | null; task: string | null; profile: string | null }>
+  /** agent_id → the `run_subagent` call that spawned it (result's tool_call_id). */
+  agentCall: Map<string, string>
   /**
    * Nodes of chain groups nothing has claimed yet (group root → rows, in row
    * order). Devin renders extra context chains — compactor and summarizer
@@ -235,8 +287,6 @@ interface DevinSessionState {
    * never-claimed one stays invisible.
    */
   pending: Map<number, StoredNode[]>
-  /** Dedup keys of the nodes in `pending` (same vocabulary as `emitted`). */
-  pendingKeys: Set<string>
 }
 
 function jsonString(value: string | null): unknown {
@@ -256,12 +306,27 @@ export class DevinSource extends EventEmitter implements SessionSource {
   private readonly book = new SessionBook<DevinEntry>(() => this.now())
   private readonly states = new Map<string, DevinSessionState>()
   private db: DevinDb | null = null
+  /**
+   * Identity (`dev:ino`) of the file the open handle and every derived state
+   * were built from. Kept across `stop()` so a file swapped while stopped is
+   * still caught at the next `start()`.
+   */
+  private dbSig: string | null = null
   private poll: ReturnType<typeof setInterval> | null = null
-  private watcher: FSWatcher | null = null
+  private readonly watchers: FSWatcher[] = []
+  private readonly watchedPaths = new Set<string>()
   private pollTimer: ReturnType<typeof setTimeout> | null = null
   private stopped = false
   /** The last open attempt failed and was already reported — suppress repeats. */
   private openFailed = false
+  /** The last sessions() query failed and was already reported — suppress repeats. */
+  private queryFailed = false
+  /**
+   * The open file is a replacement whose resync could not finish (the new
+   * store opened but its `sessions()` query failed). States still describe
+   * the OLD store — ticks retry the resync before serving them.
+   */
+  private resyncPending = false
 
   constructor(options: DevinSourceOptions) {
     super()
@@ -272,24 +337,44 @@ export class DevinSource extends EventEmitter implements SessionSource {
   }
 
   async start(): Promise<void> {
-    this.openDb()
+    this.stopped = false
+    // A restart re-reports failures: the streak flags belong to the run, not
+    // the instance.
+    this.openFailed = false
+    this.queryFailed = false
+    if (this.db === null) this.openDb()
     await this.sweep()
     if (!this.watchEnabled) return
-    this.poll = setInterval(() => {
-      this.tick().catch((error: unknown) => { this.emit('error', error) })
-    }, POLL_INTERVAL_MS)
-    this.poll.unref()
+    if (this.poll === null) {
+      this.poll = setInterval(() => {
+        this.tick().catch((error: unknown) => { this.emit('error', error) })
+      }, POLL_INTERVAL_MS)
+      this.poll.unref()
+    }
     this.attachWatcher()
+  }
+
+  /** `dev:ino` of the file at `dbPath`; null when it does not exist. */
+  private fileSig(): string | null {
+    try {
+      const st = statSync(this.dbPath)
+      return `${st.dev}:${st.ino}`
+    } catch {
+      return null
+    }
   }
 
   /**
    * (Re)open the store. A missing file is normal — Devin CLI may simply not
    * be installed yet — so it degrades silently and the poll retries; a file
    * that exists but will not open reports once per failure streak instead of
-   * crashing the composite.
+   * crashing the composite. When the opened file is not the one the states
+   * were built from (replaced while stopped, or reopened after a delete), the
+   * whole derived view is rebuilt against it.
    */
   private openDb(): boolean {
-    if (!existsSync(this.dbPath)) return false
+    const sig = this.fileSig()
+    if (sig === null) return false
     try {
       this.db = new DevinDb(this.dbPath)
       if (!this.db.hasSchema()) throw new Error('missing Devin tables')
@@ -303,29 +388,162 @@ export class DevinSource extends EventEmitter implements SessionSource {
       return false
     }
     this.openFailed = false
+    const replaced = this.dbSig !== null && this.dbSig !== sig && this.states.size > 0
+    this.dbSig = sig
+    if (replaced) this.resyncPending = !this.resyncAll()
     return true
   }
 
   /**
-   * The WAL file's mtime moves on every commit; watch it for promptness and
-   * let the debounced poll do the real work (WAL may not exist yet — retry
-   * each tick is overkill, just watch the db file itself too).
+   * The store file was replaced (atomic rename, delete+recreate): every
+   * derived map, cursor, fingerprint and pending buffer was built from the
+   * old store's rows — all void, even for session ids the new file reuses.
+   * Rebuild each known session in place (`materialize(full)` ships `file
+   * reset` so subscribers refold) and drop the ones the new store lacks.
+   * Returns false when the new store will not query yet — the caller keeps
+   * `resyncPending` set so the next tick retries instead of serving the
+   * old store's state.
+   */
+  private resyncAll(): boolean {
+    const db = this.db
+    if (db === null) return false
+    const rows = this.sessionRows()
+    if (rows === null) return false
+    const seen = new Set<string>()
+    for (const row of rows) {
+      if (row.hidden !== 0) continue
+      seen.add(row.id)
+      const state = this.states.get(row.id)
+      try {
+        if (state === undefined) {
+          this.freshSession(db, row)
+          this.emit('change', KIND, row.id)
+          continue
+        }
+        state.row = row
+        if (state.session.main !== null) {
+          state.session.main.mtimeMs = row.last_activity_at * 1000
+        }
+        // `materialize(full)` resets the lineage/dedup/counter/scanner state
+        // and ships `file reset`; the claim maps it does not own still hold
+        // old-store node ids — void them first.
+        state.heads = new Map(db.subagentHeads(row.id).map(head => [head.chain_node_id, head.agent_id]))
+        state.chainAgent.clear()
+        state.spawnArgs.clear()
+        state.agentCall.clear()
+        this.materialize(state, true)
+        // The reset wiped the fingerprints: re-emit the store's current tool
+        // rows so subscribers that just refolded get their tool state back.
+        this.syncToolState(state)
+        this.syncSeedFacts(state)
+        this.syncSidecar(state)
+      } catch (error) {
+        this.markBroken(row.id)
+        this.emit('error', new Error(`devin session ${row.id} resync failed`, { cause: error }))
+        continue
+      }
+      this.emit('change', KIND, row.id)
+    }
+    for (const state of [...this.states.values()]) {
+      if (!seen.has(state.row.id)) this.drop(state)
+    }
+    return true
+  }
+
+  /**
+   * Register and materialize one session row (initial sweep and resync share
+   * it). The caller's loop decides whether a failure here is fatal — it is
+   * not: callers catch per session.
+   */
+  private freshSession(db: DevinDb, row: DevinSessionRow): void {
+    const state = this.register(row)
+    state.row = row
+    state.heads = new Map(db.subagentHeads(row.id).map(head => [head.chain_node_id, head.agent_id]))
+    this.materialize(state)
+    // History tools arrive in replay; only track their fingerprints live.
+    for (const tool of db.toolStates(row.id)) {
+      state.toolFingerprints.set(
+        tool.tool_call_id,
+        `${tool.tool_call_json?.length ?? -1}:${tool.tool_call_update_json ?? ''}`,
+      )
+    }
+    this.syncSeedFacts(state)
+    this.syncSidecar(state)
+  }
+
+  /**
+   * The `sessions` row feeds the meta scanner's seed at registration; a title
+   * that lands late (or is rewritten) updates the seeded fields in place —
+   * re-creating the scanner would drop promptCount and its mid dedup set.
+   */
+  private syncSeedFacts(state: DevinSessionState): void {
+    const meta = state.session.main?.meta?.state
+    if (meta === undefined || meta === null) return
+    const title = state.row.title?.trim()
+    meta.aiTitle = title === undefined || title === '' ? null : title
+    meta.cwd = state.row.working_directory
+    meta.model = state.row.model
+  }
+
+  /**
+   * `sessions()` with failure isolation: a whole-store query failure degrades
+   * this source to empty for the tick instead of rejecting the sweep (which
+   * would take the composite — and every other harness — down with it). One
+   * error event per failure streak.
+   */
+  private sessionRows(): DevinSessionRow[] | null {
+    if (this.db === null) return null
+    try {
+      const rows = this.db.sessions()
+      this.queryFailed = false
+      return rows
+    } catch (error) {
+      if (!this.queryFailed) {
+        this.queryFailed = true
+        this.emit('error', new Error(`${this.dbPath}: session query failed`, { cause: error }))
+      }
+      return null
+    }
+  }
+
+  /**
+   * The store file's WAL moves on every commit while the main file only moves
+   * at checkpoint — watch both for promptness and let the debounced poll do
+   * the real work. The WAL may not exist yet; ticks retry the attach.
    */
   private attachWatcher(): void {
-    if (this.watcher !== null) return
-    try {
-      this.watcher = watch(this.dbPath, () => this.scheduleTick())
-    } catch {
-      this.watcher = null
+    for (const path of [this.dbPath, `${this.dbPath}-wal`]) {
+      if (this.watchedPaths.has(path) || !existsSync(path)) continue
+      try {
+        this.watchers.push(watch(path, () => this.scheduleTick()))
+        this.watchedPaths.add(path)
+      } catch {
+        // An unwatchable path only costs promptness — the interval still polls.
+      }
     }
+  }
+
+  private clearWatchers(): void {
+    for (const watcher of this.watchers) watcher.close()
+    this.watchers.length = 0
+    this.watchedPaths.clear()
   }
 
   stop(): void {
     this.stopped = true
-    if (this.poll !== null) clearInterval(this.poll)
-    if (this.pollTimer !== null) clearTimeout(this.pollTimer)
-    this.watcher?.close()
-    this.db?.close()
+    if (this.poll !== null) {
+      clearInterval(this.poll)
+      this.poll = null
+    }
+    if (this.pollTimer !== null) {
+      clearTimeout(this.pollTimer)
+      this.pollTimer = null
+    }
+    this.clearWatchers()
+    if (this.db !== null) {
+      this.db.close()
+      this.db = null
+    }
   }
 
   /** Streams this source feeds to the search index (its half of `finishBackfill`). */
@@ -441,13 +659,15 @@ export class DevinSource extends EventEmitter implements SessionSource {
       epochs: new Map(),
       maxRowId: 0,
       earliestNode: 0,
+      needsRebuild: false,
       nodes: new Map(),
       toolFingerprints: new Map(),
       sidecarKey: null,
       heads: new Map(),
       chainAgent: new Map(),
+      spawnArgs: new Map(),
+      agentCall: new Map(),
       pending: new Map(),
-      pendingKeys: new Set(),
     }
   }
 
@@ -517,12 +737,17 @@ export class DevinSource extends EventEmitter implements SessionSource {
     const meta = isRecord(record['metadata']) ? record['metadata'] : {}
     const ext = isRecord(record['extensions']) ? record['extensions'] : {}
     const msgExt = isRecord(meta['extensions']) ? meta['extensions'] : {}
+    // The render's replace links live in the row's own `metadata` column
+    // (`extensions."compact/prior_node_ids"`); the chat_message locations are
+    // kept for older stores that wrote them inside the message.
+    const rowMeta = jsonString(row.metadata)
+    const rowExtRaw = isRecord(rowMeta) ? rowMeta['extensions'] : undefined
+    const rowExt = isRecord(rowExtRaw) ? rowExtRaw : {}
     const priors: number[] = []
-    for (const bag of [ext['compact/prior_node_ids'], msgExt]) {
-      const list = isRecord(bag) ? bag['compact/prior_node_ids'] : undefined
-      if (Array.isArray(list)) {
-        for (const value of list) if (typeof value === 'number') priors.push(value)
-      }
+    for (const bag of [rowExt, ext, msgExt]) {
+      const list = bag['compact/prior_node_ids']
+      if (!Array.isArray(list)) continue
+      for (const value of list) if (typeof value === 'number') priors.push(value)
     }
     const compaction = msgExt['devin-rs/summary'] !== undefined || ext['devin-rs/summary'] !== undefined
     const metaCreated = Date.parse(asString(meta['created_at']) ?? '')
@@ -556,6 +781,30 @@ export class DevinSource extends EventEmitter implements SessionSource {
   }
 
   /**
+   * Facts about a claimed agent the child file's `agent` meta advertises: the
+   * resolved agent id, the `run_subagent` call that spawned it (`toolUseId`),
+   * its human title (`description` = the call's `title`, else `task`), and the
+   * profile from `subagent/profile_name` (else the call's `profile` arg).
+   */
+  private agentFacts(
+    state: DevinSessionState,
+    agentId: string,
+    learned: { profile: string | null; model: string | null } | undefined,
+  ): AgentFileMeta {
+    const callId = state.agentCall.get(agentId)
+    const spawn = callId === undefined ? undefined : state.spawnArgs.get(callId)
+    const description = spawn?.title ?? spawn?.task ?? null
+    const agentType = learned?.profile ?? spawn?.profile ?? null
+    return {
+      agentId,
+      ...(callId === undefined ? {} : { toolUseId: callId }),
+      ...(description === null ? {} : { description }),
+      ...(agentType === null ? {} : { agentType }),
+      ...(learned?.model == null ? {} : { model: learned.model }),
+    }
+  }
+
+  /**
    * A spawn result's `subagent/*` extensions name the chain it produced. When
    * the chain's child file already exists, its agent facts update in place and
    * a `file` event re-ships the ref.
@@ -566,15 +815,70 @@ export class DevinSource extends EventEmitter implements SessionSource {
     const chainNode = ext?.['subagent/chain_node_id']
     const agentId = ext?.['subagent/agent_id']
     if (typeof chainNode !== 'number' || typeof agentId !== 'string') return
-    const profile = asString(ext?.['subagent/profile_name']) ?? null
-    if (!state.chainAgent.has(chainNode)) state.chainAgent.set(chainNode, { agentId, profile })
-    const entry = state.groups.entryOf(chainNode)
-    if (entry === undefined || entry === state.session.main || entry.ref.agent?.agentId === agentId) return
-    entry.ref = {
-      ...entry.ref,
-      agent: { ...entry.ref.agent, agentId, ...(profile === null ? {} : { agentType: profile }) },
+    const learned = {
+      profile: asString(ext?.['subagent/profile_name']) ?? null,
+      model: asString(ext?.['subagent/model']) ?? null,
     }
+    if (!state.chainAgent.has(chainNode)) state.chainAgent.set(chainNode, { agentId, ...learned })
+    const entry = state.groups.entryOf(chainNode)
+    if (entry === undefined || entry === state.session.main) return
+    this.refreshAgentFacts(state, entry, agentId, learned)
+  }
+
+  /**
+   * Re-resolve a claimed child's `agent` meta against the spawn facts learned
+   * so far and re-ship the ref when they changed — a completion's claim, a
+   * late `tool_call_id` join, or a `subagent_heads` row can each arrive after
+   * the file already exists.
+   */
+  private refreshAgentFacts(
+    state: DevinSessionState,
+    entry: DevinEntry,
+    agentId: string,
+    learned: { profile: string | null; model: string | null } | undefined,
+  ): void {
+    const facts = this.agentFacts(state, agentId, learned)
+    const known = entry.ref.agent
+    if (known?.agentId === agentId
+      && known.toolUseId === facts.toolUseId
+      && known.description === facts.description
+      && known.agentType === facts.agentType
+      && known.model === facts.model) return
+    entry.ref = { ...entry.ref, agent: { ...entry.ref.agent, ...facts } }
     state.book.emitTo(state.session, { type: 'file', file: entry.ref })
+  }
+
+  /**
+   * The `title`/`task`/`profile` arguments a `run_subagent` call carried, and
+   * the result node's `tool_call_id` → `subagent/agent_id` join — together
+   * they attach the human title to a claimed chain's file (the catalog row's
+   * fallback title when no run bound it).
+   */
+  private learnSpawnFacts(state: DevinSessionState, node: ParsedNode): void {
+    for (const call of asArray(node.record['tool_calls']) ?? []) {
+      if (!isRecord(call) || asString(call['name']) !== 'run_subagent') continue
+      const callId = asString(call['id'])
+      if (callId === undefined) continue
+      const parsed: unknown = typeof call['arguments'] === 'string' ? parseJsonLine(call['arguments']) : call['arguments']
+      const args = isRecord(parsed) ? parsed : {}
+      state.spawnArgs.set(callId, {
+        title: asString(args['title']) ?? null,
+        task: asString(args['task']) ?? null,
+        profile: asString(args['profile']) ?? null,
+      })
+    }
+    const meta = isRecord(node.record['metadata']) ? node.record['metadata'] : undefined
+    const ext = isRecord(meta?.['extensions']) ? meta['extensions'] : undefined
+    const agentId = asString(ext?.['subagent/agent_id'])
+    const callId = asString(node.record['tool_call_id'])
+    if (agentId === undefined || callId === undefined || state.agentCall.has(agentId)) return
+    state.agentCall.set(agentId, callId)
+    // The join may land after the child file exists — re-resolve its facts,
+    // keeping the profile/model the claim already learned.
+    const learned = [...state.chainAgent.values()].find(facts => facts.agentId === agentId)
+    for (const child of state.session.children.values()) {
+      if (child.ref.agent?.agentId === agentId) this.refreshAgentFacts(state, child, agentId, learned)
+    }
   }
 
   /**
@@ -597,6 +901,7 @@ export class DevinSource extends EventEmitter implements SessionSource {
       state.groups.find(chainNode) === state.groups.find(node.nodeId))
     const agentId = named?.[1] ?? learned?.[1].agentId
     if (agentId === undefined) return null
+    const learnedFacts = learned?.[1]
     // The file is named by the claimed agent id, not a row-derived group key:
     // the key depends on WHICH members were visible at claim time (a pending
     // chain drains under whatever group existed then), while the agent id is
@@ -605,16 +910,12 @@ export class DevinSource extends EventEmitter implements SessionSource {
     const existing = session.children.get(fileId)
     if (existing !== undefined) return existing
     const path = `${DevinSource.sessionPath(session.id)}/${fileId}`
-    const profile = learned?.[1].profile
     const entry: DevinEntry = {
       kind: KIND,
       path,
       ref: {
         id: fileId, role: 'child', path, parentId: session.id,
-        agent: {
-          agentId,
-          ...(profile === null || profile === undefined ? {} : { agentType: profile }),
-        },
+        agent: this.agentFacts(state, agentId, learnedFacts),
       },
       sessionId: session.id,
       size: 0,
@@ -701,6 +1002,24 @@ export class DevinSource extends EventEmitter implements SessionSource {
    */
   private materialize(state: DevinSessionState, full = false): void {
     if (this.db === null) return
+    // A flagged state's derived maps are unreliable — force the rebuild no
+    // matter which caller asked. Any throw below left partial batch state
+    // (`state.nodes` already holds rows that never emitted — an incremental
+    // retry would see `fresh` empty and skip them forever), so flag it and
+    // let the next materialize rebuild rather than resume.
+    if (state.needsRebuild) full = true
+    try {
+      this.materializeRows(state, full)
+      state.needsRebuild = false
+    } catch (error) {
+      state.needsRebuild = true
+      throw error
+    }
+  }
+
+  private materializeRows(state: DevinSessionState, full: boolean): void {
+    const db = this.db
+    if (db === null) return
     if (full) {
       state.groups = new ChainGroups()
       state.midAnchor.clear()
@@ -708,8 +1027,13 @@ export class DevinSource extends EventEmitter implements SessionSource {
       state.epochs.clear()
       state.nodes.clear()
       state.pending.clear()
-      state.pendingKeys.clear()
       state.maxRowId = 0
+      // `file reset` makes subscribers refold from empty, so every fact
+      // folded from the old rows must re-derive: rebuild each meta scanner
+      // (promptCount, mid-dedup, prompt title) and drop the tool/sidecar
+      // dedup state so those lines re-emit.
+      state.toolFingerprints.clear()
+      state.sidecarKey = null
       for (const entry of [state.session.main, ...state.session.children.values()]) {
         if (entry === null) continue
         entry.lines = 0
@@ -717,6 +1041,9 @@ export class DevinSource extends EventEmitter implements SessionSource {
         entry.searchFrom = 0
         if (state.live) {
           this.search?.reset(entry.path)
+          entry.meta = createMetaScanner(
+            KIND, entry === state.session.main ? sessionSeed(state.row) : null,
+          )
           state.book.emitTo(state.session, { type: 'file', file: entry.ref, reset: true })
         }
       }
@@ -731,15 +1058,18 @@ export class DevinSource extends EventEmitter implements SessionSource {
       }
     }
     const rows = state.replayRows ?? (full
-      ? this.db.nodes(state.row.id)
-      : this.db.nodesAfter(state.row.id, state.maxRowId))
+      ? db.nodes(state.row.id)
+      : db.nodesAfter(state.row.id, state.maxRowId))
     if (rows.length === 0) return
     if (state.maxRowId === 0) state.earliestNode = rows[0]?.node_id ?? 0
-    state.maxRowId = Math.max(state.maxRowId, rows[rows.length - 1]?.row_id ?? 0)
     const parsed = rows.map(row => this.parseNode(row))
     // Pass 1 — structure: parent + prior + identity edges before any line is
     // attributed, so a render committed in this batch is already merged.
     const fresh = new Set<number>()
+    // message_id edges collected while scanning; applied only after every
+    // structural edge of the batch landed, so each is judged on the batch's
+    // complete prior structure.
+    const midEdges: [number, number][] = []
     for (const node of parsed) {
       const { node_id, parent_node_id } = node.row
       // The CLI periodically rewrites a session's whole forest in one commit
@@ -755,19 +1085,45 @@ export class DevinSource extends EventEmitter implements SessionSource {
       if (!state.groups.union(node_id, parent_node_id)) return this.materialize(state, true)
       for (const prior of node.priors) {
         state.groups.add(prior)
-        if (!state.groups.union(node_id, prior)) return this.materialize(state, true)
-      }
-      if (node.messageId !== null) {
-        const anchor = state.midAnchor.get(node.messageId)
-        if (anchor !== undefined && !state.groups.union(node_id, anchor)) {
+        // A prior edge joining two components is reliable lineage. When one
+        // side was glued by an earlier message_id edge, the glue may have been
+        // a shared object (another conversation's copy): the merge is
+        // unsafe — re-materialize so the full pass judges it with all priors.
+        if (
+          state.groups.find(node_id) !== state.groups.find(prior)
+          && (state.groups.hasMid(node_id) || state.groups.hasMid(prior))
+        ) {
           return this.materialize(state, true)
         }
+        if (!state.groups.union(node_id, prior)) return this.materialize(state, true)
+        state.groups.markPrior(node_id)
+      }
+      // Identity edges come only from conversation messages. `system`-role
+      // records are context objects — render prefixes, injected blocks, the
+      // boilerplate prompt opening every subagent context — shared across
+      // conversations by design, so one must never glue two lineages.
+      if (node.messageId !== null && asString(node.record['role']) !== 'system') {
+        const anchor = state.midAnchor.get(node.messageId)
+        if (anchor !== undefined) midEdges.push([node_id, anchor])
         state.midAnchor.set(node.messageId, node_id)
       }
       // A spawn result names its chain: `subagent/chain_node_id` points at the
       // child tree's head. Learn it here so `childEntry` can name the file's
-      // agent even when the chain's lines preceded the result.
+      // agent even when the chain's lines preceded the result. Spawn facts go
+      // first so a node carrying all three extensions resolves in one pass.
+      this.learnSpawnFacts(state, node)
       this.learnChainAgent(state, node)
+    }
+    // Shared message_id is object identity, not conversation membership — the
+    // same boilerplate object (the subagent system prompt is one mid) opens
+    // every agent's context. Glue two components on a mid edge only when
+    // neither has prior structure of its own: prior-equipped lineages decide
+    // by their edges, and a mid reaching between them is a shared object.
+    for (const [nodeId, anchor] of midEdges) {
+      if (state.groups.find(nodeId) === state.groups.find(anchor)) continue
+      if (state.groups.hasPrior(nodeId) || state.groups.hasPrior(anchor)) continue
+      if (!state.groups.union(nodeId, anchor)) return this.materialize(state, true)
+      state.groups.markMid(nodeId)
     }
     // Pass 2 — emit first occurrences in insertion order. Chains nothing has
     // claimed yet (context renders, compactor passes) buffer until a claim or
@@ -783,9 +1139,10 @@ export class DevinSource extends EventEmitter implements SessionSource {
         ? state.session.main
         : this.childEntry(state, stored)
       if (owner === null) {
-        const key = node.messageId ?? `node:${node.row.node_id}`
-        if (state.pendingKeys.has(key)) continue
-        state.pendingKeys.add(key)
+        // Buffer per chain, never dedup here: two unclaimed lineages may
+        // legitimately carry the same shared object (the boilerplate opener)
+        // and each needs its own copy when its claim lands. Dedup runs at
+        // emit time, where the owner is known (`tryEmitNode`).
         const root = state.groups.find(node.row.node_id)
         const list = state.pending.get(root)
         if (list === undefined) state.pending.set(root, [stored])
@@ -798,6 +1155,10 @@ export class DevinSource extends EventEmitter implements SessionSource {
       this.flushBatch(state, emitted)
       if (state.live) this.emit('change', KIND, state.row.id)
     }
+    // The watermark marks rows CONSUMED — it advances only after the whole
+    // batch landed. A mid-batch throw must leave it behind so the next tick
+    // refetches and retries these rows instead of skipping them.
+    state.maxRowId = Math.max(state.maxRowId, rows[rows.length - 1]?.row_id ?? 0)
   }
 
   /**
@@ -822,8 +1183,6 @@ export class DevinSource extends EventEmitter implements SessionSource {
       if (owner === null) continue
       state.pending.delete(root)
       for (const node of nodes) {
-        const key = node.messageId ?? `node:${node.nodeId}`
-        state.pendingKeys.delete(key)
         if (!this.tryEmitNode(state, owner, node, emitted)) continue
       }
     }
@@ -1007,22 +1366,28 @@ export class DevinSource extends EventEmitter implements SessionSource {
   }
 
   private async sweep(): Promise<void> {
-    if (this.db === null) return
-    for (const row of this.db.sessions()) {
+    const db = this.db
+    if (db === null) return
+    const rows = this.sessionRows()
+    if (rows === null) return
+    for (const row of rows) {
       if (row.hidden !== 0) continue
-      const state = this.register(row)
-      state.row = row
-      state.heads = new Map(this.db.subagentHeads(row.id).map(head => [head.chain_node_id, head.agent_id]))
-      this.materialize(state)
-      // History tools arrive in replay; only track their fingerprints live.
-      for (const tool of this.db.toolStates(row.id)) {
-        state.toolFingerprints.set(
-          tool.tool_call_id,
-          `${tool.tool_call_json?.length ?? -1}:${tool.tool_call_update_json ?? ''}`,
-        )
+      // A session that fails to materialize must not take the sweep down —
+      // the rest still register, and the next tick retries this one (its
+      // watermark never advanced).
+      try {
+        this.freshSession(db, row)
+      } catch (error) {
+        this.markBroken(row.id)
+        this.emit('error', new Error(`devin session ${row.id} materialization failed`, { cause: error }))
       }
-      this.syncSidecar(state)
     }
+  }
+
+  /** Flag the session for a full rebuild on its next materialize. */
+  private markBroken(sessionId: string): void {
+    const state = this.states.get(sessionId)
+    if (state !== undefined) state.needsRebuild = true
   }
 
   private async tick(): Promise<void> {
@@ -1032,43 +1397,73 @@ export class DevinSource extends EventEmitter implements SessionSource {
     // open, then sweeps once and announces the sessions it found.
     if (this.db === null) {
       if (!this.openDb()) return
-      this.attachWatcher()
+      if (this.watchEnabled) this.attachWatcher()
       await this.sweep()
       for (const state of this.states.values()) this.emit('change', KIND, state.row.id)
       return
     }
-    let rows: DevinSessionRow[]
-    try {
-      rows = this.db.sessions()
-    } catch (error) {
-      this.emit('error', error)
+    // A replace (atomic rename over the path, delete+recreate) changes the
+    // file's identity — the open handle keeps serving the OLD file. Plain
+    // mtime movement does not count: every commit touches it.
+    const sig = this.fileSig()
+    if (sig !== null && sig !== this.dbSig) {
+      this.db.close()
+      this.db = null
+      // fs watchers track the inode, not the path — they are stale now.
+      this.clearWatchers()
+      // Keep `dbSig` as the baseline: `openDb` compares and resyncs all
+      // derived state when the opened file is a different one.
+      if (this.openDb()) {
+        if (this.watchEnabled) this.attachWatcher()
+        for (const state of this.states.values()) this.emit('change', KIND, state.row.id)
+      }
       return
     }
+    if (this.resyncPending && !this.resyncAll()) return
+    this.resyncPending = false
+    if (this.watchEnabled) this.attachWatcher()
+    const db = this.db
+    const rows = this.sessionRows()
+    if (rows === null) return
     const seen = new Set<string>()
     for (const row of rows) {
       if (row.hidden !== 0) continue
       seen.add(row.id)
-      // A session appearing between polls (created live, or un-hidden after a
-      // drop) registers with `state.row` already equal to `row`, so `moved`
-      // alone would never materialize it — it would list but stay empty.
-      const fresh = !this.states.has(row.id)
-      const state = this.register(row)
-      const moved = row.last_activity_at !== state.row.last_activity_at
-        || row.main_chain_id !== state.row.main_chain_id
-        || row.title !== state.row.title
-      const dropped = this.db.maxRowId(row.id) < state.maxRowId
-      state.row = row
-      if (state.session.main !== null) state.session.main.mtimeMs = row.last_activity_at * 1000
-      state.heads = new Map(this.db.subagentHeads(row.id).map(head => [head.chain_node_id, head.agent_id]))
-      if (dropped) {
-        this.materialize(state, true)
-      } else if (fresh || moved || this.book.hasSubscribers(KIND, row.id)) {
-        this.materialize(state)
-        this.syncToolState(state)
+      try {
+        // A session appearing between polls (created live, or un-hidden after a
+        // drop) registers with `state.row` already equal to `row`, so `moved`
+        // alone would never materialize it — it would list but stay empty.
+        const fresh = !this.states.has(row.id)
+        const state = this.register(row)
+        const metaMoved = row.title !== state.row.title
+          || row.main_chain_id !== state.row.main_chain_id
+        const moved = metaMoved || row.last_activity_at !== state.row.last_activity_at
+        const maxRow = db.maxRowId(row.id)
+        const dropped = maxRow < state.maxRowId
+        const grew = maxRow > state.maxRowId
+        state.row = row
+        if (state.session.main !== null) state.session.main.mtimeMs = row.last_activity_at * 1000
+        this.syncSeedFacts(state)
+        state.heads = new Map(db.subagentHeads(row.id).map(head => [head.chain_node_id, head.agent_id]))
+        if (dropped || state.needsRebuild) {
+          this.materialize(state, true)
+          // The reset made subscribers refold; tool lines re-emit now that
+          // their fingerprints were cleared with the rest of the batch state.
+          this.syncToolState(state)
+        } else if (fresh || moved || grew || this.book.hasSubscribers(KIND, row.id)) {
+          this.materialize(state)
+          this.syncToolState(state)
+        }
+        // A `subagent_heads` claim can land without new message rows.
+        this.drainPending(state)
+        this.syncSidecar(state)
+        // A just-registered session with no rows yet emits nothing from
+        // `materialize` — announce it so live list views pick it up.
+        if (fresh || metaMoved) this.emit('change', KIND, row.id)
+      } catch (error) {
+        this.markBroken(row.id)
+        this.emit('error', new Error(`devin session ${row.id} refresh failed`, { cause: error }))
       }
-      // A `subagent_heads` claim can land without new message rows.
-      this.drainPending(state)
-      this.syncSidecar(state)
     }
     for (const state of [...this.states.values()]) {
       if (!seen.has(state.row.id)) this.drop(state)

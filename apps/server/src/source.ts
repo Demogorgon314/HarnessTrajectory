@@ -81,7 +81,10 @@ export interface SessionSource extends EventEmitter {
   /**
    * The paths this source feeds to the search index, read after `start()`
    * resolves. A {@link CompositeSource} aggregates them so one
-   * `finishBackfill` sees every source's live set.
+   * `finishBackfill` sees every source's live set. Sources sharing the
+   * index MUST NOT call `finishBackfill` themselves — the composite owns
+   * the aggregate backfill lifecycle (a member's early finish would stamp
+   * the watermarks of sources that have not started yet).
    */
   livePaths(): Iterable<string>
   /**

@@ -82,7 +82,10 @@ export type SubagentStatus = 'launching' | 'running' | 'completed' | 'failed' | 
 export interface SubagentRun {
   /** Harness id of the run (Claude `agentId`, Codex child thread id). */
   agentId: string
-  /** Child transcript file id once one of its lines has been seen. */
+  /**
+   * Child transcript file id once the source has discovered it — `null`
+   * while unbound; the agent id itself is never a usable file id.
+   */
   fileId: string | null
   /** Parent tool call that spawned the run, when bound. */
   callId: string | null

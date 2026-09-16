@@ -13,7 +13,7 @@ import {
   type TrajectorySnapshot,
 } from '@harness-trajectory/core'
 import { createSnapshotStore, type MessageImageLoader, type SnapshotStore } from '@harness-trajectory/ui'
-import { openSessionStream, type LiveStream } from './api.ts'
+import { getSession, HttpError, openSessionStream, type LiveStream } from './api.ts'
 
 export interface SessionRuntimeState {
   snapshot: TrajectorySnapshot
@@ -55,6 +55,10 @@ export class SessionRuntime {
   private publishTimer: ReturnType<typeof setTimeout> | null = null
   private lineCount = 0
   private closed = false
+  /** Stream/refold generation: an existence probe applies only to its own. */
+  private epoch = 0
+  /** Epoch owning the in-flight probe — one probe per disconnect, never global. */
+  private probingEpoch: number | null = null
 
   /**
    * @param fileId - a child transcript id to fold on its own (the subagent
@@ -98,17 +102,25 @@ export class SessionRuntime {
   start(): void {
     // React StrictMode mounts, unmounts, and remounts: a closed runtime must be restartable.
     this.closed = false
+    this.epoch += 1
     this.stream?.close()
     this.stream = openSessionStream(this.kind, this.id, {
       onEvent: event => { this.handle(event) },
+      // Any open — the first connect or a retry after a failed attempt —
+      // proves the stream alive and voids existence probes started while it
+      // was down (`onReconnect` alone misses the first-open case).
+      onOpen: () => {
+        this.epoch += 1
+      },
       onReconnect: () => {
         if (!this.closed) this.rebuild()
       },
       onError: () => {
         this.patch({ connected: false })
+        this.probeExistence()
       },
     }, { file: this.fileId ?? undefined })
-    this.patch({ connected: true })
+    this.patch({ connected: true, error: null })
   }
 
   close(): void {
@@ -119,6 +131,52 @@ export class SessionRuntime {
       clearTimeout(this.publishTimer)
       this.publishTimer = null
     }
+  }
+
+  /**
+   * EventSource's onerror does not say why the stream failed — a dead child
+   * link 404s exactly like a dropped connection. Ask the session detail
+   * route: a session or child confirmed missing is a dead end (end loading,
+   * close the retry loop, say so); an unreachable server or an answered
+   * detail leaves the native reconnect retrying. A late answer drops when the
+   * stream has already recovered (epoch moved) or the runtime closed. One
+   * probe runs per epoch: an earlier outage's still-unanswered request must
+   * not starve a NEW disconnect of its own verdict.
+   */
+  private probeExistence(): void {
+    const epoch = this.epoch
+    if (this.probingEpoch === epoch) return
+    this.probingEpoch = epoch
+    getSession(this.kind, this.id)
+      .then(detail => {
+        if (this.closed || epoch !== this.epoch) return
+        // The session exists: for a child view, "missing" is only true once
+        // the announced child list lacks this file; anything else is a
+        // transient drop the stream is already retrying through.
+        if (this.fileId === null) return
+        if (detail.children.some(child => child.file.id === this.fileId)) return
+        this.failFatally(`subagent transcript "${this.fileId}" was not found`)
+      })
+      .catch((error: unknown) => {
+        if (this.closed || epoch !== this.epoch) return
+        if (error instanceof HttpError && error.status === 404) {
+          this.failFatally(`session "${this.id}" was not found`)
+        }
+        // Any other answer (network down, 5xx): the probe itself could not
+        // confirm anything — keep retrying.
+      })
+      .finally(() => {
+        // Only the probe still owning the slot frees it — a newer epoch's
+        // probe has already replaced this token.
+        if (this.probingEpoch === epoch) this.probingEpoch = null
+      })
+  }
+
+  /** A confirmed-dead stream: stop the retry loop and surface the cause. */
+  private failFatally(message: string): void {
+    this.stream?.close()
+    this.stream = null
+    this.patch({ loading: false, connected: false, error: message })
   }
 
   private handle(event: SessionLiveEvent): void {
@@ -164,6 +222,7 @@ export class SessionRuntime {
    * from empty before those events land or every record folds twice.
    */
   private rebuild(): void {
+    this.epoch += 1
     this.parser = createSessionParser(this.kind)
     this.context = new ContextSession(this.kind)
     this.lineCount = 0

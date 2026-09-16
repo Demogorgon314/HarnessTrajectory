@@ -27,7 +27,11 @@
  *   `metadata.extensions` carry `chisel/tool_result_meta.success`,
  *   `chisel/tool_call_timing.duration_ms`, and for `run_subagent` the binding
  *   fields `subagent/agent_id`, `subagent/chain_node_id`,
- *   `subagent/profile_name`, `subagent/model`.
+ *   `subagent/profile_name`, `subagent/model`. A background spawn result
+ *   carries `subagent/agent_id` only — the chain id arrives later on a
+ *   completion notification — so a run can exist with `fileId: null` until
+ *   the sidecar's agent list or a child file ref supplies the real file id;
+ *   the agent id is never a usable stream id on its own.
  * - `tool_calls` entries are flat `{id, name, arguments}` (not the OpenAI
  *   `{function:{…}}` nesting); both spellings are accepted.
  */
@@ -334,7 +338,9 @@ class DevinParser implements SessionParser {
       .filter(run => run.callId !== null || run.agentId !== run.fileId)
       .map(run => ({
       agentId: run.agentId,
-      fileId: run.fileId ?? run.agentId,
+      // Null while the server has not discovered the chain — the agent id is
+      // not a stream id, and opening one would 404 the events route.
+      fileId: run.fileId,
       callId: run.callId,
       description: run.description,
       agentType: run.agentType,
@@ -692,6 +698,14 @@ class DevinParser implements SessionParser {
     if (agentId !== undefined && agentId !== file.id) {
       const run = this.runFor(agentId, time)
       run.fileId = file.id
+      // The ref's agent facts (spawn title, call id) backfill a run the
+      // result binding has not claimed yet.
+      run.description ??= file.agent?.description ?? null
+      run.agentType ??= file.agent?.agentType ?? null
+      if (run.callId === null && file.agent?.toolUseId !== undefined) {
+        run.callId = file.agent.toolUseId
+        this.runByCall.set(file.agent.toolUseId, run)
+      }
       return run
     }
     // Task-text binding happens on the first user line; until then keep a
