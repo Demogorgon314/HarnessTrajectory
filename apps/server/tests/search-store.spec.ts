@@ -307,10 +307,67 @@ describe('compressed text at rest', () => {
       { line: 0, role: 'human', text: 'corrupt me please' },
       { line: 1, role: 'human', text: 'corrupt me not' },
     ])
-    store.db.prepare(`update docs set text = ? where line = 0`).run(Buffer.from([1, 2, 3, 4]))
+    store.db.prepare(`update texts set text = ? where id = (select text from docs where line = 0)`)
+      .run(Buffer.from([1, 2, 3, 4]))
     const response = search(store, { q: 'corrupt me' })
     // The FTS index still nominates the torn row; verification skips it.
     expect(response.totalHits).toBe(1)
     expect(response.groups[0]?.hits[0]?.line).toBe(1)
+  })
+})
+
+describe('text dedup', () => {
+  it('stores and indexes a repeated text once, but expands every occurrence', () => {
+    const store = open()
+    const shared = 'the exact same tool output in two sessions'
+    add(store, key(), [{ line: 2, role: 'tool', text: shared }])
+    add(store, key({ path: '/r/codex/r-1.jsonl', kind: 'codex', sessionId: 'thread-1', fileId: 'thread-1' }), [
+      { line: 7, role: 'tool', text: shared },
+    ])
+    expect(store.docCount()).toBe(2)
+    expect(store.textCount()).toBe(1)
+    // One FTS row total: the inverted index holds the text once.
+    expect(store.db.prepare('select count(*) as n from docs_fts').get()?.['n']).toBe(1)
+
+    const response = search(store, { q: 'same tool output' })
+    expect(response.totalHits).toBe(2)
+    const byKind = new Map(response.groups.map(group => [group.kind, group]))
+    expect(byKind.get('claude')?.hits[0]).toMatchObject({ line: 2 })
+    expect(byKind.get('codex')?.hits[0]).toMatchObject({ line: 7 })
+    // Kind filtering happens at expansion, where the session identity lives.
+    expect(search(store, { q: 'same tool output', kind: 'codex' }).totalHits).toBe(1)
+  })
+
+  it('keeps a surviving occurrence searchable after the other file is cleared', () => {
+    const store = open()
+    const shared = 'output both transcripts printed verbatim'
+    const doomed = key()
+    const survivor = key({ path: '/r/codex/r-1.jsonl', kind: 'codex', sessionId: 'thread-1', fileId: 'thread-1' })
+    add(store, doomed, [{ line: 0, role: 'tool', text: shared }])
+    add(store, survivor, [{ line: 1, role: 'tool', text: shared }])
+
+    store.transaction(() => { store.clearDocs(doomed.path) })
+    expect(store.docCount()).toBe(1)
+    // The text and its FTS row must stay: the survivor still references them.
+    expect(store.textCount()).toBe(1)
+    const response = search(store, { q: 'printed verbatim' })
+    expect(response.totalHits).toBe(1)
+    expect(response.groups[0]).toMatchObject({ kind: 'codex', sessionId: 'thread-1' })
+  })
+
+  it('reclaims orphaned texts and their FTS rows only via gcTexts', () => {
+    const store = open()
+    const file = key()
+    add(store, file, [{ line: 0, role: 'human', text: 'a prompt nobody else typed' }])
+    store.transaction(() => { store.deleteFile(file.path) })
+    expect(store.docCount()).toBe(0)
+    // Deferred by design: the text lingers, matches, and expands to no hits.
+    expect(store.textCount()).toBe(1)
+    expect(search(store, { q: 'nobody else typed' }).totalHits).toBe(0)
+
+    store.gcTexts()
+    expect(store.textCount()).toBe(0)
+    expect(store.db.prepare('select count(*) as n from docs_fts').get()?.['n']).toBe(0)
+    expect(search(store, { q: 'nobody else typed' }).totalHits).toBe(0)
   })
 })

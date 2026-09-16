@@ -87,10 +87,20 @@ Logo credits live in the web registry and README license section.
 - Server writes belong under the cache directory defined in `apps/server/src/cache.ts`:
   `search.sqlite`, `listing.sqlite`, and `settings.json`. Never write to harness roots.
 - Search uses `node:sqlite` FTS5 with trigram, `detail=none`, and contentless storage.
-  `store.ts` keeps deflate-compressed text in `docs.text` and a `docs.file → files.id`
-  foreign key; `extract.ts` caps tool outputs at 4 KB; `indexer.ts` batches writes.
-  `query.ts` ANDs trigrams, then inflates, verifies, snippets, and ranks in JS.
-  FTS phrase queries, `snippet()`, and `bm25` are not used.
+  `store.ts` deduplicates document text: `texts` holds each unique text once
+  (8-byte SHA-1-prefix key, deflate-compressed) and `docs` stores only occurrences
+  (`file, line, role, time_ms → texts.id`); the FTS rowid is the text id, so the
+  inverted index dedups too. `extract.ts` caps tool outputs at 4 KB; `indexer.ts`
+  batches writes. `query.ts` ANDs trigrams, verifies each unique text once in JS,
+  expands occurrences through `docs_by_text` and the in-memory `files` snapshot
+  (kind filter applies at expansion), ranks by occurrence count, and builds
+  snippets only for displayed hits. FTS phrase queries, `snippet()`, and `bm25`
+  are not used.
+- Deletes remove only `docs` rows; texts orphaned when their last occurrence goes
+  away still match but expand to zero hits. `store.gcTexts()` reclaims them (with
+  their FTS rows) on the paths that already accept a multi-second cost —
+  `finishBackfill` after purging vanished files and `applyMaxAgeDays` — never
+  inline in a flush.
 - The search database is a cache: bump `SEARCH_SCHEMA_VERSION` instead of migrating.
 - `contentSearch` defaults off; `HARNESS_TRAJECTORY_SEARCH=1` forces it on. The setting
   takes effect at startup; disabling it preserves any existing database on disk.

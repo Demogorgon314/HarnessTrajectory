@@ -107,12 +107,13 @@ export class SearchIndexer {
       this.store.transaction(() => {
         for (const path of stale) this.store.deleteFile(path)
       })
+      // Reclaim the texts those files were the last reference of, then hand
+      // the freed pages back to the OS so narrowing the window shows on disk.
+      this.store.gcTexts()
     } catch {
       // A locked database keeps the stale rows; the next startup tries again.
       return 0
     }
-    // Deleting hundreds of thousands of rows leaves their pages inside the
-    // file; hand them back to the OS so narrowing the window shows on disk.
     this.store.compact()
     return stale.length
   }
@@ -287,7 +288,9 @@ export class SearchIndexer {
         this.store.transaction(() => {
           for (const path of gone) this.store.deleteFile(path)
         })
-        // A retention purge can drop most of the database; return the pages.
+        // Files deleted on disk leave their texts orphaned; reclaim them
+        // (and with a retention purge, most of the database) before vacuum.
+        this.store.gcTexts()
         this.store.compact()
       } catch {
         // Stale rows are harmless; the next startup tries again.

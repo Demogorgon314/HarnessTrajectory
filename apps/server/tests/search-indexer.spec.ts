@@ -143,6 +143,8 @@ describe('SearchIndexer with SessionIndex', () => {
     expect(store.paths()).toEqual([other])
     expect(search(store, { q: 'Doomed session' }).totalHits).toBe(0)
     expect(search(store, { q: 'Surviving session' }).totalHits).toBe(1)
+    // The startup sweep also reclaims the vanished file's now-orphaned texts.
+    expect(store.textCount()).toBe(1)
   })
 
   it('does not re-extract or duplicate an unchanged file when the server restarts', async () => {
@@ -227,6 +229,8 @@ describe('SearchIndexer with SessionIndex', () => {
     await start()
     expect(store.fileState(path)).toBeUndefined()
     expect(search(store, { q: 'Once young' }).totalHits).toBe(0)
+    // …including the text itself: nothing references it any more.
+    expect(store.textCount()).toBe(0)
   })
 
   it('reconsiders a skipped file on the next start once the window widens', async () => {
@@ -425,6 +429,8 @@ describe('SearchIndexer', () => {
     expect(store.paths()).toEqual([fresh.path])
     expect(search(store, { q: 'stale prompt' }).totalHits).toBe(0)
     expect(search(store, { q: 'fresh prompt' }).totalHits).toBe(1)
+    // The purge reclaims the stale file's text; only the fresh one remains.
+    expect(store.textCount()).toBe(1)
     // Narrowing further with nothing left to purge is a no-op.
     expect(indexer.applyMaxAgeDays(30)).toBe(0)
     // 0 lifts the limit and never purges.
