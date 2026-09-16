@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { SessionSummary } from '@harness-trajectory/core'
 import { icons } from '@harness-trajectory/ui'
 import type { Route } from './App.tsx'
@@ -92,49 +92,105 @@ export function SessionList({ sessions, selected, onSelect, folded, onToggleGrou
               <span className={css.slot} data-role="folder" data-active={(expanded && containsCurrent) || undefined}>
                 {expanded ? <IconFolderOpen16 /> : <IconFolderClose16 />}
               </span>
-              <span className={css.slot} data-role="chevron">
-                <IconTriangleRightFill14 className={css.arrow} data-open={expanded || undefined} />
+              <span className={css.slot} data-role="chevron" data-open={expanded || undefined}>
+                <IconTriangleRightFill14 className={css.arrow} />
               </span>
               <span className={css.title}>{projectName(group.cwd)}</span>
               <span className={css.time}>{group.sessions.length}</span>
             </div>
-            {expanded && group.sessions.map((session) => {
-              const active = selected !== null && selected.kind === session.kind && selected.id === session.id
-              const meta = harnessMeta(session.kind)
-              return (
-                <div
-                  key={`${session.kind}/${session.id}`}
-                  className={css.sessionRow}
-                  role="treeitem"
-                  aria-selected={active}
-                  tabIndex={0}
-                  data-active={active || undefined}
-                  title={rowTooltip(session)}
-                  onClick={() => { onSelect({ kind: session.kind, id: session.id }) }}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Enter' || event.key === ' ') {
-                      event.preventDefault()
-                      onSelect({ kind: session.kind, id: session.id })
-                    }
-                  }}
-                >
-                  {/* Status slot: the harness mark, with a live dot while the transcript is being written. */}
-                  <span
-                    className={css.slot}
-                    data-role="mark"
-                    data-live={session.live || undefined}
-                    aria-label={session.live ? `${meta.label}, live` : meta.label}
+            <GroupRows open={expanded}>
+              {group.sessions.map((session, index) => {
+                const active = selected !== null && selected.kind === session.kind && selected.id === session.id
+                const meta = harnessMeta(session.kind)
+                return (
+                  <div
+                    key={`${session.kind}/${session.id}`}
+                    className={css.sessionRow}
+                    role="treeitem"
+                    aria-selected={active}
+                    tabIndex={0}
+                    data-active={active || undefined}
+                    title={rowTooltip(session)}
+                    /* Unfold cascade: each row settles a beat after the one above. */
+                    style={{ animationDelay: `${Math.min(index, 8) * 24}ms` }}
+                    onClick={() => { onSelect({ kind: session.kind, id: session.id }) }}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault()
+                        onSelect({ kind: session.kind, id: session.id })
+                      }
+                    }}
                   >
-                    <HarnessMark kind={session.kind} size={14} />
-                  </span>
-                  <span className={css.title}>{session.title}</span>
-                  <span className={css.time}>{relativeTime(session.updatedAt)}</span>
-                </div>
-              )
-            })}
+                    {/* Status slot: the harness mark, with a live dot while the transcript is being written. */}
+                    <span
+                      className={css.slot}
+                      data-role="mark"
+                      data-live={session.live || undefined}
+                      aria-label={session.live ? `${meta.label}, live` : meta.label}
+                    >
+                      <HarnessMark kind={session.kind} size={14} />
+                    </span>
+                    <span className={css.title}>{session.title}</span>
+                    <span className={css.time}>{relativeTime(session.updatedAt)}</span>
+                  </div>
+                )
+              })}
+            </GroupRows>
           </section>
         )
       })}
     </nav>
+  )
+}
+
+/** Matches the wrap's grid-template-rows transition in app.module.css. */
+const GROUP_CLOSE_MS = 180
+
+/**
+ * Height animation shell for a group's session rows. The rows mount while
+ * `open` or while the close transition plays, so collapsing shrinks over them
+ * instead of snapping away; on open the wrapper mounts at 0fr and flips to 1fr
+ * one frame later so the transition has a painted start.
+ */
+function GroupRows({ open, children }: { open: boolean; children: ReactNode }) {
+  const [rendered, setRendered] = useState(open)
+  const [shown, setShown] = useState(open)
+  const wrap = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (open) {
+      setRendered(true)
+      return
+    }
+    setShown(false)
+    if (!rendered) return
+    if (typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      setRendered(false)
+      return
+    }
+    const node = wrap.current
+    const finish = () => setRendered(false)
+    const onEnd = (event: TransitionEvent) => {
+      if (event.target === node && event.propertyName === 'grid-template-rows') finish()
+    }
+    node?.addEventListener('transitionend', onEnd)
+    // transitionend does not fire when the transition never ran.
+    const timer = setTimeout(finish, GROUP_CLOSE_MS + 60)
+    return () => {
+      node?.removeEventListener('transitionend', onEnd)
+      clearTimeout(timer)
+    }
+  }, [open, rendered])
+
+  useEffect(() => {
+    if (!open || !rendered || shown) return
+    const frame = requestAnimationFrame(() => setShown(true))
+    return () => cancelAnimationFrame(frame)
+  }, [open, rendered, shown])
+
+  return (
+    <div ref={wrap} className={css.sessionWrap} data-open={shown || undefined}>
+      <div className={css.sessionInner}>{rendered ? children : null}</div>
+    </div>
   )
 }

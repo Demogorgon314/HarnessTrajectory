@@ -402,11 +402,45 @@
 .group {
   display: flex;
   flex-direction: column;
-  gap: 2px;
 }
 
 .group + .group {
   margin-top: 2px;
+}
+
+/* Session rows animate their height through the grid-rows trick: the wrap's
+   single track transitions 0fr↔1fr while the inner clips. GroupRows keeps the
+   rows mounted through the close transition so it has content to shrink over. */
+.sessionWrap {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 180ms var(--ds-ease-in-out);
+}
+
+.sessionWrap[data-open] {
+  grid-template-rows: 1fr;
+}
+
+.sessionInner {
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  transition: visibility 0s;
+}
+
+/* The project↔session gap is a margin on the first row: inside the clip it
+   collapses with the rows, unlike inner padding which would leak 2px. */
+.sessionInner > .sessionRow:first-child {
+  margin-top: 2px;
+}
+
+/* Rows stay visible (and clipped) while the close transition shrinks over
+   them; the hidden flip is delayed until it lands. */
+.sessionWrap:not([data-open]) .sessionInner {
+  visibility: hidden;
+  transition-delay: 180ms;
 }
 
 .projectRow,
@@ -429,12 +463,17 @@
 .sessionRow {
   height: 32px;
   gap: 0;
-  /* Mount fade: session rows appear by unfolding a group. */
-  animation: row-in 150ms var(--ds-ease-in-out);
+  /* One level under the project row: the 8px pad plus a slot's width puts the
+     harness mark under the project title. The hit rows in `.matches` use the
+     same step. */
+  padding-left: 24px;
+  /* Mount fade: session rows appear by unfolding a group. `both` holds the
+     `from` frame through the per-row stagger delay (SessionList). */
+  animation: row-in 150ms var(--ds-ease-in-out) both;
 }
 
 @keyframes row-in {
-  from { opacity: 0; }
+  from { opacity: 0; transform: translateY(-4px); }
 }
 
 .projectRow:hover,
@@ -481,12 +520,13 @@
   display: none;
 }
 
-/* Expand arrow: points right closed, rotates to point down open. */
+/* Expand arrow: points right closed, rotates to point down open. The icon
+   components only forward `className`, so `data-open` rides the slot. */
 .arrow {
   transition: transform 150ms var(--ds-ease-in-out);
 }
 
-.arrow[data-open] {
+.slot[data-role='chevron'][data-open] .arrow {
   transform: rotate(90deg);
 }
 
@@ -514,6 +554,8 @@
 
 @media (prefers-reduced-motion: reduce) {
   .sessionRow,
+  .sessionWrap,
+  .sessionInner,
   .arrow {
     animation: none;
     transition: none;
