@@ -525,8 +525,9 @@ function grokMetaScanner(summary: Record<string, unknown> | null): MetaScanner {
  * Devin keeps title/cwd/model in the `sessions` row — handed in as `summary` —
  * and its generated title lands late, so it goes to `aiTitle` like grok's
  * `session_summary`. The prompt count comes from `is_user_input` on the
- * emitted `devin.msg` lines; a child stream's delegated task carries
- * `is_user_input:false`, so subagent chains never inflate the count.
+ * emitted `devin.msg` lines; every stream gets its own scanner, so a
+ * subagent chain's delegated task (`is_user_input:true`, same as the main
+ * stream's prompts) counts toward the child file, never the parent's.
  */
 function devinMetaScanner(session: Record<string, unknown> | null): MetaScanner {
   const state = emptyMeta()

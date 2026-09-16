@@ -308,6 +308,48 @@ describe('SearchIndexer', () => {
     again.stop()
   })
 
+  it('re-indexes from line 0 when a queued forget has not flushed yet', () => {
+    const indexer = new SearchIndexer({ store, flushDelayMs: 60_000 })
+    const key = { path: '/r/c/main.jsonl', kind: 'claude' as const, sessionId: 'm', fileId: 'm' }
+    store.transaction(() => {
+      store.insertDocs(key, [
+        { line: 0, role: 'human', text: 'first prompt' },
+        { line: 1, role: 'human', text: 'second prompt' },
+      ])
+      store.setFileState(key, { size: 200, mtimeMs: 1_000, indexedBytes: 200, indexedLines: 2 })
+    })
+    // A hide→show cycle inside one debounce window: the stream drops and
+    // re-registers before the flush lands. Resuming at the stale watermark
+    // would lose the prefix once the pending delete commits.
+    indexer.forget(key.path)
+    expect(indexer.beginFile(key, { size: 200, mtimeMs: 1_000 })).toBe(0)
+    indexer.queue(key, 0, JSON.stringify(claudeUser('first prompt', 'm', 0)))
+    indexer.queue(key, 1, JSON.stringify(claudeUser('second prompt', 'm', 100)))
+    indexer.flush()
+    expect(store.docCount()).toBe(2)
+    expect(search(store, { q: 'first prompt' }).totalHits).toBe(1)
+    expect(store.fileState(key.path)).toMatchObject({ indexedLines: 2 })
+    indexer.stop()
+  })
+
+  it('re-indexes from line 0 over a queued reset, not its stale watermark', () => {
+    const indexer = new SearchIndexer({ store, flushDelayMs: 60_000 })
+    const key = { path: '/r/c/main.jsonl', kind: 'claude' as const, sessionId: 'm', fileId: 'm' }
+    store.transaction(() => {
+      store.insertDocs(key, [{ line: 0, role: 'human', text: 'first prompt' }])
+      store.setFileState(key, { size: 200, mtimeMs: 1_000, indexedBytes: 200, indexedLines: 1 })
+    })
+    // A full rematerialize queues `reset` and rebuilds with a same-or-greater
+    // size, so the size/mtime check alone would resume at the old watermark.
+    indexer.reset(key.path)
+    expect(indexer.beginFile(key, { size: 300, mtimeMs: 2_000 })).toBe(0)
+    indexer.queue(key, 0, JSON.stringify(claudeUser('first prompt', 'm', 0)))
+    indexer.flush()
+    expect(store.docCount()).toBe(1)
+    expect(store.fileState(key.path)).toMatchObject({ indexedLines: 1 })
+    indexer.stop()
+  })
+
   it('reports itself unready until the startup sweep finishes', () => {
     const indexer = new SearchIndexer({ store })
     expect(indexer.stats().ready).toBe(false)

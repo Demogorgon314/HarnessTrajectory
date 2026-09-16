@@ -6,13 +6,16 @@
  * `chat_message`/`subagent/*` field names the CLI writes.
  */
 
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { SessionLiveEvent } from '@harness-trajectory/core'
 import { DevinDb } from '../src/devin/db.ts'
 import { DevinSource } from '../src/devin/source.ts'
+import { SearchIndexer } from '../src/search/indexer.ts'
+import { SearchStore } from '../src/search/store.ts'
+import { extractSearchDocs } from '../src/search/extract.ts'
 
 let dir: string
 let dbPath: string
@@ -80,13 +83,13 @@ function insertNode(
   ).run(sessionId, nodeId, parent, JSON.stringify(msg), createdAt, null)
 }
 
-const userMsg = (mid: string, text: string, human = true): Record<string, unknown> => ({
+const userMsg = (mid: string, text: string, opts: { human?: boolean } = {}): Record<string, unknown> => ({
   message_id: mid,
   role: 'user',
   content: [{ type: 'text', text }],
   metadata: {
     created_at: '2023-11-14T22:13:20.000Z',
-    ...(human ? { is_user_input: true } : {}),
+    ...(opts.human === false ? {} : { is_user_input: true }),
   },
 })
 
@@ -107,7 +110,7 @@ const toolMsg = (mid: string, callId: string, text: string, ext: Record<string, 
 })
 
 async function start(): Promise<DevinSource> {
-  source = new DevinSource({ dbPath, dataDir: dir, watch: false })
+  source = new DevinSource({ dbPath, watch: false })
   await source.start()
   return source
 }
@@ -135,7 +138,7 @@ describe('DevinSource', () => {
     insertSession(db, 'alpha', { title: 'Alpha work' })
     insertSession(db, 'ghost', { hidden: 1 })
     insertNode(db, 'alpha', 1, null, userMsg('u1', 'hello'))
-    insertNode(db, 'alpha', 2, 1, userMsg('u2', 'system_guidance: keep going', false))
+    insertNode(db, 'alpha', 2, 1, userMsg('u2', 'system_guidance: keep going', { human: false }))
     insertNode(db, 'alpha', 3, 2, userMsg('u3', 'again'))
     db.close()
     const src = await start()
@@ -201,13 +204,18 @@ describe('DevinSource', () => {
     insertNode(db, 'alpha', 13, 12, assistantMsg('a2', 'after'), 1_700_000_200)
     db.close()
     const src = await start()
-    const msgs = linesOf(await replay(src, 'alpha'))
+    const lines = linesOf(await replay(src, 'alpha'))
       .flatMap(chunk => chunk.lines)
       .filter(line => line.includes('devin.msg'))
-      .map(line => JSON.parse(line).msg.message_id as string)
+      .map(line => JSON.parse(line) as { msg: { message_id: string }; kept?: number })
+    const msgs = lines.map(line => line.msg.message_id)
     // u1's copy re-emits past the boundary; sys1's copy flushes with the
     // summary's render ancestors. a2 is a fresh post-summary node.
     expect(msgs).toEqual(['u1', 'a1', 'sys1', 'sys1', 's1', 'u1', 'a2'])
+    // Only the ancestor flush (the second sys1) is tagged `kept` — the claim's
+    // exemption set. The post-summary descendant copy stays untagged so the
+    // NEXT render's summary can claim it.
+    expect(lines.map(line => line.kept ?? 0)).toEqual([0, 0, 0, 1, 0, 0, 0])
   })
 
   it('emits a synthetic sidecar (startLine -1) plus tool state', async () => {
@@ -238,7 +246,7 @@ describe('DevinSource', () => {
     insertNode(db, 'alpha', 2, 1, assistantMsg('a1', 'spawning', [{ id: 'spawn-1', name: 'run_subagent' }]))
     // Subagent chain: its own root (disjoint tree).
     insertNode(db, 'alpha', 10, null, { message_id: 'c-sys', role: 'system', content: 'You are a subagent of Devin', metadata: {} })
-    insertNode(db, 'alpha', 11, 10, userMsg('c-task', 'survey the repo', false))
+    insertNode(db, 'alpha', 11, 10, userMsg('c-task', 'survey the repo', { human: false }))
     insertNode(db, 'alpha', 12, 11, assistantMsg('c-a1', 'on it', [{ id: 'child-1', name: 'ls' }]))
     // The spawn result lands last and names the chain.
     insertNode(db, 'alpha', 3, 2, toolMsg('r1', 'spawn-1', 'done', {
@@ -278,7 +286,7 @@ describe('DevinSource', () => {
       content: 'You are a Summarizer that summarizes conversation history',
       metadata: {},
     })
-    insertNode(db, 'alpha', 11, 10, userMsg('s-ctx', 'summarize this', false))
+    insertNode(db, 'alpha', 11, 10, userMsg('s-ctx', 'summarize this', { human: false }))
     insertNode(db, 'alpha', 2, 1, assistantMsg('a1', 'reply'))
     db.close()
     const src = await start()
@@ -297,7 +305,7 @@ describe('DevinSource', () => {
     insertNode(db, 'alpha', 2, 1, assistantMsg('a1', 'spawning', [{ id: 'spawn-1', name: 'run_subagent' }]))
     // The chain starts before its claim lands (a live run in flight).
     insertNode(db, 'alpha', 10, null, { message_id: 'c-sys', role: 'system', content: 'subagent prompt', metadata: {} })
-    insertNode(db, 'alpha', 11, 10, userMsg('c-task', 'survey', false))
+    insertNode(db, 'alpha', 11, 10, userMsg('c-task', 'survey', { human: false }))
     db.close()
     const src = await start()
     // Unclaimed so far: invisible.
@@ -407,11 +415,81 @@ describe('DevinSource', () => {
     expect(lines[0]).toContain('new content')
   })
 
-  it('rejects a file without the Devin schema', async () => {
+  it('degrades on a file without the Devin schema — error event, empty list, no throw', async () => {
     const db = fixture()
     db.db.exec(`CREATE TABLE other (id TEXT)`)
     db.close()
-    source = new DevinSource({ dbPath, dataDir: dir, watch: false })
-    await expect(source.start()).rejects.toThrow('not a Devin session store')
+    source = new DevinSource({ dbPath, watch: false })
+    const errors: unknown[] = []
+    source.on('error', error => errors.push(error))
+    // A foreign database must not take the composite down: the source runs
+    // degraded (no sessions) and reports through 'error'.
+    await expect(source.start()).resolves.toBeUndefined()
+    expect(errors).toHaveLength(1)
+    expect(String(errors[0])).toContain('not a Devin session store')
+    expect(source.list()).toEqual([])
+    // Degraded source answers reads with nothing rather than throwing.
+    await expect(replay(source, 'alpha')).resolves.toEqual([])
+  })
+
+  it('degrades on a corrupt file that is not SQLite at all', async () => {
+    const db = fixture()
+    db.close()
+    writeFileSync(dbPath, 'this is not a sqlite database')
+    source = new DevinSource({ dbPath, watch: false })
+    const errors: unknown[] = []
+    source.on('error', error => errors.push(error))
+    await expect(source.start()).resolves.toBeUndefined()
+    expect(errors).toHaveLength(1)
+    expect(source.list()).toEqual([])
+  })
+
+  it('drops the search watermark with the session so a re-appearing one re-indexes', async () => {
+    const store = new SearchStore({ path: ':memory:' })
+    const indexer = new SearchIndexer({ store, flushDelayMs: 1, extract: extractSearchDocs, maxAgeDays: 0 })
+    const db = fixture()
+    createStore(db)
+    insertSession(db, 'alpha')
+    insertNode(db, 'alpha', 1, null, userMsg('u1', 'findable line'))
+    db.close()
+    source = new DevinSource({ dbPath, watch: false, search: indexer })
+    await source.start()
+    indexer.flush()
+    const path = 'devin://sessions/alpha'
+    expect(store.fileState(path)?.indexedLines).toBe(1)
+    // The session hides → drop → the whole index entry (docs + watermark) goes.
+    const write = new DevinDb(dbPath, { readOnly: false })
+    write.db.prepare(`UPDATE sessions SET hidden = 1 WHERE id = 'alpha'`).run()
+    write.close()
+    await source.refresh()
+    indexer.flush()
+    expect(store.fileState(path)).toBeUndefined()
+    // Un-hide → re-register → beginFile sees no watermark → re-index from 0.
+    const write2 = new DevinDb(dbPath, { readOnly: false })
+    write2.db.prepare(`UPDATE sessions SET hidden = 0, last_activity_at = 1700000900 WHERE id = 'alpha'`).run()
+    write2.close()
+    await source.refresh()
+    indexer.flush()
+    expect(store.fileState(path)?.indexedLines).toBe(1)
+  })
+
+  it('keeps a session past the retention window browsable but unindexed', async () => {
+    const store = new SearchStore({ path: ':memory:' })
+    const indexer = new SearchIndexer({ store, flushDelayMs: 1, extract: extractSearchDocs, maxAgeDays: 30, now: () => Date.parse('2026-01-01T00:00:00Z') })
+    const db = fixture()
+    createStore(db)
+    insertSession(db, 'alpha', { last_activity_at: 1_700_000_000 }) // ~Nov 2023, way past the window
+    insertNode(db, 'alpha', 1, null, userMsg('u1', 'old but browsable'))
+    db.close()
+    source = new DevinSource({ dbPath, watch: false, search: indexer })
+    await source.start()
+    indexer.flush()
+    // Browsable…
+    expect(source.list()).toHaveLength(1)
+    expect(linesOf(await replay(source, 'alpha')).flatMap(c => c.lines).some(l => l.includes('old but browsable'))).toBe(true)
+    // …but nothing was queued, no watermark was recorded, and the path is not
+    // reported live (so finishBackfill purges any stale rows for it).
+    expect(store.fileState('devin://sessions/alpha')).toBeUndefined()
+    expect(source.livePaths()).toEqual([])
   })
 })

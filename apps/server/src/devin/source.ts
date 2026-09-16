@@ -10,10 +10,14 @@
  * - `{t:'devin.session', …}` — session facts sidecar: title/cwd/model/agent
  *   mode/created time from the `sessions` row plus the discovered subagent
  *   list. Synthetic (`startLine: -1`), re-sent when facts change.
- * - `{t:'devin.msg', node, parent, time, msg}` — one message node. `msg` is the
- *   raw `chat_message` JSON; `time` is epoch ms (`metadata.created_at`, else
- *   `created_at` seconds). These are the only indexed lines: the 0-based line
- *   number is the emission index within its stream.
+ * - `{t:'devin.msg', node, parent, time, kept?, msg}` — one message node. `msg`
+ *   is the raw `chat_message` JSON; `time` is epoch ms (`metadata.created_at`,
+ *   else `created_at` seconds). `kept:1` marks a summary's ancestor flush —
+ *   the incoming render's declared-kept prefix/context — so the synthesizer
+ *   exempts exactly those seqs from the summary's claim (later kept copies
+ *   that arrive as descendants carry no tag and are claimed normally). These
+ *   are the only indexed lines: the 0-based line number is the emission index
+ *   within its stream.
  * - `{t:'devin.tool', id, time, call?, update?}` — one `tool_call_state` row:
  *   serialized ACP `ToolCall`/`ToolCallUpdate`. Synthetic; re-sent when the
  *   row changes (the update column lands late).
@@ -34,13 +38,17 @@
  * size).
  *
  * Compaction epochs: a `system` node carrying `extensions['devin-rs/summary']`
- * closes one render and opens the next. Dedup is per `(message_id, stream,
+ * closes one render and opens the next ON ITS OWN STREAM — each owner entry
+ * keeps an epoch counter (`epochs`), so a subagent chain's compaction works
+ * the same way as the main chain's. Dedup is per `(message_id, stream,
  * epoch)` — a mid emitted before the latest summary re-emits once afterward,
  * because a render copy of a shadowed message is kept context, not a dup.
- * Copies that are ancestors of the summary node itself (the render's prefix
- * and kept injections) emit with it via `emitRenderAncestors`; same-epoch
- * copies of still-live messages stay deduped, and re-emissions skip search
- * indexing so the index never double-counts.
+ * Only the FIRST sighting of a summary mid opens an epoch: a later render's
+ * kept copy of that summary is content, not a new boundary. Copies that are
+ * ancestors of the summary node itself (the render's prefix and kept
+ * injections) emit with it via `emitRenderAncestors`, tagged `kept` on the
+ * wire; same-epoch copies of still-live messages stay deduped, and
+ * re-emissions skip search indexing so the index never double-counts.
  *
  * Store rewrites: the CLI periodically rewrites a session's whole forest in
  * one commit — same node_ids re-inserted in node order under fresh row_ids,
@@ -54,7 +62,6 @@
 
 import { EventEmitter } from 'node:events'
 import { watch, type FSWatcher } from 'node:fs'
-import { dirname } from 'node:path'
 import { asString, isRecord, type HarnessKind, type SessionFileRef, type SessionLiveEvent } from '@harness-trajectory/core'
 import { createMetaScanner } from '../meta.ts'
 import type { SearchIndexer } from '../search/indexer.ts'
@@ -70,8 +77,6 @@ const POLL_INTERVAL_MS = 1_500
 export interface DevinSourceOptions {
   /** Absolute path of `sessions.db`. */
   dbPath: string
-  /** Devin data dir; `<dir>/session_locks/<id>.lock` marks a running session. */
-  dataDir?: string | undefined
   search?: SearchIndexer | undefined
   /** Disable polling and file watching (tests). */
   watch?: boolean | undefined
@@ -83,6 +88,8 @@ interface DevinEntry extends SourceEntry {
   buffered: string[]
   /** First line index that still needs search indexing (`beginFile`'s answer). */
   searchFrom: number
+  /** Session aged past the retention window: browsable, but never queued. */
+  searchSkipped: boolean
 }
 
 /**
@@ -166,14 +173,14 @@ interface DevinSessionState {
   midAnchor: Map<string, number>
   /**
    * Dedup key (message_id, else `node:<id>`) → owner entry → compaction epoch
-   * at emit time. A key may emit to main AGAIN once a summary node has landed:
-   * everything emitted before a compaction leaves the rendered context, so a
-   * later render carrying the same message_id is a kept copy — real context
-   * the fold must re-count. Children and same-epoch duplicates dedupe flat.
+   * at emit time. A key may emit to an owner AGAIN once a summary node has
+   * landed there: everything emitted before a compaction leaves the rendered
+   * context, so a later render carrying the same message_id is a kept copy —
+   * real context the fold must re-count. Same-epoch duplicates dedupe flat.
    */
   emitted: Map<string, Map<DevinEntry, number>>
-  /** Summary nodes emitted to the main stream so far. */
-  summaryEpoch: number
+  /** Summary nodes emitted per owner entry — each stream's render boundary. */
+  epochs: Map<DevinEntry, number>
   /** Highest row_id consumed; a regression means the store was rebuilt. */
   maxRowId: number
   /** node_id of the session's first row — the main-chain fallback root. */
@@ -217,7 +224,6 @@ function jsonString(value: string | null): unknown {
 
 export class DevinSource extends EventEmitter implements SessionSource {
   private readonly dbPath: string
-  private readonly dataDir: string
   private readonly search: SearchIndexer | undefined
   private readonly watchEnabled: boolean
   private readonly now: () => number
@@ -232,22 +238,29 @@ export class DevinSource extends EventEmitter implements SessionSource {
   constructor(options: DevinSourceOptions) {
     super()
     this.dbPath = options.dbPath
-    this.dataDir = options.dataDir ?? dirname(options.dbPath)
     this.search = options.search
     this.watchEnabled = options.watch !== false
     this.now = options.now ?? Date.now
   }
 
   async start(): Promise<void> {
-    this.db = new DevinDb(this.dbPath)
-    if (!this.db.hasSchema()) {
-      this.db.close()
+    // An absent/corrupt/foreign database must not take the composite down:
+    // degrade to an empty source (every method tolerates `db === null`) and
+    // surface the failure through the usual error channel.
+    try {
+      this.db = new DevinDb(this.dbPath)
+      if (!this.db.hasSchema()) throw new Error('missing Devin tables')
+    } catch (error) {
+      this.db?.close()
       this.db = null
-      throw new Error(`${this.dbPath}: not a Devin session store`)
+      this.emit('error', new Error(`${this.dbPath}: not a Devin session store`, { cause: error }))
+      return
     }
     await this.sweep()
     if (!this.watchEnabled) return
-    this.poll = setInterval(() => { void this.tick() }, POLL_INTERVAL_MS)
+    this.poll = setInterval(() => {
+      this.tick().catch((error: unknown) => { this.emit('error', error) })
+    }, POLL_INTERVAL_MS)
     this.poll.unref()
     // The WAL file's mtime moves on every commit; watch it for promptness and
     // let the debounced poll do the real work (WAL may not exist yet — retry
@@ -269,7 +282,7 @@ export class DevinSource extends EventEmitter implements SessionSource {
 
   /** Streams this source feeds to the search index (its half of `finishBackfill`). */
   livePaths(): string[] {
-    return [...this.book.files.values()].map(entry => entry.path)
+    return [...this.book.files.values()].flatMap(entry => (entry.searchSkipped ? [] : [entry.path]))
   }
 
   list() { return this.book.list() }
@@ -355,6 +368,8 @@ export class DevinSource extends EventEmitter implements SessionSource {
       meta: createMetaScanner(KIND, sessionSeed(row)),
       buffered: [],
       searchFrom: 0,
+      searchSkipped: this.search !== undefined
+        && !this.search.shouldIndex({ mtimeMs: row.last_activity_at * 1000 }),
     }
     session.main = entry
     this.book.files.set(entry.path, entry)
@@ -364,7 +379,7 @@ export class DevinSource extends EventEmitter implements SessionSource {
       groups: new ChainGroups(),
       midAnchor: new Map(),
       emitted: new Map(),
-      summaryEpoch: 0,
+      epochs: new Map(),
       maxRowId: 0,
       earliestNode: 0,
       nodes: new Map(),
@@ -376,7 +391,7 @@ export class DevinSource extends EventEmitter implements SessionSource {
       pendingKeys: new Set(),
     }
     this.states.set(row.id, state)
-    if (this.search !== undefined) {
+    if (this.search !== undefined && !entry.searchSkipped) {
       // The row watermark stands in for file size: monotonic while the store
       // appends, lower after a rebuild — exactly what `beginFile` checks.
       const maxRow = this.db?.maxRowId(row.id) ?? 0
@@ -390,7 +405,9 @@ export class DevinSource extends EventEmitter implements SessionSource {
   /** Forget a session (hidden or deleted from the store). */
   private drop(state: DevinSessionState): void {
     const paths = this.book.dropSession(state.session)
-    for (const path of paths) this.search?.reset(path)
+    // `forget` (not `reset`): the watermark row must go too, or a session that
+    // reappears keeps `indexed_lines` and its earlier lines never re-index.
+    for (const path of paths) this.search?.forget(path)
     this.states.delete(state.row.id)
     this.emit('change', KIND, state.row.id)
   }
@@ -490,10 +507,12 @@ export class DevinSource extends EventEmitter implements SessionSource {
       meta: createMetaScanner(KIND),
       buffered: [],
       searchFrom: 0,
+      searchSkipped: this.search !== undefined
+        && !this.search.shouldIndex({ mtimeMs: state.row.last_activity_at * 1000 }),
     }
     session.children.set(fileId, entry)
     this.book.files.set(path, entry)
-    if (this.search !== undefined) {
+    if (this.search !== undefined && !entry.searchSkipped) {
       entry.searchFrom = this.search.beginFile(
         searchKeyOf(entry), { size: state.maxRowId, mtimeMs: entry.mtimeMs },
       )
@@ -502,14 +521,28 @@ export class DevinSource extends EventEmitter implements SessionSource {
     return entry
   }
 
-  private emitLine(state: DevinSessionState, entry: DevinEntry, node: ParsedNode, indexable = true): void {
-    entry.buffered.push(node.line)
+  /**
+   * Append `line` (the node's wire form, or a tagged variant such as the
+   * ancestor flush's `kept` line) to `entry`'s stream: buffer for replay,
+   * feed the meta scanner, and queue it for search when fresh.
+   */
+  private emitLine(
+    state: DevinSessionState,
+    entry: DevinEntry,
+    node: ParsedNode,
+    indexable = true,
+    line = node.line,
+  ): void {
+    entry.buffered.push(line)
     entry.lines = entry.buffered.length
-    entry.size += node.line.length + 1
+    entry.size += line.length + 1
     entry.mtimeMs = Math.max(entry.mtimeMs, node.time)
-    entry.meta?.push(node.line)
-    if (indexable && this.search !== undefined && entry.buffered.length - 1 >= entry.searchFrom) {
-      this.search.queue(searchKeyOf(entry), entry.buffered.length - 1, node.line)
+    entry.meta?.push(line)
+    if (
+      indexable && !entry.searchSkipped && this.search !== undefined
+      && entry.buffered.length - 1 >= entry.searchFrom
+    ) {
+      this.search.queue(searchKeyOf(entry), entry.buffered.length - 1, line)
     }
   }
 
@@ -517,23 +550,25 @@ export class DevinSource extends EventEmitter implements SessionSource {
    * Fan a materialization batch out to subscribers as chunked `lines` events
    * (one event per contiguous run per stream) and record search progress.
    */
-  private flushBatch(state: DevinSessionState, emitted: Map<DevinEntry, ParsedNode[]>): void {
-    for (const [entry, nodes] of emitted) {
-      const startLine = entry.buffered.length - nodes.length
-      for (let offset = 0; offset < nodes.length; offset += CHUNK_LINES) {
+  private flushBatch(state: DevinSessionState, emitted: Map<DevinEntry, string[]>): void {
+    for (const [entry, lines] of emitted) {
+      const startLine = entry.buffered.length - lines.length
+      for (let offset = 0; offset < lines.length; offset += CHUNK_LINES) {
         this.book.emitTo(state.session, {
           type: 'lines',
           file: entry.ref,
-          lines: nodes.slice(offset, offset + CHUNK_LINES).map(node => node.line),
+          lines: lines.slice(offset, offset + CHUNK_LINES),
           startLine: startLine + offset,
         })
       }
-      this.search?.noteProgress(searchKeyOf(entry), {
-        size: state.maxRowId,
-        mtimeMs: entry.mtimeMs,
-        indexedBytes: entry.size,
-        indexedLines: entry.lines,
-      })
+      if (!entry.searchSkipped) {
+        this.search?.noteProgress(searchKeyOf(entry), {
+          size: state.maxRowId,
+          mtimeMs: entry.mtimeMs,
+          indexedBytes: entry.size,
+          indexedLines: entry.lines,
+        })
+      }
     }
   }
 
@@ -547,7 +582,7 @@ export class DevinSource extends EventEmitter implements SessionSource {
       state.groups = new ChainGroups()
       state.midAnchor.clear()
       state.emitted.clear()
-      state.summaryEpoch = 0
+      state.epochs.clear()
       state.nodes.clear()
       state.pending.clear()
       state.pendingKeys.clear()
@@ -607,7 +642,7 @@ export class DevinSource extends EventEmitter implements SessionSource {
     // claimed yet (context renders, compactor passes) buffer until a claim or
     // a merge into the main chain resolves them.
     this.drainPending(state)
-    const emitted = new Map<DevinEntry, ParsedNode[]>()
+    const emitted = new Map<DevinEntry, string[]>()
     for (const node of parsed) {
       // Store-rewrite copies never re-emit; the kept-copy re-emission past a
       // compaction boundary belongs to render nodes — always NEW node_ids.
@@ -642,7 +677,7 @@ export class DevinSource extends EventEmitter implements SessionSource {
    */
   private drainPending(state: DevinSessionState): void {
     if (state.pending.size === 0) return
-    const emitted = new Map<DevinEntry, ParsedNode[]>()
+    const emitted = new Map<DevinEntry, string[]>()
     for (const [root, nodes] of [...state.pending]) {
       const first = nodes[0]
       if (first === undefined) {
@@ -668,37 +703,40 @@ export class DevinSource extends EventEmitter implements SessionSource {
 
   /**
    * Emit `node`'s line to `owner` unless its dedup key already produced a line
-   * for that stream in the current compaction epoch. A key emitted to main
-   * before the latest summary re-emits once a summary has landed: everything
-   * before a compaction leaves the rendered context, so a later copy is a
-   * kept/rendered message the fold must re-count. Child streams and
-   * same-epoch duplicates dedupe flat. Returns whether a line went out.
+   * for that stream in the stream's current compaction epoch. A key emitted
+   * before the owner's latest summary re-emits once a summary has landed:
+   * everything before a compaction leaves the rendered context, so a later
+   * copy is a kept/rendered message the fold must re-count. Same-epoch
+   * duplicates dedupe flat. Returns whether a line went out.
    */
   private tryEmitNode(
     state: DevinSessionState,
     owner: DevinEntry,
     node: ParsedNode,
-    emitted: Map<DevinEntry, ParsedNode[]>,
+    emitted: Map<DevinEntry, string[]>,
   ): boolean {
     const key = node.messageId ?? `node:${node.row.node_id}`
-    const isMain = owner === state.session.main
-    const epoch = isMain ? state.summaryEpoch : -1
+    const epoch = state.epochs.get(owner) ?? 0
     const owners = state.emitted.get(key)
-    if (owners?.get(owner) === epoch) return false
+    const prevEpoch = owners?.get(owner)
+    if (prevEpoch === epoch) return false
     // A re-emission is a render's kept copy: real context for the fold, but
     // already indexed — queueing it again would double its search hits.
-    const indexable = owners === undefined || owners.get(owner) === undefined
+    const indexable = prevEpoch === undefined
     if (owners === undefined) state.emitted.set(key, new Map([[owner, epoch]]))
     else owners.set(owner, epoch)
-    if (node.compaction && isMain) {
-      state.summaryEpoch += 1
+    if (node.compaction && prevEpoch === undefined) {
+      // Only the FIRST sighting of a summary mid on this stream opens an
+      // epoch and flushes its ancestors; a later render's kept copy of that
+      // same summary is content, not another boundary.
+      state.epochs.set(owner, epoch + 1)
       this.emitRenderAncestors(state, owner, node, emitted)
     }
     state.groups.claim(node.row.node_id, owner)
     this.emitLine(state, owner, node, indexable)
     const list = emitted.get(owner)
-    if (list === undefined) emitted.set(owner, [node])
-    else list.push(node)
+    if (list === undefined) emitted.set(owner, [node.line])
+    else list.push(node.line)
     return true
   }
 
@@ -708,14 +746,18 @@ export class DevinSource extends EventEmitter implements SessionSource {
    * summary in row order, so same-epoch ones were skipped as duplicates and
    * older ones may already sit in `pending`: flush any not yet emitted at the
    * new epoch, oldest first, so the fold sees the render's full prefix and
-   * kept injections. Nested summaries emit flat — their epoch already ended.
+   * kept injections. Every flushed line carries `"kept":1` — the wire marker
+   * the synthesizer uses to exempt exactly this run from the summary's claim
+   * (kept copies arriving as post-summary descendants are NOT tagged: the
+   * next render's copies replace them, so they stay claimable).
    */
   private emitRenderAncestors(
     state: DevinSessionState,
     owner: DevinEntry,
     summary: ParsedNode,
-    emitted: Map<DevinEntry, ParsedNode[]>,
+    emitted: Map<DevinEntry, string[]>,
   ): void {
+    const epoch = state.epochs.get(owner) ?? 0
     const ancestors: ParsedNode[] = []
     const guard = new Set<number>([summary.row.node_id])
     let cur = summary.row.parent_node_id
@@ -729,15 +771,18 @@ export class DevinSource extends EventEmitter implements SessionSource {
     for (const anc of ancestors.reverse()) {
       const key = anc.messageId ?? `node:${anc.row.node_id}`
       const owners = state.emitted.get(key)
-      if (owners?.get(owner) === state.summaryEpoch) continue
+      if (owners?.get(owner) === epoch) continue
       const indexable = owners === undefined || owners.get(owner) === undefined
-      if (owners === undefined) state.emitted.set(key, new Map([[owner, state.summaryEpoch]]))
-      else owners.set(owner, state.summaryEpoch)
+      if (owners === undefined) state.emitted.set(key, new Map([[owner, epoch]]))
+      else owners.set(owner, epoch)
       state.groups.claim(anc.row.node_id, owner)
-      this.emitLine(state, owner, anc, indexable)
+      const line = `{"t":"devin.msg","node":${anc.row.node_id},`
+        + `"parent":${anc.row.parent_node_id === null ? 'null' : anc.row.parent_node_id},`
+        + `"time":${anc.time},"kept":1,"msg":${anc.row.chat_message}}`
+      this.emitLine(state, owner, anc, indexable, line)
       const list = emitted.get(owner)
-      if (list === undefined) emitted.set(owner, [anc])
-      else list.push(anc)
+      if (list === undefined) emitted.set(owner, [line])
+      else list.push(line)
     }
   }
 
@@ -758,11 +803,6 @@ export class DevinSource extends EventEmitter implements SessionSource {
       backend: state.row.backend_type,
       createdAt: state.row.created_at * 1000,
       agents,
-    }
-    const cost = isRecord(jsonString(state.row.metadata)) ? jsonString(state.row.metadata) : null
-    if (cost !== null && isRecord(cost)) {
-      const acu = cost['total_acu_cost']
-      if (typeof acu === 'number') payload['acuCost'] = acu
     }
     const line = JSON.stringify(payload)
     const key = line
@@ -826,7 +866,7 @@ export class DevinSource extends EventEmitter implements SessionSource {
     if (this.pollTimer !== null) return
     this.pollTimer = setTimeout(() => {
       this.pollTimer = null
-      void this.tick()
+      this.tick().catch((error: unknown) => { this.emit('error', error) })
     }, 120)
   }
 
@@ -867,6 +907,10 @@ export class DevinSource extends EventEmitter implements SessionSource {
     for (const row of rows) {
       if (row.hidden !== 0) continue
       seen.add(row.id)
+      // A session appearing between polls (created live, or un-hidden after a
+      // drop) registers with `state.row` already equal to `row`, so `moved`
+      // alone would never materialize it — it would list but stay empty.
+      const fresh = !this.states.has(row.id)
       const state = this.register(row)
       const moved = row.last_activity_at !== state.row.last_activity_at
         || row.main_chain_id !== state.row.main_chain_id
@@ -877,7 +921,7 @@ export class DevinSource extends EventEmitter implements SessionSource {
       state.heads = new Map(this.db.subagentHeads(row.id).map(head => [head.chain_node_id, head.agent_id]))
       if (dropped) {
         this.materialize(state, true)
-      } else if (moved || this.book.hasSubscribers(KIND, row.id)) {
+      } else if (fresh || moved || this.book.hasSubscribers(KIND, row.id)) {
         this.materialize(state)
         this.syncToolState(state)
       }

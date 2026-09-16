@@ -64,13 +64,14 @@ export type DevinRecord =
     readonly model: string | null
     readonly agentMode: string | null
     readonly agents: readonly { id: string; fileId: string }[]
-    readonly acuCost: number | null
   }
   | {
     readonly tag: 'msg'
     readonly time: number | null
     readonly node: number | null
     readonly parent: number | null
+    /** `kept:1` — a summary's ancestor flush: the incoming render's kept context. */
+    readonly kept: boolean
     readonly msg: Record<string, unknown>
   }
   | {
@@ -121,7 +122,6 @@ export function parseDevinLine(line: string): DevinRecord | null {
         model: asString(raw['model']) ?? null,
         agentMode: asString(raw['agentMode']) ?? null,
         agents,
-        acuCost: asNumber(raw['acuCost']) ?? null,
       }
     }
     case 'devin.msg': {
@@ -132,6 +132,7 @@ export function parseDevinLine(line: string): DevinRecord | null {
         time,
         node: asNumber(raw['node']) ?? null,
         parent: asNumber(raw['parent']) ?? null,
+        kept: raw['kept'] === 1,
         msg,
       }
     }
@@ -170,7 +171,9 @@ function msgUsage(msg: Record<string, unknown>): TokenUsage | undefined {
   const input = asNumber(metrics['input_tokens'])
   const output = asNumber(metrics['output_tokens'])
   const cacheRead = asNumber(metrics['cache_read_tokens'])
-  const cacheWrite = asNumber(metrics['cache_write_tokens'])
+  // Observed stores write `cache_creation_tokens` (null so far); the
+  // `cache_write_tokens` spelling is kept as a forward-compat alias.
+  const cacheWrite = asNumber(metrics['cache_write_tokens']) ?? asNumber(metrics['cache_creation_tokens'])
   if (input === undefined && output === undefined && cacheRead === undefined) return undefined
   return {
     inputTokens: input ?? 0,

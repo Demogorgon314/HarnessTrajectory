@@ -23,6 +23,12 @@
  *   compaction/summary  data { shadowedSeqs: number[], shadowedTokenCount?: number }
  *   compaction/prune    data { shadowedSeqs: number[], shadowedTokenCount?: number }
  *
+ * Any surface event may carry `data.replay: true` — a re-rendered copy of
+ * context the model still holds (a Devin render re-sends its kept messages).
+ * The fold surfaces the copy but skips bookkeeping (turns, steps, usage,
+ * event records). The wire-level `kept` tag that marks a summary's ancestor
+ * flush is consumed inside the synthesizer and never reaches the fold.
+ *
  * `seq` is a strictly increasing integer per file; `time` is epoch milliseconds.
  */
 export interface TimelineEvent {

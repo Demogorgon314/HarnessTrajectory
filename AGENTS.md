@@ -178,11 +178,23 @@ kind in `index.ts` to stamp those facts.
   prefix (each render rewrites it — a new contiguous run replaces the header text),
   `devin-rs/summary` = compaction, anything else = an injected block
   (`agent-ext/rules-loaded`, `agent-ext/skills-loaded`, `affogato/cog-context`,
-  `chisel/user-edits-*`; a re-injection under the same key replaces the stale one).
+  `chisel/user-edits-*`; a re-injection under the same key replaces the stale one;
+  the store does not preserve `extensions` key order across renders, so a
+  multi-key node's identity key is its sorted-first key). A summary node bundles
+  the render's whole retained context: `content` is summary text plus the kept
+  conversation tail under `<conversation_history>`, and
+  `extensions['chisel/conversation_history'].messages` carries the same tail in
+  structured form (with `compact/todo_list`/`compact/edited_files` alongside).
+  The fold prices it as ONE compaction block — after a compaction `user` can
+  read zero even though kept prompts sit inside the bundle; that is the wire
+  truth, not a dropped message.
   Replays re-enter the fold surface carrying `data.replay: true` — the fold surfaces
   the copy but skips all bookkeeping (request record, usage, step timing, human-input
-  tally, inject re-listing); they are exempt from the claim that produced them and are
-  not re-indexed for search. Human
+  tally, inject re-listing) and they are not re-indexed for search. The wire marks
+  the summary's ancestor flush `kept:1`; the synth exempts exactly that tagged run
+  from the summary's claim. Untagged post-summary descendant copies stay claimable —
+  exempting them would leave the same logical message on the surface twice after the
+  next render. Human
   vs injected is `metadata.is_user_input`; usage lives in `metadata.metrics`, tool wall
   time in `chisel/tool_call_timing.duration_ms`, and ACP state in `tool_call_state`
   (settles a call whose result message never landed). `devin.session`/`devin.tool` are

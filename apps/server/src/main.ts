@@ -10,7 +10,7 @@ import { listingDbPath, searchDbPath, searchEnabled } from './cache.ts'
 import { DevinSource } from './devin/source.ts'
 import { SessionIndex } from './index.ts'
 import { ListingCache } from './listing-cache.ts'
-import { defaultRoots, devinDataDir, devinDbPath } from './roots.ts'
+import { defaultRoots, devinDbPath } from './roots.ts'
 import { CompositeSource } from './source.ts'
 import { browserUrl, openBrowser, shouldOpenBrowser } from './open-browser.ts'
 import { createSearchService, type SearchService } from './search/index.ts'
@@ -100,7 +100,6 @@ are editable in the UI.`)
   if (hasDevin) {
     const devin = new DevinSource({
       dbPath: devinDb,
-      dataDir: devinDataDir(),
       ...(search === undefined ? {} : { search: search.indexer }),
     })
     const composite = new CompositeSource([index, devin], search?.indexer)
