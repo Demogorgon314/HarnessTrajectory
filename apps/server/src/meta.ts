@@ -530,6 +530,9 @@ function grokMetaScanner(summary: Record<string, unknown> | null): MetaScanner {
  */
 function devinMetaScanner(session: Record<string, unknown> | null): MetaScanner {
   const state = emptyMeta()
+  // Kept render copies re-emit past a summary boundary — same message_id, not
+  // a new prompt.
+  const seenMids = new Set<string>()
   if (session !== null) {
     const title = asString(session['title'])?.trim()
     if (title !== undefined && title !== '') state.aiTitle = title
@@ -544,6 +547,11 @@ function devinMetaScanner(session: Record<string, unknown> | null): MetaScanner 
       if (record === null) return
       if (record.time !== null) noteTime(state, record.time)
       if (record.tag !== 'msg') return
+      const mid = asString(record.msg['message_id'])
+      if (mid !== undefined) {
+        if (seenMids.has(mid)) return
+        seenMids.add(mid)
+      }
       if (devinMessageClass(record.msg)?.kind !== 'human') return
       state.promptCount += 1
       const content = record.msg['content']

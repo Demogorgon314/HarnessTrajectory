@@ -282,6 +282,9 @@ class DevinParser implements SessionParser {
   private startedAt: number | null = null
   private promptCount = 0
   private systemPromptSeen = false
+  /** message_ids already folded in — render copies re-emitted past a summary
+   *  boundary are the same message re-entering context, not a new event. */
+  private readonly seenMids = new Set<string>()
 
   push(line: string, file: SessionFileRef, lineIndex?: number): void {
     this.assembler.beginLine(file.id, lineIndex)
@@ -362,6 +365,11 @@ class DevinParser implements SessionParser {
   }
 
   private handleMsg(msg: Record<string, unknown>, time: number): void {
+    const mid = asString(msg['message_id'])
+    if (mid !== undefined) {
+      if (this.seenMids.has(mid)) return
+      this.seenMids.add(mid)
+    }
     const role = asString(msg['role'])
     const stamp = msgTime(msg, time)
     if (this.startedAt === null && stamp > 0) this.startedAt = stamp

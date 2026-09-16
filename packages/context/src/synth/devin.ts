@@ -19,8 +19,17 @@
  *   `subagent/chain_node_id` extensions; the sidecar's `agents` list resolves
  *   the agent id to the child stream's file id.
  * - Context renders duplicate the chain (the source dedupes by `message_id`),
- *   so a "compaction" never reaches this file: the fold sees the logical
- *   transcript only.
+ *   so the fold sees the logical transcript only — except the boundary: a
+ *   compaction lands as a `system` node carrying `extensions['devin-rs/summary']`
+ *   whose text is the rendered "continuing work" summary. It replaces the
+ *   whole live surface (Devin keeps the system prefix, which never entered
+ *   liveSeqs), exactly like Kimi's `context.apply_compaction`.
+ * - `system` nodes split by their extensions: none = a rendered system-prefix
+ *   part (each render rewrites it, so a new contiguous run replaces the text),
+ *   `devin-rs/summary` = compaction, anything else = an injected context block
+ *   (`agent-ext/rules-loaded`, `agent-ext/skills-loaded`, `affogato/cog-context`,
+ *   `chisel/user-edits-*`). Injects are surface nodes priced as injected
+ *   context; a re-injection replaces the earlier block under the same key.
  */
 
 import {
@@ -84,8 +93,19 @@ class DevinSynthesizer implements EventSynthesizer {
   private label: string | undefined
   private systemText: string | undefined
   private headerEmitted = false
+  /** Whether the previous emitted node was a system-prefix part. */
+  private prefixRun = false
+  /** inject extension key → live seq, so a re-injection replaces the stale block. */
+  private readonly injectSeqs = new Map<string, number>()
   private readonly openCalls = new Set<string>()
   private readonly spawns: PendingSpawn[] = []
+  /** Seqs of every live surface node, for the compaction shadow claim. */
+  private liveSeqs: number[] = []
+  /** Seqs of kept-copy replays emitted since the last compaction — they belong
+   * to the incoming render, so the next claim leaves them alone. */
+  private replaySeqs: number[] = []
+  /** message_ids already emitted once; a second sighting is a render's kept copy. */
+  private readonly seenMids = new Set<string>()
   private readonly children = new Map<string, AgentSpawn>()
   /** agentId → child file id, from the session sidecar. */
   private readonly agentFiles = new Map<string, string>()
@@ -127,9 +147,34 @@ class DevinSynthesizer implements EventSynthesizer {
     type: string,
     time: number,
     data?: Record<string, unknown>,
+    surfaceOp?: unknown,
   ): number {
     const seq = (this.seq += 1)
-    out.push({ type, seq, time, ...(data === undefined ? {} : { data }) })
+    out.push({
+      type,
+      seq,
+      time,
+      ...(data === undefined ? {} : { data }),
+      ...(surfaceOp === undefined ? {} : { surfaceOp }),
+    })
+    return seq
+  }
+
+  /** Emit a surface-bearing event and remember its seq for the compaction claim. */
+  private emitSurface(
+    out: TimelineEvent[],
+    type: string,
+    time: number,
+    data: Record<string, unknown>,
+    surfaceOp?: unknown,
+    replay = false,
+  ): number {
+    // `replay` rides the envelope: the fold surfaces the copy but skips every
+    // kind of bookkeeping (request record, usage, human-input tally, inject
+    // event) — the original emission was already booked.
+    const seq = this.emit(out, type, time, replay ? { ...data, replay: true } : data, surfaceOp)
+    this.liveSeqs.push(seq)
+    if (replay) this.replaySeqs.push(seq)
     return seq
   }
 
@@ -143,29 +188,54 @@ class DevinSynthesizer implements EventSynthesizer {
   private onMsg(record: Extract<DevinRecord, { tag: 'msg' }>, time: number, out: TimelineEvent[]): void {
     const msg = record.msg
     const stamp = msgInstant(msg, 'created_at', time)
-    switch (asString(msg['role'])) {
-      case 'system':
+    const role = asString(msg['role'])
+    // A message_id the source already emitted once reaches us again only as a
+    // post-compaction render's kept copy: it re-enters the surface but is not a
+    // new turn/step/call, and the render's own summary must not claim it.
+    const mid = asString(msg['message_id'])
+    const replay = mid !== undefined && this.seenMids.has(mid)
+    if (mid !== undefined) this.seenMids.add(mid)
+    if (role === 'system') {
+      const ext = msgExt(msg)
+      const injectKey = ext === undefined ? undefined : Object.keys(ext)[0]
+      if (ext?.['devin-rs/summary'] === undefined && injectKey === undefined) {
         this.onSystem(msg, stamp, out)
         return
+      }
+      this.prefixRun = false
+      if (ext?.['devin-rs/summary'] !== undefined) {
+        this.onCompaction(msg, stamp, out, replay)
+        return
+      }
+      if (injectKey !== undefined) this.onSystemInject(msg, stamp, out, injectKey, replay)
+      return
+    }
+    this.prefixRun = false
+    switch (role) {
       case 'user':
-        this.onUser(msg, stamp, out)
+        this.onUser(msg, stamp, out, replay)
         return
       case 'assistant':
-        this.onAssistant(msg, stamp, out)
+        this.onAssistant(msg, stamp, out, replay)
         return
       case 'tool':
-        this.onResult(msg, stamp, out)
+        this.onResult(msg, stamp, out, replay)
         return
       default:
         return
     }
   }
 
-  /** System segments accumulate into the header's `system` text. */
+  /**
+   * A contiguous run of extension-less `system` nodes is one render's system
+   * prefix (the prompt is written in parts); a later run is a newer render's
+   * prefix and replaces it rather than accumulating.
+   */
   private onSystem(msg: Record<string, unknown>, time: number, out: TimelineEvent[]): void {
     const text = msgText(msg)
     if (text.trim() === '') return
-    this.systemText = this.systemText === undefined ? text : `${this.systemText}\n\n${text}`
+    this.systemText = this.systemText === undefined || !this.prefixRun ? text : `${this.systemText}\n\n${text}`
+    this.prefixRun = true
     this.emit(out, 'request/header', time, {
       header: {
         system: this.systemText,
@@ -176,22 +246,71 @@ class DevinSynthesizer implements EventSynthesizer {
     this.headerEmitted = true
   }
 
-  private onUser(msg: Record<string, unknown>, time: number, out: TimelineEvent[]): void {
+  /**
+   * An extension-bearing `system` node is an injected context block (rules,
+   * skills, workspace context, user-edits reports), not part of the prefix.
+   * Re-injection under the same extension key replaces the stale block — the
+   * render keeps only the latest version.
+   */
+  private onSystemInject(
+    msg: Record<string, unknown>,
+    time: number,
+    out: TimelineEvent[],
+    key: string,
+    replay: boolean,
+  ): void {
+    const text = msgText(msg)
+    if (text.trim() === '') return
+    const prev = this.injectSeqs.get(key)
+    const op = prev !== undefined && this.liveSeqs.includes(prev)
+      ? { op: 'replace', startSeq: prev, endSeq: prev }
+      : undefined
+    const seq = this.emitSurface(out, 'user/message', time, {
+      content: [{ type: 'text', text }],
+      // `plugin` carries the label — the fold's injectionSourceName reads it
+      // over `kind`; `name` keeps the full extension key for identity.
+      source: { kind: 'inject', form: 'context', name: key, plugin: key.split('/').pop() ?? key },
+    }, op, replay)
+    this.injectSeqs.set(key, seq)
+  }
+
+  private onUser(msg: Record<string, unknown>, time: number, out: TimelineEvent[], replay: boolean): void {
     const cls = devinMessageClass(msg)
     const text = msgText(msg)
     const content: ContentBlock[] = text === '' ? [] : [{ type: 'text', text }]
     const source: MessageSource = cls?.kind === 'human'
       ? { kind: 'user' }
       : { kind: 'inject', form: 'context', name: cls?.name ?? 'user' }
-    if (cls?.kind === 'human') {
+    if (cls?.kind === 'human' && !replay) {
       this.turn += 1
       this.step = 0
       if (this.label === undefined && text.trim() !== '') this.label = titleFrom(text, LABEL_MAX)
     }
-    this.emit(out, 'user/message', time, { content, source })
+    this.emitSurface(out, 'user/message', time, { content, source }, undefined, replay)
   }
 
-  private onAssistant(msg: Record<string, unknown>, time: number, out: TimelineEvent[]): void {
+  private onAssistant(msg: Record<string, unknown>, time: number, out: TimelineEvent[], replay: boolean): void {
+    if (replay) {
+      // A kept copy: surface the content again, but turn/step/usage/calls were
+      // already booked when the original emitted.
+      const blocks: ContentBlock[] = []
+      const thinking = msg['thinking']
+      const thinkText = isRecord(thinking) ? asString(thinking['thinking']) : asString(thinking)
+      if (thinkText !== undefined && thinkText !== '') blocks.push({ type: 'reasoning', text: thinkText })
+      const text = msgText(msg)
+      if (text !== '') blocks.push({ type: 'text', text })
+      for (const call of asArray(msg['tool_calls']) ?? []) {
+        if (!isRecord(call)) continue
+        const fn = isRecord(call['function']) ? call['function'] : undefined
+        const id = asString(call['id'])
+        const name = asString(call['name']) ?? asString(fn?.['name'])
+        const args = call['arguments'] ?? fn?.['arguments']
+        if (id === undefined || name === undefined) continue
+        blocks.push({ type: 'tool-call', callId: id, name, arguments: typeof args === 'string' ? args : JSON.stringify(args ?? {}) })
+      }
+      this.emitSurface(out, 'assistant/message', time, { message: { content: blocks } }, undefined, true)
+      return
+    }
     if (this.turn === 0) this.turn = 1
     this.step += 1
     const started = msgInstant(msg, 'started_generation_at', time)
@@ -229,7 +348,7 @@ class DevinSynthesizer implements EventSynthesizer {
     const model = asString(msgMeta(msg)?.['generation_model'])
     if (model !== undefined) this.model = model
 
-    this.emit(out, 'assistant/message', time, {
+    this.emitSurface(out, 'assistant/message', time, {
       message: { content: blocks },
       ...(usage === undefined ? {} : { usage }),
       turn: this.turn,
@@ -258,7 +377,7 @@ class DevinSynthesizer implements EventSynthesizer {
     this.emit(out, 'step/end', time)
   }
 
-  private onResult(msg: Record<string, unknown>, time: number, out: TimelineEvent[]): void {
+  private onResult(msg: Record<string, unknown>, time: number, out: TimelineEvent[], replay: boolean): void {
     const callId = asString(msg['tool_call_id'])
     if (callId === undefined) return
     const ext = msgExt(msg)
@@ -266,8 +385,8 @@ class DevinSynthesizer implements EventSynthesizer {
     const timing = isRecord(ext?.['chisel/tool_call_timing']) ? ext['chisel/tool_call_timing'] : undefined
     const isError = resultMeta?.['success'] === false
     const text = msgText(msg)
-    this.openCalls.delete(callId)
-    this.emit(out, 'tool/result', time, {
+    if (!replay) this.openCalls.delete(callId)
+    this.emitSurface(out, 'tool/result', time, {
       message: {
         content: [{
           type: 'tool-result', toolCallId: callId, isError,
@@ -281,7 +400,8 @@ class DevinSynthesizer implements EventSynthesizer {
           ? {}
           : { durationMs: asNumber(timing?.['duration_ms']) }),
       },
-    })
+    }, undefined, replay)
+    if (replay) return
 
     // A run_subagent result names its chain: register the child under the file
     // id the sidecar resolved (else the agent id — the join still works once
@@ -302,6 +422,41 @@ class DevinSynthesizer implements EventSynthesizer {
       ...(spawn === undefined ? {} : { startedAt: spawn.time }),
       completedAt: time,
     })
+  }
+
+  /**
+   * A compaction lands as a `system` node marked `extensions['devin-rs/summary']`.
+   * Devin's compaction replaces the whole rendered history with that summary —
+   * the kept system prefix never entered liveSeqs — so every live seq is
+   * shadowed and the summary message itself carries the `replace` op that
+   * consumes the armed claim (the fold rewrites the freed-token figure).
+   * Replays emitted since the previous summary are the incoming render's kept
+   * copies — they survive this claim. A replayed summary node is just kept
+   * text: surface it without arming another claim.
+   */
+  private onCompaction(msg: Record<string, unknown>, time: number, out: TimelineEvent[], replay: boolean): void {
+    if (replay) {
+      const text = msgText(msg)
+      this.emitSurface(out, 'user/message', time, {
+        content: text === '' ? [] : [{ type: 'text', text }],
+        source: { kind: 'plugin', form: 'compaction', plugin: 'compaction' } satisfies MessageSource,
+      }, undefined, true)
+      return
+    }
+    const exempt = new Set(this.replaySeqs)
+    const shadowed = this.liveSeqs.filter(seq => !exempt.has(seq))
+    this.liveSeqs = this.replaySeqs
+    this.replaySeqs = []
+    this.injectSeqs.clear()
+    this.emit(out, 'compaction/summary', time, { shadowedSeqs: [...shadowed] })
+    const op = shadowed.length === 0
+      ? undefined
+      : { op: 'replace', startSeq: Math.min(...shadowed), endSeq: Math.max(...shadowed) }
+    const text = msgText(msg)
+    this.emitSurface(out, 'user/message', time, {
+      content: text === '' ? [] : [{ type: 'text', text }],
+      source: { kind: 'plugin', form: 'compaction', plugin: 'compaction' } satisfies MessageSource,
+    }, op)
   }
 }
 

@@ -63,6 +63,9 @@ Data flow: a `SessionSource` finds transcript content (files for fs harnesses, v
 streams for Devin) → SSE replays raw lines → the browser
 feeds each line to the core adapter (Trajectory) and the context synthesizer (Context tab).
 Both parsers are incremental and must never throw on a malformed or unknown record.
+EventSource auto-reconnects after a drop and the server replays the whole stream on the
+new socket — `openSessionStream`'s `onReconnect` fires then and the session runtime must
+refold from empty, or every record lands twice.
 
 ## Conventions
 
@@ -155,14 +158,26 @@ kind in `index.ts` to stamp those facts.
 - Devin: no files — `sessions.db` (WAL, live-written) holds `sessions`, `message_nodes`,
   `tool_call_state`; `subagent_heads` exists but is empty in practice. Column timestamps
   are epoch SECONDS; `chat_message.metadata.created_at`/`started_generation_at` are ISO
-  ms. `message_nodes` is a forest that re-renders context as copied chains: dedupe by
-  `message_id` (first `row_id` wins) and group chains by union-find over
-  `parent_node_id` + `compact/prior_node_ids` + shared `message_id`; the group holding
-  `main_chain_id` is the main stream, every other group is a child `agent-<min row_id>`
-  stream (compactor chains surface as children but never bind a spawn). A child names its
-  agent from the `subagent/agent_id`/`chain_node_id`/`profile_name` extensions on the
-  `run_subagent` result, which can arrive after the child's lines. Human vs injected is
-  `metadata.is_user_input`; usage lives in `metadata.metrics`, tool wall time in
-  `chisel/tool_call_timing.duration_ms`, and ACP state in `tool_call_state` (settles a
-  call whose result message never landed). `devin.session`/`devin.tool` are synthetic
-  sidecar lines (`startLine: -1`, never indexed).
+  ms. `message_nodes` is a forest that re-renders context as copied chains: group them by
+  union-find over `parent_node_id` + `compact/prior_node_ids` + shared `message_id`; the
+  group holding `main_chain_id` is the main stream. Other groups are NOT automatically
+  children — compactor/render chains look identical to subagent chains — so unclaimed
+  groups buffer as `pending` and surface only when a `subagent_heads` row or a spawn
+  result's `subagent/agent_id`/`chain_node_id`/`profile_name` extensions claim them
+  (claims can land after the child's lines; the child file is `agent-<agentId>`). Dedup
+  is per `(message_id, stream, compaction epoch)`: a `system` node with
+  `extensions['devin-rs/summary']` ends a render — copies of pre-summary mids then
+  re-emit because they are kept context, and the summary's chain ancestors (re-rendered
+  prefix, kept injections) flush with it. `system` splits by extension: none = rendered
+  prefix (each render rewrites it — a new contiguous run replaces the header text),
+  `devin-rs/summary` = compaction, anything else = an injected block
+  (`agent-ext/rules-loaded`, `agent-ext/skills-loaded`, `affogato/cog-context`,
+  `chisel/user-edits-*`; a re-injection under the same key replaces the stale one).
+  Replays re-enter the fold surface carrying `data.replay: true` — the fold surfaces
+  the copy but skips all bookkeeping (request record, usage, step timing, human-input
+  tally, inject re-listing); they are exempt from the claim that produced them and are
+  not re-indexed for search. Human
+  vs injected is `metadata.is_user_input`; usage lives in `metadata.metrics`, tool wall
+  time in `chisel/tool_call_timing.duration_ms`, and ACP state in `tool_call_state`
+  (settles a call whose result message never landed). `devin.session`/`devin.tool` are
+  synthetic sidecar lines (`startLine: -1`, never indexed).

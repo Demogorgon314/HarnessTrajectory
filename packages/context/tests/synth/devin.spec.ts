@@ -92,6 +92,26 @@ const toolMsg = (callId: string, text: string, ext: Record<string, unknown> = {}
     },
   }, s)
 
+const summaryMsg = (text: string, mid = '') => (node: number, s: number) => msg(node, {
+  message_id: `sum-${node}${mid}`,
+  role: 'system',
+  content: [{ type: 'text', text }],
+  metadata: {
+    created_at: iso(s),
+    extensions: { 'devin-rs/summary': { source: 'async_file_compactor' } },
+  },
+}, s)
+
+const sysInjectMsg = (text: string, ext: string) => (node: number, s: number) => msg(node, {
+  message_id: `si-${node}`,
+  role: 'system',
+  content: [{ type: 'text', text }],
+  metadata: {
+    created_at: iso(s),
+    extensions: { [ext]: {} },
+  },
+}, s)
+
 const sidecar = (overrides: Record<string, unknown> = {}): string => JSON.stringify({
   t: 'devin.session',
   sessionId: SESSION_ID,
@@ -184,6 +204,48 @@ describe('devin synthesizer', () => {
     expect(child?.agentType).toBe('explore')
   })
 
+  it('a devin-rs/summary system node shadows the live surface as a compaction', () => {
+    const synth = createDevinSynthesizer(MAIN)
+    const events = feed(synth, [
+      systemMsg('You are Devin.')(1, 0),
+      humanMsg('turn one')(2, 1),
+      assistantMsg({ text: 'working', calls: [{ id: 'c1', name: 'shell' }] })(3, 2),
+      toolMsg('c1', 'long output')(4, 3),
+      summaryMsg('You are continuing work from a previous conversation thread.')(5, 4),
+      humanMsg('turn two')(6, 5),
+      assistantMsg({ text: 'ok' })(7, 6),
+    ])
+    const compaction = events.find(event => event.type === 'compaction/summary')
+    expect(compaction).toBeDefined()
+    // user + assistant + tool-result nodes are shadowed; the header seq is not
+    // a surface node and survives.
+    const shadowed = compaction?.data?.['shadowedSeqs'] as number[]
+    expect(shadowed).toHaveLength(3)
+    const summary = events[events.indexOf(compaction!) + 1]
+    expect(summary?.type).toBe('user/message')
+    expect(summary?.data?.['source']).toEqual({ kind: 'plugin', form: 'compaction', plugin: 'compaction' })
+    expect(summary?.['surfaceOp']).toEqual({ op: 'replace', startSeq: shadowed[0], endSeq: shadowed[shadowed.length - 1] })
+    // The summary text must not leak into the system header.
+    const headers = events.filter(event => event.type === 'request/header')
+    expect(headers).toHaveLength(1)
+    expect((headers[0]?.data?.['header'] as { system: string }).system).toBe('You are Devin.')
+    // Life continues: post-compaction messages are surface nodes again.
+    const users = events.filter(event => event.type === 'user/message')
+    expect(users).toHaveLength(3) // turn one + summary + turn two
+  })
+
+  it('a summary node with an empty surface still emits the compaction marker', () => {
+    const synth = createDevinSynthesizer(MAIN)
+    const events = feed(synth, [
+      summaryMsg('continuing')(1, 0),
+      humanMsg('hi')(2, 1),
+    ])
+    const compaction = events.find(event => event.type === 'compaction/summary')
+    expect(compaction?.data?.['shadowedSeqs']).toEqual([])
+    const summary = events[events.indexOf(compaction!) + 1]
+    expect(summary?.['surfaceOp']).toBeUndefined()
+  })
+
   it('accumulates system segments into the header', () => {
     const synth = createDevinSynthesizer(MAIN)
     const events = feed(synth, [
@@ -195,6 +257,102 @@ describe('devin synthesizer', () => {
     expect(headers).toHaveLength(2)
     expect((headers[1]?.data?.['header'] as { system: string }).system).toBe('Part one.\n\nPart two.')
     expect(headers[1]?.data?.['reason']).toBe('change')
+  })
+
+  it('routes extension-bearing system nodes to injected context, and a new prefix run replaces the header', () => {
+    const synth = createDevinSynthesizer(MAIN)
+    const events = feed(synth, [
+      systemMsg('Prefix v1 part one.')(1, 0),
+      systemMsg('Prefix v1 part two.')(2, 0),
+      sysInjectMsg('<rules>v1</rules>', 'agent-ext/rules-loaded')(3, 1),
+      humanMsg('hi')(4, 2),
+      assistantMsg({ text: 'ok' })(5, 3),
+      // A later render rewrites the prefix and re-injects the rules block.
+      systemMsg('Prefix v2.')(6, 4),
+      sysInjectMsg('<rules>v2</rules>', 'agent-ext/rules-loaded')(7, 5),
+    ])
+    const headers = events.filter(event => event.type === 'request/header')
+    expect(headers).toHaveLength(3)
+    expect((headers[1]?.data?.['header'] as { system: string }).system)
+      .toBe('Prefix v1 part one.\n\nPrefix v1 part two.')
+    expect((headers[2]?.data?.['header'] as { system: string }).system).toBe('Prefix v2.')
+    const users = events.filter(event => event.type === 'user/message')
+    expect(users).toHaveLength(3)
+    expect(users[0]?.data?.['source']).toMatchObject({ kind: 'inject', name: 'agent-ext/rules-loaded', plugin: 'rules-loaded' })
+    // The second injection replaces the first — it must not double-count.
+    expect(users[2]?.['surfaceOp']).toMatchObject({
+      op: 'replace',
+      startSeq: users[0]?.['seq'],
+      endSeq: users[0]?.['seq'],
+    })
+  })
+
+  it('keeps render copies alive across the claim: replays re-enter the surface and escape the shadow', () => {
+    const synth = createDevinSynthesizer(MAIN)
+    const events = feed(synth, [
+      systemMsg('You are Devin.')(1, 0),
+      humanMsg('first task')(2, 1),
+      assistantMsg({ text: 'working' })(3, 2),
+      summaryMsg('summary one.')(5, 4),
+      // Kept copy of 'first task' in the next render — same message_id (u-2),
+      // so the source re-emits it past the summary boundary.
+      humanMsg('first task')(2, 5),
+      assistantMsg({ text: 'post' })(6, 6),
+      summaryMsg('summary two.')(8, 7),
+      assistantMsg({ text: 'later' })(9, 8),
+    ])
+    const compactions = events.filter(event => event.type === 'compaction/summary')
+    expect(compactions).toHaveLength(2)
+    // The second claim shadows the live originals but not the kept copy.
+    const claim2 = compactions[1]?.data?.['shadowedSeqs'] as number[]
+    const users = events.filter(event => event.type === 'user/message')
+    const keptCopy = users.find(
+      event => (event.data?.['content'] as { text?: string }[] | undefined)?.[0]?.text === 'first task'
+        && event.seq > (compactions[0]?.seq ?? 0),
+    )
+    expect(keptCopy).toBeDefined()
+    expect(claim2).not.toContain(keptCopy?.seq)
+    // A replay is not a new turn: 'later' still sits in turn 1 — the replayed
+    // human input must not bump the counter.
+    const later = events.filter(event => event.type === 'assistant/message').at(-1)
+    expect(later?.data?.['turn']).toBe(1)
+    expect(keptCopy?.data?.['source']).toMatchObject({ kind: 'user' })
+    // The replay marker rides the envelope so the fold surfaces the copy
+    // without minting a request record or a second human input.
+    expect(keptCopy?.data?.['replay']).toBe(true)
+  })
+
+  it('marks every replayed copy — user, assistant, tool, inject — with data.replay', () => {
+    const synth = createDevinSynthesizer(MAIN)
+    const events = feed(synth, [
+      systemMsg('You are Devin.')(1, 0),
+      sysInjectMsg('<rules>v1</rules>', 'agent-ext/rules-loaded')(2, 1),
+      humanMsg('task')(3, 2),
+      assistantMsg({ text: 'working', calls: [{ id: 'c-1', name: 'exec', args: '{}' }] })(4, 3),
+      toolMsg('c-1', 'done')(5, 4),
+      // The next render's chain keeps all four — the copies are the summary
+      // node's ancestors, so they arrive BEFORE it with the same message_ids
+      // (a copy reuses its original's node number).
+      sysInjectMsg('<rules>v1</rules>', 'agent-ext/rules-loaded')(2, 5),
+      humanMsg('task')(3, 6),
+      assistantMsg({ text: 'working', calls: [{ id: 'c-1', name: 'exec', args: '{}' }] })(4, 7),
+      toolMsg('c-1', 'done')(5, 8),
+      summaryMsg('summary.')(7, 9),
+      assistantMsg({ text: 'post' })(8, 10),
+    ])
+    const replays = events.filter(event => event.data?.['replay'] === true)
+    // The kept inject + kept human + kept assistant + kept tool result.
+    expect(replays.map(event => event.type)).toEqual([
+      'user/message', 'user/message', 'assistant/message', 'tool/result',
+    ])
+    // The replayed inject REPLACES the original block (the render supersedes
+    // it), so its surfaceOp points at the first copy — not appended alongside.
+    const injectReplay = replays[0]
+    expect(injectReplay?.['surfaceOp']).toMatchObject({ op: 'replace' })
+    // And the claim the summary arms exempts all four copies — they are the
+    // incoming render's surface, not the outgoing one's.
+    const claim = events.find(event => event.type === 'compaction/summary')?.data?.['shadowedSeqs'] as number[]
+    for (const event of replays) expect(claim).not.toContain(event.seq)
   })
 
   it('never throws on malformed lines', () => {

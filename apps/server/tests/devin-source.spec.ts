@@ -169,6 +169,47 @@ describe('DevinSource', () => {
     expect(again).toEqual(msgs)
   })
 
+  it('re-emits render copies past a summary boundary — ancestors and descendants', async () => {
+    const db = fixture()
+    createStore(db)
+    insertSession(db, 'alpha')
+    // Live chain.
+    insertNode(db, 'alpha', 1, null, userMsg('u1', 'first task'))
+    insertNode(db, 'alpha', 2, 1, assistantMsg('a1', 'working'))
+    insertNode(db, 'alpha', 3, 2, {
+      message_id: 'sys1', role: 'system',
+      content: [{ type: 'text', text: 'You are Devin.' }],
+      metadata: { created_at: '2023-11-14T22:13:20.000Z' },
+    })
+    // Compaction render: a new chain re-copying the kept context — the system
+    // prefix lands as an ANCESTOR of the summary, the kept user message as a
+    // DESCENDANT (both share the originals' message_ids).
+    insertNode(db, 'alpha', 10, null, {
+      message_id: 'sys1', role: 'system',
+      content: [{ type: 'text', text: 'You are Devin.' }],
+      metadata: { created_at: '2023-11-14T22:13:23.000Z' },
+    }, 1_700_000_100)
+    insertNode(db, 'alpha', 11, 10, {
+      message_id: 's1', role: 'system',
+      content: [{ type: 'text', text: 'continuing work summary' }],
+      metadata: {
+        created_at: '2023-11-14T22:13:24.000Z',
+        extensions: { 'devin-rs/summary': { source: 'async_file_compactor' } },
+      },
+    }, 1_700_000_100)
+    insertNode(db, 'alpha', 12, 11, userMsg('u1', 'first task'), 1_700_000_100)
+    insertNode(db, 'alpha', 13, 12, assistantMsg('a2', 'after'), 1_700_000_200)
+    db.close()
+    const src = await start()
+    const msgs = linesOf(await replay(src, 'alpha'))
+      .flatMap(chunk => chunk.lines)
+      .filter(line => line.includes('devin.msg'))
+      .map(line => JSON.parse(line).msg.message_id as string)
+    // u1's copy re-emits past the boundary; sys1's copy flushes with the
+    // summary's render ancestors. a2 is a fresh post-summary node.
+    expect(msgs).toEqual(['u1', 'a1', 'sys1', 'sys1', 's1', 'u1', 'a2'])
+  })
+
   it('emits a synthetic sidecar (startLine -1) plus tool state', async () => {
     const db = fixture()
     createStore(db)
@@ -211,18 +252,71 @@ describe('DevinSource', () => {
     const children = detail?.files.filter(file => file.role === 'child') ?? []
     expect(children).toHaveLength(1)
     const child = children[0]
-    // fileId is `agent-<smallest row_id in the chain group>` — merge-stable.
-    expect(child?.id).toBe('agent-3')
+    // fileId is `agent-<agentId>` — identical for a fresh scan, a live poll,
+    // and a restart (a row-derived group key is not).
+    expect(child?.id).toBe('agent-d4bf017')
     expect(child?.agent?.agentId).toBe('d4bf017')
-    expect(src.hasChild('devin', 'alpha', 'agent-3')).toBe(true)
+    expect(src.hasChild('devin', 'alpha', 'agent-d4bf017')).toBe(true)
     // Standalone child replay serves only the child's lines.
-    const childLines = linesOf(await replay(src, 'alpha', 'agent-3'))
+    const childLines = linesOf(await replay(src, 'alpha', 'agent-d4bf017'))
       .flatMap(chunk => chunk.lines)
     expect(childLines.filter(line => line.includes('subagent of Devin'))).toHaveLength(1)
     expect(childLines.filter(line => line.includes('survey the repo'))).toHaveLength(1)
     // Main replay includes main lines AND child lines merged chronologically.
     const all = linesOf(await replay(src, 'alpha')).flatMap(chunk => chunk.lines)
     expect(all.filter(line => line.includes('devin.msg'))).toHaveLength(6)
+  })
+
+  it('keeps unclaimed chains (compactor renders) out of the child list', async () => {
+    const db = fixture()
+    createStore(db)
+    insertSession(db, 'alpha')
+    insertNode(db, 'alpha', 1, null, userMsg('u1', 'hi'))
+    // A summarizer context chain: disjoint tree, nothing claims it.
+    insertNode(db, 'alpha', 10, null, {
+      message_id: 's-sys', role: 'system',
+      content: 'You are a Summarizer that summarizes conversation history',
+      metadata: {},
+    })
+    insertNode(db, 'alpha', 11, 10, userMsg('s-ctx', 'summarize this', false))
+    insertNode(db, 'alpha', 2, 1, assistantMsg('a1', 'reply'))
+    db.close()
+    const src = await start()
+    const detail = src.get('devin', 'alpha')
+    expect(detail?.files.filter(file => file.role === 'child')).toHaveLength(0)
+    const all = linesOf(await replay(src, 'alpha')).flatMap(chunk => chunk.lines)
+    expect(all.filter(line => line.includes('devin.msg'))).toHaveLength(2)
+    expect(all.some(line => line.includes('Summarizer'))).toBe(false)
+  })
+
+  it('materializes a chain late-claimed by a spawn result with its backlog', async () => {
+    const db = fixture()
+    createStore(db)
+    insertSession(db, 'alpha', { main_chain_id: 1 })
+    insertNode(db, 'alpha', 1, null, userMsg('u1', 'delegate'))
+    insertNode(db, 'alpha', 2, 1, assistantMsg('a1', 'spawning', [{ id: 'spawn-1', name: 'run_subagent' }]))
+    // The chain starts before its claim lands (a live run in flight).
+    insertNode(db, 'alpha', 10, null, { message_id: 'c-sys', role: 'system', content: 'subagent prompt', metadata: {} })
+    insertNode(db, 'alpha', 11, 10, userMsg('c-task', 'survey', false))
+    db.close()
+    const src = await start()
+    // Unclaimed so far: invisible.
+    expect(src.get('devin', 'alpha')?.files.filter(file => file.role === 'child')).toHaveLength(0)
+    const write = new DevinDb(dbPath, { readOnly: false })
+    insertNode(write, 'alpha', 3, 2, toolMsg('r1', 'spawn-1', 'done', {
+      'subagent/agent_id': 'late007',
+      'subagent/chain_node_id': 10,
+    }))
+    write.db.prepare(`UPDATE sessions SET last_activity_at = 1700000500 WHERE id = 'alpha'`).run()
+    write.close()
+    await src.refresh()
+    const detail = src.get('devin', 'alpha')
+    const child = detail?.files.find(file => file.role === 'child')
+    expect(child?.agent?.agentId).toBe('late007')
+    const childLines = linesOf(await replay(src, 'alpha', child?.id)).flatMap(chunk => chunk.lines)
+    // The buffered backlog landed in order.
+    expect(childLines.filter(line => line.includes('devin.msg'))).toHaveLength(2)
+    expect(childLines[0]).toContain('subagent prompt')
   })
 
   it('picks up appended rows and new sessions on refresh', async () => {

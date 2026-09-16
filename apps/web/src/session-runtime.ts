@@ -101,6 +101,9 @@ export class SessionRuntime {
     this.stream?.close()
     this.stream = openSessionStream(this.kind, this.id, {
       onEvent: event => { this.handle(event) },
+      onReconnect: () => {
+        if (!this.closed) this.rebuild()
+      },
       onError: () => {
         this.patch({ connected: false })
       },
@@ -155,17 +158,26 @@ export class SessionRuntime {
     this.patch({ files: next })
   }
 
-  /** The server truncated or rewrote a file: rebuild from scratch by reopening the stream. */
-  private reset(): void {
+  /**
+   * Drop folded state without touching the stream — the server replays the
+   * session from the top on a reconnected socket, so the parsers must refold
+   * from empty before those events land or every record folds twice.
+   */
+  private rebuild(): void {
     this.parser = createSessionParser(this.kind)
     this.context = new ContextSession(this.kind)
     this.lineCount = 0
-    this.stream?.close()
     this.patch({
       snapshot: EMPTY_TRAJECTORY_SNAPSHOT, loading: true, lines: 0, files: [], subagents: [],
       meta: this.parser.meta(),
       contextRevision: this.context.revision,
     })
+  }
+
+  /** The server truncated or rewrote a file: rebuild from scratch by reopening the stream. */
+  private reset(): void {
+    this.rebuild()
+    this.stream?.close()
     this.start()
   }
 

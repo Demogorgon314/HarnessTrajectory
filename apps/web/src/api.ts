@@ -127,11 +127,22 @@ export function openSessionStream(
   handlers: {
     onEvent: (event: SessionLiveEvent) => void
     onError?: (error: Event) => void
+    /**
+     * The connection dropped and EventSource re-established it — the server
+     * replays the whole stream on the new socket, so folded state must be
+     * rebuilt before the replayed events land or every record counts twice.
+     */
+    onReconnect?: () => void
   },
   options: { file?: string | undefined } = {},
 ): LiveStream {
   const suffix = options.file === undefined ? '' : `?file=${encodeURIComponent(options.file)}`
   const source = new EventSource(`/api/sessions/${kind}/${encodeURIComponent(id)}/events${suffix}`)
+  let opened = false
+  source.onopen = () => {
+    if (opened) handlers.onReconnect?.()
+    opened = true
+  }
   const forward = (message: MessageEvent<string>) => {
     if (message.data === '') return
     let event: SessionLiveEvent

@@ -18,9 +18,12 @@
  *   serialized ACP `ToolCall`/`ToolCallUpdate`. Synthetic; re-sent when the
  *   row changes (the update column lands late).
  *
- * Stream layout: `devin://sessions/<id>` is the main stream; subagent chains —
- * the forest components disjoint from the main chain — are child streams
- * `devin://sessions/<id>/<fileId>` with `fileId = 'agent-<firstRowId>'`.
+ * Stream layout: `devin://sessions/<id>` is the main stream; a disjoint chain
+ * becomes the child stream `devin://sessions/<id>/agent-<agentId>` once
+ * claimed — by a `subagent_heads` row or a spawn result's `subagent/*`
+ * extensions. Unclaimed chains (context renders, compactor/summarizer passes)
+ * buffer as `pending` and never appear: a claim drains the backlog in order,
+ * a merge into the main chain drains it there.
  *
  * Chain membership (see db.ts header): a union-find over `parent_node_id`,
  * `compact/prior_node_ids` and shared `message_id`s groups render trees into
@@ -29,6 +32,15 @@
  * emitted lines, the earlier attribution was wrong, so the session is
  * re-materialized with `file reset` (deterministic rebuild, cheap at this
  * size).
+ *
+ * Compaction epochs: a `system` node carrying `extensions['devin-rs/summary']`
+ * closes one render and opens the next. Dedup is per `(message_id, stream,
+ * epoch)` — a mid emitted before the latest summary re-emits once afterward,
+ * because a render copy of a shadowed message is kept context, not a dup.
+ * Copies that are ancestors of the summary node itself (the render's prefix
+ * and kept injections) emit with it via `emitRenderAncestors`; same-epoch
+ * copies of still-live messages stay deduped, and re-emissions skip search
+ * indexing so the index never double-counts.
  */
 
 import { EventEmitter } from 'node:events'
@@ -65,13 +77,12 @@ interface DevinEntry extends SourceEntry {
 }
 
 /**
- * Union-find over message nodes. Roots carry the smallest `row_id` seen in the
- * group — a merge-stable identity used for the child file id — and the entry
- * already emitting the group, so an emitted-lines merge is detectable.
+ * Union-find over message nodes. Roots carry the entry already emitting the
+ * group, so an emitted-lines merge is detectable. (The child file id comes
+ * from the claiming agent id, not the group — see `childEntry`.)
  */
 class ChainGroups {
   private readonly parent = new Map<number, number>()
-  private readonly minRow = new Map<number, number>()
   private readonly emitted = new Map<number, DevinEntry>()
 
   find(node: number): number {
@@ -89,10 +100,9 @@ class ChainGroups {
     return root
   }
 
-  add(node: number, rowId: number): void {
+  add(node: number): void {
     if (this.parent.has(node)) return
     this.parent.set(node, node)
-    this.minRow.set(node, rowId)
   }
 
   /** Entry (if any) already emitting for the node's group. */
@@ -105,11 +115,6 @@ class ChainGroups {
     this.emitted.set(this.find(node), entry)
   }
 
-  /** Merge-stable identity of the node's group: the smallest row_id in it. */
-  groupKey(node: number): number {
-    return this.minRow.get(this.find(node)) ?? 0
-  }
-
   /**
    * Union two nodes. Returns `false` when the merge joined two groups that
    * each already emitted lines — the earlier attribution is void, caller must
@@ -117,16 +122,15 @@ class ChainGroups {
    */
   union(a: number | null, b: number | null): boolean {
     if (a === null || b === null) return true
-    this.add(a, this.minRow.get(a) ?? 0)
-    this.add(b, this.minRow.get(b) ?? 0)
-    let ra = this.find(a)
-    let rb = this.find(b)
+    this.add(a)
+    this.add(b)
+    const ra = this.find(a)
+    const rb = this.find(b)
     if (ra === rb) return true
     const ea = this.emitted.get(ra)
     const eb = this.emitted.get(rb)
     if (ea !== undefined && eb !== undefined && ea !== eb) return false
     this.parent.set(ra, rb)
-    this.minRow.set(rb, Math.min(this.minRow.get(ra) ?? 0, this.minRow.get(rb) ?? 0))
     const entry = ea ?? eb
     if (entry !== undefined) this.emitted.set(rb, entry)
     return true
@@ -139,6 +143,8 @@ interface ParsedNode {
   record: Record<string, unknown>
   messageId: string | null
   priors: number[]
+  /** Carries `extensions['devin-rs/summary']` — emitting one to main ends an epoch. */
+  compaction: boolean
   time: number
   line: string
 }
@@ -149,12 +155,22 @@ interface DevinSessionState {
   groups: ChainGroups
   /** message_id → a node already carrying it (identity edges). */
   midAnchor: Map<string, number>
-  /** message_ids already emitted. */
-  emitted: Set<string>
+  /**
+   * Dedup key (message_id, else `node:<id>`) → owner entry → compaction epoch
+   * at emit time. A key may emit to main AGAIN once a summary node has landed:
+   * everything emitted before a compaction leaves the rendered context, so a
+   * later render carrying the same message_id is a kept copy — real context
+   * the fold must re-count. Children and same-epoch duplicates dedupe flat.
+   */
+  emitted: Map<string, Map<DevinEntry, number>>
+  /** Summary nodes emitted to the main stream so far. */
+  summaryEpoch: number
   /** Highest row_id consumed; a regression means the store was rebuilt. */
   maxRowId: number
   /** node_id of the session's first row — the main-chain fallback root. */
   earliestNode: number
+  /** node_id → parsed row, for walking a render chain's ancestry. */
+  nodes: Map<number, ParsedNode>
   /** tool_call_id → fingerprint of the last emitted `tool_call_state` row. */
   toolFingerprints: Map<string, string>
   /** Dedup key of the last emitted sidecar line. */
@@ -167,6 +183,18 @@ interface DevinSessionState {
    * is empty in observed stores).
    */
   chainAgent: Map<number, { agentId: string; profile: string | null }>
+  /**
+   * Nodes of chain groups nothing has claimed yet (group root → rows, in row
+   * order). Devin renders extra context chains — compactor and summarizer
+   * passes — in the same forest, and only a spawn result's `subagent/*`
+   * extensions (or a `subagent_heads` row) prove a group is a real agent
+   * transcript. Unclaimed groups buffer here instead of becoming child files;
+   * a group that merges into the main chain drains to the main stream, and a
+   * never-claimed one stays invisible.
+   */
+  pending: Map<number, ParsedNode[]>
+  /** Dedup keys of the nodes in `pending` (same vocabulary as `emitted`). */
+  pendingKeys: Set<string>
 }
 
 function jsonString(value: string | null): unknown {
@@ -326,13 +354,17 @@ export class DevinSource extends EventEmitter implements SessionSource {
       row,
       groups: new ChainGroups(),
       midAnchor: new Map(),
-      emitted: new Set(),
+      emitted: new Map(),
+      summaryEpoch: 0,
       maxRowId: 0,
       earliestNode: 0,
+      nodes: new Map(),
       toolFingerprints: new Map(),
       sidecarKey: null,
       heads: new Map(),
       chainAgent: new Map(),
+      pending: new Map(),
+      pendingKeys: new Set(),
     }
     this.states.set(row.id, state)
     if (this.search !== undefined) {
@@ -348,6 +380,7 @@ export class DevinSource extends EventEmitter implements SessionSource {
 
   /** Forget a session (hidden or deleted from the store). */
   private drop(state: DevinSessionState): void {
+    this.dbg(state, `drop maxRowId=${state.maxRowId}`)
     const paths = this.book.dropSession(state.session)
     for (const path of paths) this.search?.reset(path)
     this.states.delete(state.row.id)
@@ -361,13 +394,15 @@ export class DevinSource extends EventEmitter implements SessionSource {
     const record = isRecord(message) ? message : {}
     const meta = isRecord(record['metadata']) ? record['metadata'] : {}
     const ext = isRecord(record['extensions']) ? record['extensions'] : {}
+    const msgExt = isRecord(meta['extensions']) ? meta['extensions'] : {}
     const priors: number[] = []
-    for (const bag of [ext['compact/prior_node_ids'], meta['extensions']]) {
+    for (const bag of [ext['compact/prior_node_ids'], msgExt]) {
       const list = isRecord(bag) ? bag['compact/prior_node_ids'] : undefined
       if (Array.isArray(list)) {
         for (const value of list) if (typeof value === 'number') priors.push(value)
       }
     }
+    const compaction = msgExt['devin-rs/summary'] !== undefined || ext['devin-rs/summary'] !== undefined
     const metaCreated = Date.parse(asString(meta['created_at']) ?? '')
     const time = Number.isNaN(metaCreated) ? row.created_at * 1000 : metaCreated
     const messageId = asString(record['message_id']) ?? null
@@ -376,7 +411,7 @@ export class DevinSource extends EventEmitter implements SessionSource {
     const line = `{"t":"devin.msg","node":${row.node_id},`
       + `"parent":${row.parent_node_id === null ? 'null' : row.parent_node_id},`
       + `"time":${time},"msg":${row.chat_message}}`
-    return { row, record, messageId, priors, time, line }
+    return { row, record, messageId, priors, compaction, time, line }
   }
 
   /**
@@ -411,19 +446,24 @@ export class DevinSource extends EventEmitter implements SessionSource {
     return state.groups.find(root) === state.groups.find(node)
   }
 
-  private childEntry(state: DevinSessionState, node: ParsedNode): DevinEntry {
+  private childEntry(state: DevinSessionState, node: ParsedNode): DevinEntry | null {
     const session = state.session
-    const fileId = `agent-${state.groups.groupKey(node.row.node_id)}`
-    const existing = session.children.get(fileId)
-    if (existing !== undefined) return existing
-    const path = `${DevinSource.sessionPath(session.id)}/${fileId}`
     // A subagent chain is named by `subagent_heads` when populated, else by the
     // `subagent/*` extensions on the result of the call that spawned it.
     const named = [...state.heads.entries()].find(([chainNode]) =>
       state.groups.find(chainNode) === state.groups.find(node.row.node_id))
     const learned = [...state.chainAgent.entries()].find(([chainNode]) =>
       state.groups.find(chainNode) === state.groups.find(node.row.node_id))
-    const agentId = named?.[1] ?? learned?.[1].agentId ?? fileId
+    const agentId = named?.[1] ?? learned?.[1].agentId
+    if (agentId === undefined) return null
+    // The file is named by the claimed agent id, not a row-derived group key:
+    // the key depends on WHICH members were visible at claim time (a pending
+    // chain drains under whatever group existed then), while the agent id is
+    // identical for a fresh scan, a live poll, and a restart.
+    const fileId = `agent-${agentId}`
+    const existing = session.children.get(fileId)
+    if (existing !== undefined) return existing
+    const path = `${DevinSource.sessionPath(session.id)}/${fileId}`
     const profile = learned?.[1].profile
     const entry: DevinEntry = {
       kind: KIND,
@@ -454,13 +494,22 @@ export class DevinSource extends EventEmitter implements SessionSource {
     return entry
   }
 
-  private emitLine(state: DevinSessionState, entry: DevinEntry, node: ParsedNode): void {
+  /** Temporary forensic log; gated by HT_DEVIN_DEBUG=<path>. */
+  private dbg(state: DevinSessionState, msg: string): void {
+    const path = process.env['HT_DEVIN_DEBUG']
+    if (path === undefined) return
+    const line = `${Date.now()} ${state.row.id} ${msg}\n`
+    void import('node:fs').then(fs => fs.appendFileSync(path, line))
+  }
+
+  private emitLine(state: DevinSessionState, entry: DevinEntry, node: ParsedNode, indexable = true): void {
+    this.dbg(state, `emit entry=${entry.ref.id} node=${node.row.node_id} mid=${node.messageId} epoch=${state.summaryEpoch} via=${new Error().stack?.split('\n')[2]?.trim() ?? '?'}`)
     entry.buffered.push(node.line)
     entry.lines = entry.buffered.length
     entry.size += node.line.length + 1
     entry.mtimeMs = Math.max(entry.mtimeMs, node.time)
     entry.meta?.push(node.line)
-    if (this.search !== undefined && entry.buffered.length - 1 >= entry.searchFrom) {
+    if (indexable && this.search !== undefined && entry.buffered.length - 1 >= entry.searchFrom) {
       this.search.queue(searchKeyOf(entry), entry.buffered.length - 1, node.line)
     }
   }
@@ -495,10 +544,15 @@ export class DevinSource extends EventEmitter implements SessionSource {
    */
   private materialize(state: DevinSessionState, full = false): void {
     if (this.db === null) return
+    this.dbg(state, `materialize full=${full} maxRowId=${state.maxRowId} mainBuffered=${state.session.main?.buffered.length ?? -1}`)
     if (full) {
       state.groups = new ChainGroups()
       state.midAnchor.clear()
       state.emitted.clear()
+      state.summaryEpoch = 0
+      state.nodes.clear()
+      state.pending.clear()
+      state.pendingKeys.clear()
       state.maxRowId = 0
       for (const entry of [state.session.main, ...state.session.children.values()]) {
         if (entry === null) continue
@@ -523,15 +577,23 @@ export class DevinSource extends EventEmitter implements SessionSource {
     // attributed, so a render committed in this batch is already merged.
     for (const node of parsed) {
       const { node_id, parent_node_id } = node.row
-      state.groups.add(node_id, node.row.row_id)
-      if (!state.groups.union(node_id, parent_node_id)) return this.materialize(state, true)
+      state.nodes.set(node_id, node)
+      state.groups.add(node_id)
+      if (!state.groups.union(node_id, parent_node_id)) {
+        this.dbg(state, `union-conflict parent a=${node_id} b=${parent_node_id}`)
+        return this.materialize(state, true)
+      }
       for (const prior of node.priors) {
-        state.groups.add(prior, node.row.row_id)
-        if (!state.groups.union(node_id, prior)) return this.materialize(state, true)
+        state.groups.add(prior)
+        if (!state.groups.union(node_id, prior)) {
+          this.dbg(state, `union-conflict prior a=${node_id} b=${prior}`)
+          return this.materialize(state, true)
+        }
       }
       if (node.messageId !== null) {
         const anchor = state.midAnchor.get(node.messageId)
         if (anchor !== undefined && !state.groups.union(node_id, anchor)) {
+          this.dbg(state, `union-conflict mid a=${node_id} b=${anchor} mid=${node.messageId}`)
           return this.materialize(state, true)
         }
         state.midAnchor.set(node.messageId, node_id)
@@ -541,25 +603,138 @@ export class DevinSource extends EventEmitter implements SessionSource {
       // agent even when the chain's lines preceded the result.
       this.learnChainAgent(state, node)
     }
-    // Pass 2 — emit first occurrences in insertion order.
+    // Pass 2 — emit first occurrences in insertion order. Chains nothing has
+    // claimed yet (context renders, compactor passes) buffer until a claim or
+    // a merge into the main chain resolves them.
+    this.drainPending(state)
     const emitted = new Map<DevinEntry, ParsedNode[]>()
     for (const node of parsed) {
-      const key = node.messageId ?? `node:${node.row.node_id}`
-      if (state.emitted.has(key)) continue
       const owner = this.isMainGroup(state, node.row.node_id)
         ? state.session.main
         : this.childEntry(state, node)
-      if (owner === null) continue
-      state.emitted.add(key)
-      state.groups.claim(node.row.node_id, owner)
-      this.emitLine(state, owner, node)
-      const list = emitted.get(owner)
-      if (list === undefined) emitted.set(owner, [node])
-      else list.push(node)
+      if (owner === null) {
+        const key = node.messageId ?? `node:${node.row.node_id}`
+        if (state.pendingKeys.has(key)) continue
+        state.pendingKeys.add(key)
+        const root = state.groups.find(node.row.node_id)
+        const list = state.pending.get(root)
+        if (list === undefined) state.pending.set(root, [node])
+        else list.push(node)
+        continue
+      }
+      if (!this.tryEmitNode(state, owner, node, emitted)) continue
     }
     if (emitted.size > 0) {
       this.flushBatch(state, emitted)
       this.emit('change', KIND, state.row.id)
+    }
+  }
+
+  /**
+   * Flush buffered chain groups whose ownership resolved since they were
+   * buffered: a `subagent/*` result or a `subagent_heads` row turns the group
+   * into a child file that receives its backlog in order; a group that merged
+   * into the main chain emits to the main stream (identity-deduplicated, like
+   * every line there).
+   */
+  private drainPending(state: DevinSessionState): void {
+    if (state.pending.size === 0) return
+    const emitted = new Map<DevinEntry, ParsedNode[]>()
+    for (const [root, nodes] of [...state.pending]) {
+      const first = nodes[0]
+      if (first === undefined) {
+        state.pending.delete(root)
+        continue
+      }
+      const owner = this.isMainGroup(state, root)
+        ? state.session.main
+        : this.childEntry(state, first)
+      if (owner === null) continue
+      state.pending.delete(root)
+      for (const node of nodes) {
+        const key = node.messageId ?? `node:${node.row.node_id}`
+        state.pendingKeys.delete(key)
+        if (!this.tryEmitNode(state, owner, node, emitted)) continue
+      }
+    }
+    if (emitted.size > 0) {
+      this.flushBatch(state, emitted)
+      this.emit('change', KIND, state.row.id)
+    }
+  }
+
+  /**
+   * Emit `node`'s line to `owner` unless its dedup key already produced a line
+   * for that stream in the current compaction epoch. A key emitted to main
+   * before the latest summary re-emits once a summary has landed: everything
+   * before a compaction leaves the rendered context, so a later copy is a
+   * kept/rendered message the fold must re-count. Child streams and
+   * same-epoch duplicates dedupe flat. Returns whether a line went out.
+   */
+  private tryEmitNode(
+    state: DevinSessionState,
+    owner: DevinEntry,
+    node: ParsedNode,
+    emitted: Map<DevinEntry, ParsedNode[]>,
+  ): boolean {
+    const key = node.messageId ?? `node:${node.row.node_id}`
+    const isMain = owner === state.session.main
+    const epoch = isMain ? state.summaryEpoch : -1
+    const owners = state.emitted.get(key)
+    if (owners?.get(owner) === epoch) return false
+    // A re-emission is a render's kept copy: real context for the fold, but
+    // already indexed — queueing it again would double its search hits.
+    const indexable = owners === undefined || owners.get(owner) === undefined
+    if (owners === undefined) state.emitted.set(key, new Map([[owner, epoch]]))
+    else owners.set(owner, epoch)
+    if (node.compaction && isMain) {
+      state.summaryEpoch += 1
+      this.emitRenderAncestors(state, owner, node, emitted)
+    }
+    state.groups.claim(node.row.node_id, owner)
+    this.emitLine(state, owner, node, indexable)
+    const list = emitted.get(owner)
+    if (list === undefined) emitted.set(owner, [node])
+    else list.push(node)
+    return true
+  }
+
+  /**
+   * The render a summary closes out re-copied its kept context onto the
+   * summary's own chain — its ancestors are those copies. They precede the
+   * summary in row order, so same-epoch ones were skipped as duplicates and
+   * older ones may already sit in `pending`: flush any not yet emitted at the
+   * new epoch, oldest first, so the fold sees the render's full prefix and
+   * kept injections. Nested summaries emit flat — their epoch already ended.
+   */
+  private emitRenderAncestors(
+    state: DevinSessionState,
+    owner: DevinEntry,
+    summary: ParsedNode,
+    emitted: Map<DevinEntry, ParsedNode[]>,
+  ): void {
+    const ancestors: ParsedNode[] = []
+    const guard = new Set<number>([summary.row.node_id])
+    let cur = summary.row.parent_node_id
+    while (cur !== null && !guard.has(cur)) {
+      guard.add(cur)
+      const anc = state.nodes.get(cur)
+      if (anc === undefined) break
+      ancestors.push(anc)
+      cur = anc.row.parent_node_id
+    }
+    for (const anc of ancestors.reverse()) {
+      const key = anc.messageId ?? `node:${anc.row.node_id}`
+      const owners = state.emitted.get(key)
+      if (owners?.get(owner) === state.summaryEpoch) continue
+      const indexable = owners === undefined || owners.get(owner) === undefined
+      if (owners === undefined) state.emitted.set(key, new Map([[owner, state.summaryEpoch]]))
+      else owners.set(owner, state.summaryEpoch)
+      state.groups.claim(anc.row.node_id, owner)
+      this.emitLine(state, owner, anc, indexable)
+      const list = emitted.get(owner)
+      if (list === undefined) emitted.set(owner, [anc])
+      else list.push(anc)
     }
   }
 
@@ -703,6 +878,8 @@ export class DevinSource extends EventEmitter implements SessionSource {
         this.materialize(state)
         this.syncToolState(state)
       }
+      // A `subagent_heads` claim can land without new message rows.
+      this.drainPending(state)
       this.syncSidecar(state)
     }
     for (const state of [...this.states.values()]) {
