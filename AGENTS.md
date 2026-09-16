@@ -1,251 +1,127 @@
 # harness-trajectory — agent guide
 
-Local viewer for coding-agent sessions (Claude Code, Codex, Kimi Code, Grok Build, Devin CLI): a
-Trajectory view (ported from deepseek-harness) and a Context dashboard (ported from
-dsh-context). Everything runs on this machine; transcripts are read from the harness
-home directories and never leave it.
+Local viewer for Claude Code, Codex, Kimi Code, Grok Build, and Devin CLI sessions.
+Trajectory is ported from deepseek-harness; Context is ported from dsh-context.
+Transcripts stay local. Harness roots are read-only.
 
-## Commands
+## Working rules
+
+- Inspect the relevant implementation and tests before editing; preserve unrelated changes.
+- Keep changes focused and follow existing architecture, naming, imports, and error handling.
+- Do not commit or push unless explicitly asked. Do not add attribution lines to commit messages.
+- Before changing a harness's parsing, context, metadata, search extraction, or source lifecycle,
+  read its section in [the harness reference](docs/harness-formats.md).
+- Keep this file focused on shared rules and navigation. Put harness-specific format and
+  lifecycle details in the reference; update them when observable behavior changes.
+
+## Commands and verification
+
+Use Node ≥ 22.13 and pnpm 12 (the exact pnpm version is pinned in `package.json`).
+No linter is configured; strict TypeScript checking is required.
 
 ```sh
 pnpm install
-pnpm dev          # server on :5170 (HARNESS_TRAJECTORY_PORT) + Vite web on :5173
-pnpm test         # vitest, all projects (core, ui, context, context-ui, server, web)
-pnpm vitest run --project core   # one project
-pnpm typecheck    # tsc in every package; must be clean before you finish
-pnpm build && pnpm start         # production bundle served by the server
-pnpm pack:cli                    # npm tarball for `npx @demogorgon314/harness-trajectory`
+pnpm dev                         # API :5170 + Vite UI :5173
+pnpm vitest run --project core    # targeted project
+pnpm test                        # all six Vitest projects
+pnpm typecheck                    # all packages; must pass before finishing
+pnpm build && pnpm start          # production bundle + server
+pnpm pack:cli                     # build and pack the npm CLI tarball
 ```
 
-Node ≥ 22, pnpm 12. No linter is configured; `tsc` strictness is the lint.
+- `HARNESS_TRAJECTORY_PORT` changes the API port. During development, open Vite on :5173.
+  `pnpm dev` passes `--no-open`; the API port serves the last production UI bundle.
+- Vitest projects: `core`, `ui`, `context`, `context-ui`, `server`, `web`.
+  Run the affected projects for behavior changes and the full suite for cross-layer changes.
+- Add regression coverage in each affected behavior layer. Use synthetic records with real
+  field names and fake payloads; no fixture files. Server tests use real temporary directories.
+  Do not add tests solely for documentation or mechanical edits.
+- Run `pnpm typecheck` before finishing. Run `pnpm build` when changing build, packaging,
+  or production-serving behavior. Report checks actually run and any failures or blockers.
 
-## Layout
+## Code map
 
-```
-packages/core     contract types + one adapter per harness (packages/core/src/adapters/*.ts).
-                  Pure TS, runs in the browser and the server. HarnessKind union lives in session.ts.
-packages/ui       Trajectory view + vendored dsh primitives/theme (MIT).
-packages/context  dsh-context port (Apache-2.0; keep LICENSE + NOTICE):
-                  src/fold = vendored fold (do not change its event vocabulary),
-                  src/synth/<kind>.ts = transcript → fold events, src/client = dashboard.
-apps/server       Hono API: `src/source.ts` is the `SessionSource` contract + shared
-                  `SessionBook`/`CompositeSource`; `src/index.ts` (`SessionIndex`) is the
-                  filesystem implementation (scans harness roots, classifies files,
-                  replays + tails JSONL over SSE); `src/devin/` is the SQLite-backed
-                  implementation reading Devin CLI's `sessions.db` into virtual
-                  `devin://sessions/<id>` line streams. A composite routes kinds via
-                  each source's `kinds()` (disjoint by design) and is always attached:
-                  the Devin source self-heals — a missing/corrupt `sessions.db`
-                  degrades it to empty and a later tick re-opens and sweeps when the
-                  file appears, so a CLI installed mid-run needs no restart.
-                  src/search = SQLite FTS5 (node:sqlite, trigram, detail=none, contentless)
-                  full-text index: store.ts schema (doc text deflate-compressed in
-                  docs.text, docs.file → files.id FK), extract.ts record → docs (tool
-                  outputs capped at 4 KB), indexer.ts batched writes, query.ts the
-                  /api/search read (trigram-AND cover + inflate/verify/snippet/rank in
-                  JS — FTS phrase, snippet and bm25 are unused).
-                  Contract types live in core/src/search.ts.
-                  src/settings.ts = settings.json persistence + the /api/settings controller.
-                  contentSearch (default off; HARNESS_TRAJECTORY_SEARCH=1 forces on) decides
-                  at startup whether the index exists at all. indexer.shouldIndex enforces
-                  the retention window (searchMaxAgeDays,
-                  default 90, 0 = all) at registration; the startup sweep and
-                  applyMaxAgeDays purge what falls outside it.
-                  src/listing-cache.ts = the restart fast path: per-file consume
-                  cursors (bytes, rest, line count) + serialized meta-scanner
-                  state, so a restart re-reads only transcripts whose
-                  (size, mtime) changed, and resumes grown ones at the saved
-                  offset. Fingerprint includes the scanner version
-                  (`META_SCANNER_VERSION` in meta.ts — bump on scanner-logic
-                  changes) and, for grok, `summary.json`'s mtime; a file the
-                  search index has not fully covered (`searchFrom` below the
-                  cached line count) is re-read so its docs can flow.
-apps/web          Vite/React shell: sidebar, routes, harness registry (src/harnesses.tsx).
-```
+| Path | Responsibility |
+| --- | --- |
+| `packages/core/src/session.ts` | Session contracts, `HarnessKind`, `HARNESS_KINDS` |
+| `packages/core/src/adapters/` | Incremental harness parsers and registry; browser/server-safe TypeScript |
+| `packages/ui` | Trajectory view and vendored dsh primitives/theme (MIT) |
+| `packages/context/src/fold/` | Vendored fold; do not change its event vocabulary |
+| `packages/context/src/synth/` | Harness records → fold events, plus registry |
+| `packages/context/src/client/` | Context dashboard |
+| `apps/server/src/source.ts` | `SessionSource`, shared `SessionBook`, `CompositeSource` |
+| `apps/server/src/index.ts` | Filesystem `SessionIndex`: scan, classify, replay, tail JSONL |
+| `apps/server/src/devin/` | SQLite-backed source for virtual `devin://sessions/<id>` streams |
+| `apps/server/src/meta.ts` | Listing scanners, serializable metadata, child-agent facts |
+| `apps/server/src/search/` | Full-text index; contracts in `packages/core/src/search.ts` |
+| `apps/server/src/settings.ts` | `settings.json` persistence and settings controller |
+| `apps/server/src/listing-cache.ts` | Restart cursors and serialized scanner state |
+| `apps/web/src/harnesses.tsx` | Harness UI registry, logos, resume commands |
 
-Data flow: a `SessionSource` finds transcript content (files for fs harnesses, virtual
-streams for Devin) → SSE replays raw lines → the browser
-feeds each line to the core adapter (Trajectory) and the context synthesizer (Context tab).
-Both parsers are incremental and must never throw on a malformed or unknown record.
-EventSource auto-reconnects after a drop and the server replays the whole stream on the
-new socket — `openSessionStream`'s `onReconnect` fires then and the session runtime must
-refold from empty, or every record lands twice.
+`apps/web` is the Vite/React shell, sidebar, and routes. `packages/context` is an
+Apache-2.0 port: retain LICENSE and NOTICE. Preserve all vendored attribution.
+Logo credits live in the web registry and README license section.
 
-## Conventions
+## Cross-layer invariants
 
-- Strict TS: `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes` (spread optional
-  fields conditionally), no `any`, no non-null assertions to hide real cases. Use the
-  `isRecord/asString/asNumber/parseTime` helpers from `packages/core/src/jsonl.ts`.
-- Adapters document their verified on-disk format in the module header: transcript
-  path, harness version checked, unit traps (seconds vs ms, ids, flush order). Decide
-  human-vs-injected by a structural field, never by matching text.
-- A meta scanner's state must be serializable for the listing cache:
-  `serializeMeta`/`hydrateMeta` (meta.ts) cover `MetaState`; scanner-private
-  state (Kimi's pending Agent calls) goes through the optional `save`/`load`
-  pair. `pnpm dev` passes `--no-open` — the dev UI is Vite on :5173, and the
-  auto-opened :5170 serves only the stale production bundle.
-- Human prompt counting must agree across three places: the core adapter, the context
-  synthesizer, and the server meta scanner (`apps/server/src/meta.ts`). Share one
-  exported classifier per harness. The search extractor
-  (`apps/server/src/search/extract.ts`) is the fourth caller and must reuse the same
-  classifiers — never re-derive human-vs-injected from the text.
-- The server writes only under the cache dir (`apps/server/src/cache.ts`):
-  `search.sqlite`, `listing.sqlite` (`apps/server/src/listing-cache.ts`), and
-  `settings.json` (`apps/server/src/settings.ts`). Harness roots stay
-  read-only. The index is a cache:
-  bump `SEARCH_SCHEMA_VERSION` instead of migrating. A search hit addresses a record by
-  `(kind, sessionId, fileId, line)`, where `line` is the 0-based index of the record among
-  the file's non-blank lines — the same numbering `readLines` produces. SSE replay uses
-  that index as `startLine`. Grok's synthetic sidecar is emitted with `startLine: -1` and
-  is not a search hit, so it shifts nothing.
-- `snapshot()` returns the same object when nothing changed; touch the assembler only on
-  real changes (the UI re-renders on identity).
-- Tests: no fixture files. Each spec hand-writes synthetic records with the real field
-  names and fake payloads; server specs use real temp directories. Add tests in every
-  layer you touch.
-- Vendored code keeps its attribution; logos come from lobe-icons or Simple Icons and are
-  credited in `apps/web/src/harnesses.tsx` and the README license section.
-- Do not commit or push unless asked. No attribution lines in commit messages.
+- Flow: `SessionSource` → raw-line SSE → core adapter (Trajectory) and context synthesizer.
+  Both parsers are incremental and must not throw on malformed or unknown records.
+- SSE reconnect replays the entire stream. Reset session folding to empty on
+  `openSessionStream.onReconnect` or every record is counted twice.
+- `CompositeSource` routes disjoint harness kinds through each source's `kinds()`.
+  Always attach the Devin source: a missing/corrupt database degrades to empty and later
+  polling must recover without restarting.
+- Human prompt classification must agree across the core adapter, context synthesizer,
+  server meta scanner, and search extractor. Reuse one exported classifier per harness;
+  use structural fields, never text matching, to distinguish human and injected input.
+- `snapshot()` must retain object identity when unchanged. Touch the assembler only
+  for real changes; the UI renders on identity.
+- Use strict TS (`noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`), conditional
+  spreads for optional fields, and the `isRecord/asString/asNumber/parseTime` helpers
+  from `packages/core/src/jsonl.ts`. Do not use `any` or non-null assertions to hide cases.
+- Adapter headers document the verified transcript path, harness version, and format
+  traps such as timestamp units, IDs, and flush order.
+
+## Storage, search, and cache contracts
+
+- Server writes belong under the cache directory defined in `apps/server/src/cache.ts`:
+  `search.sqlite`, `listing.sqlite`, and `settings.json`. Never write to harness roots.
+- Search uses `node:sqlite` FTS5 with trigram, `detail=none`, and contentless storage.
+  `store.ts` keeps deflate-compressed text in `docs.text` and a `docs.file → files.id`
+  foreign key; `extract.ts` caps tool outputs at 4 KB; `indexer.ts` batches writes.
+  `query.ts` ANDs trigrams, then inflates, verifies, snippets, and ranks in JS.
+  FTS phrase queries, `snippet()`, and `bm25` are not used.
+- The search database is a cache: bump `SEARCH_SCHEMA_VERSION` instead of migrating.
+- `contentSearch` defaults off; `HARNESS_TRAJECTORY_SEARCH=1` forces it on. The setting
+  takes effect at startup; disabling it preserves any existing database on disk.
+  `searchMaxAgeDays` defaults to 90; 0 means all. `indexer.shouldIndex` enforces retention
+  at registration; the startup sweep and `applyMaxAgeDays` purge expired entries.
+- A search hit uses `(kind, sessionId, fileId, line)`. For JSONL, `line` is the zero-based
+  non-blank record index produced by `readLines`; SSE uses it as `startLine`.
+  Devin uses the emission index within its virtual stream. Grok and Devin synthetic
+  sidecars use `startLine: -1` and are never search hits or counted as stream records.
+- Listing cache stores consume cursors (bytes, rest, line count) and scanner state.
+  `serializeMeta`/`hydrateMeta` cover `MetaState`; scanner-private state uses `save`/`load`.
+  Bump `META_SCANNER_VERSION` in `meta.ts` whenever scanner logic changes.
+- Restart compares size/mtime and resumes growing files at the saved offset. Cache
+  validation also includes scanner version and Grok's `summary.json` mtime. Re-read files
+  whose search coverage (`searchFrom`) is below the cached line count.
 
 ## Adding a harness
 
-Mirror the most recent one (`git show --stat` of the Kimi or Grok commit lists every
-touchpoint): `HarnessKind` + `HARNESS_KINDS`, `adapters/<kind>.ts` + registry,
-`synth/<kind>.ts` + registry, server `roots.ts` / `classifyPath` / meta scanner /
-child binding / `search/extract.ts` branch, web registry entry with logo + resume command,
-README roots and limits, and specs in core, context, server, and web. Child listing
-titles go through `listingScannerFor` / `MetaState.agents` / `mergeChildAgent` in
-`apps/server/src/meta.ts` — a sidecar harness attaches `file.agent` at registration
-and skips the child scan; a JSONL-only harness fills the parent scanner's `agents`
-map (spawn description) and the child's own `title`/`agentType`. Do not branch on
-kind in `index.ts` to stamp those facts.
+Use an existing harness with a similar storage and subagent model as a reference.
+Check each integration point:
 
-## Harness facts that are easy to get wrong
+1. Core: `HarnessKind`, `HARNESS_KINDS`, adapter, exported classifier, adapter registry.
+2. Context: synthesizer and synthesizer registry.
+3. Server: roots, `classifyPath`, meta scanner, child binding, search extraction.
+   For a new storage backend, implement `SessionSource` and compose disjoint kinds.
+4. Web: registry entry, attributed logo, and resume command.
+5. Documentation: README roots/limits and the harness reference.
+6. Tests: affected core, context, server, and web behavior.
 
-- Claude: context window is not recorded; assume 200k, 1M when the model tag is `[1m]`.
-  A main session's cost includes its subagents. Subagent files bind through `.meta.json`.
-- Codex: children are top-level rollouts with `parent_thread_id`.
-- Kimi: `time` is epoch ms; loop events are flushed after the response, so tool
-  durations are not recoverable; `message.origin` decides human vs injected, with one
-  exception that looks wrong but isn't: a subagent's delegated prompt is
-  `system_trigger`/`subagent`, the one trigger the CLI itself displays as a prompt, so
-  `kimiMessageClass` counts it as human (titles skip its `<git-context>` prelude via
-  `kimiTitleText`). An `llm.request` with `kind: 'compaction'` is not a loop step: it
-  has no `turnStep` and its `maxTokens` is the summary model's cap, not the context
-  window. A compaction replaces the context with a summary message (the
-  `contextSummary` field — the shorter `summary` is the working summary the
-  trajectory shows) plus a SELECTION OF USER MESSAGES (`keptUserMessageCount`,
-  `keptHeadUserMessageCount` when the middle was elided), never whole turns; a
-  trend that keeps whole turns alive never drops. There is no durable spawn
-  record for subagents: a background launch binds through `task.started`
-  (`info.parentToolCallId`), a foreground one only through the `Agent` result's
-  `agent_id:` header (arriving after the child's whole transcript — child loop
-  events are buffered until it lands), an `AgentSwarm` through the result's
-  `<subagent agent_id="…">` XML. There is no sidecar: the listing description is
-  the parent Agent call's `description` (else the child's delegated prompt),
-  discovered by the meta scanner. Finished subagent wires can still grow after
-  `turn.ended` — the AGENTS.md reminder service lives in the agent's scope,
-  which outlives the turn and keeps watching the session's instruction files;
-  `reminder.notify()` appends `agents_md_change` to context memory immediately
-  (no turn gate), so they are real context records.
-  The TUI replay skips rendering `origin.kind === 'injection'`; this viewer
-  folds them as context, the same way it shows Claude system-reminders. Images
-  are `image_url` parts:
-  inline `data:` URLs below ~4 KB, else `blobref:<mime>;<sha256>` whose bytes
-  sit in `agents/<id>/blobs/` and are served by the server's blob route.
-- Grok: parse only `updates.jsonl` (`chat_history.jsonl` is a derived cache, `events.jsonl`
-  is telemetry). Envelope `timestamp` is seconds, `_meta.agentTimestampMs` is ms. Usage
-  arrives per turn in `turn_completed`; per-call split uses each stream's first
-  `_meta.totalTokens`. Children are top-level session dirs bound through the parent's
-  `subagents/<id>/meta.json`, never by tool call id. Title, cwd, system prompt, and tool
-  schemas live outside the JSONL and reach the parsers through the server's sidecar line.
-- Devin: no files — `sessions.db` (WAL, live-written) holds `sessions`, `message_nodes`,
-  `tool_call_state`; `subagent_heads` exists but is empty in practice. Column timestamps
-  are epoch SECONDS; `chat_message.metadata.created_at`/`started_generation_at` are ISO
-  ms. `message_nodes` is a forest that re-renders context as copied chains: group them by
-  union-find over `parent_node_id` + `compact/prior_node_ids` — carried in the ROW's
-  `metadata.extensions` column, not inside `chat_message` — plus shared `message_id`
-  edges for NON-`system` roles, applied only when neither component carries a prior
-  edge. `message_id` is OBJECT identity, not conversation membership: every subagent's
-  context opens with the same system-prompt object (one mid across all agent chains),
-  and `system` records generally are context objects — render prefixes, injections,
-  summaries — shared across conversations by design, so they never build identity
-  edges at all. A mid merge contradicted by a later prior edge re-materializes the
-  session. Unclaimed groups buffer per chain (never deduped by mid while pending —
-  two lineages may each need their own copy of a shared opener); dedup runs at emit
-  time where the owner is known. The
-  group holding `main_chain_id` is the main stream. Other groups are NOT automatically
-  children — compactor/render chains look identical to subagent chains — so unclaimed
-  groups buffer as `pending` and surface only when a `subagent_heads` row or a spawn
-  result's `subagent/agent_id`/`chain_node_id`/`profile_name` extensions claim them
-  (claims can land after the child's lines; the child file is `agent-<agentId>`). A
-  background `run_subagent` result carries `subagent/agent_id` only — the
-  `chain_node_id` arrives on a `<subagent_completion_notification>` system node on the
-  main chain, so the child materializes at completion; while unclaimed the run's
-  `fileId` stays null in the catalog (the agent id is never a stream id). The
-  child ref's `agent` facts are assembled from the `run_subagent` call's
-  `title`/`task`/`profile` arguments joined through the result's `tool_call_id`
-  → `subagent/agent_id` (so `agent.description` is the spawn title even in a
-  child view that never folded the parent's calls), plus `subagent/profile_name`
-  and `subagent/model` from the claim — late facts re-emit the `file` event. The
-  CLI periodically rewrites a session's whole forest in one commit — same node_ids
-  re-inserted in node order under fresh AUTOINCREMENT row_ids (row_ids form contiguous
-  per-generation blocks, ~8 generations observed in one session) — so `row_id` is an
-  append watermark within a generation only; content is keyed by `node_id`
-  (byte-identical across generations), and materialization skips already-seen
-  node_ids or every rewrite would append a whole extra copy of the transcript. Dedup
-  is per `(message_id, stream, compaction epoch)`: a `system` node with
-  `extensions['devin-rs/summary']` ends a render — copies of pre-summary mids then
-  re-emit because they are kept context, and the summary's chain ancestors (re-rendered
-  prefix, kept injections) flush with it. `system` splits by extension: none = rendered
-  prefix (each render rewrites it — a new contiguous run replaces the header text),
-  `devin-rs/summary` = compaction, anything else = an injected block
-  (`agent-ext/rules-loaded`, `agent-ext/skills-loaded`, `affogato/cog-context`,
-  `chisel/user-edits-*`; a re-injection under the same key replaces the stale one;
-  the store does not preserve `extensions` key order across renders, so a
-  multi-key node's identity key is its sorted-first key). A summary node bundles
-  the render's whole retained context: `content` is summary text plus the kept
-  conversation tail under `<conversation_history>`, and
-  `extensions['chisel/conversation_history'].messages` carries the same tail in
-  structured form (with `compact/todo_list`/`compact/edited_files` alongside).
-  The fold prices it as ONE compaction block — after a compaction `user` can
-  read zero even though kept prompts sit inside the bundle; that is the wire
-  truth, not a dropped message.
-  Replays re-enter the fold surface carrying `data.replay: true` — the fold surfaces
-  the copy but skips all bookkeeping (request record, usage, step timing, human-input
-  tally, inject re-listing) and they are not re-indexed for search. The wire marks
-  the summary's ancestor flush `kept:1`; the synth exempts exactly that tagged run
-  from the summary's claim. Untagged post-summary descendant copies stay claimable —
-  exempting them would leave the same logical message on the surface twice after the
-  next render. Human
-  vs injected is `metadata.is_user_input`; usage lives in `metadata.metrics`, tool wall
-  time in `chisel/tool_call_timing.duration_ms`, and ACP state in `tool_call_state`
-  (settles a call whose result message never landed). `devin.session`/`devin.tool` are
-  synthetic sidecar lines (`startLine: -1`, never indexed). Stream lines are never
-  retained — the store IS the buffer: entries keep counters, and `readAll` re-derives
-  the stream by re-running materialization on a scratch state pinned to live's
-  consumed node_ids (unconsumed rows must not replay or the next live emit doubles
-  them). The cost is one full replay per SSE open — ~250 ms on a 2.5k-node session,
-  and reconnects re-derive again; caching replay output is a follow-up that first
-  needs rewrite/epoch invalidation solved. The poll keys work off the
-  `message_nodes` row_id watermark (growth → incremental materialize, even
-  with no subscribers and an unchanged `sessions` row; regression → full
-  rebuild), and the watermark only advances after a batch fully lands — but
-  a mid-batch failure also poisons the derived maps (`state.nodes` holds
-  rows that never emitted, so an incremental retry would skip them), so any
-  per-session error flags the state `needsRebuild` and the next materialize
-  rebuilds it whole, meta scanner and tool fingerprints included.
-  Per-session errors are isolated the same way, and a `sessions()` failure
-  degrades the source without rejecting start. The
-  store file's identity (`dev:ino`) is compared every tick — an atomic
-  replace or delete+recreate closes the stale handle, reopens, and rebuilds
-  every derived map in place (`file reset` to subscribers, search watermarks
-  reset), while a plain delete leaves the open handle serving its last
-  snapshot (sessions go stale, not empty); ordinary commits move mtime
-  without touching identity and never trigger a reopen. Both `sessions.db`
-  and `sessions.db-wal` are watched (the WAL is attached lazily once it
-  exists — fs.watch only buys promptness, the 1.5 s poll is the correctness
-  path). The `sessions` row's title/cwd/model re-seed the meta scanner in
-  place on change — never re-created, or promptCount and the mid-dedup set
-  would reset. `stop()` is idempotent and `start()` re-runs cleanly on the
-  same instance.
+Child listing facts go through `listingScannerFor`, `MetaState.agents`, and
+`mergeChildAgent` in `apps/server/src/meta.ts`. A sidecar harness attaches `file.agent`
+at registration and skips the child scan; a JSONL-only harness fills the parent's
+`agents` map with spawn descriptions and the child's own `title`/`agentType`.
+Do not add kind-specific branches in `index.ts` to stamp those facts.
