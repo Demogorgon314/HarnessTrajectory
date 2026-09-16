@@ -81,10 +81,15 @@ export interface SessionSource extends EventEmitter {
   /**
    * The paths this source feeds to the search index, read after `start()`
    * resolves. A {@link CompositeSource} aggregates them so one
-   * `finishBackfill` sees every source's live set; a standalone source can
-   * omit it (its own backfill already ran).
+   * `finishBackfill` sees every source's live set.
    */
-  livePaths?(): Iterable<string>
+  livePaths(): Iterable<string>
+  /**
+   * The harness kinds this source can serve — known at construction (fs
+   * roots, a DB source's fixed kind), so a composite routes without
+   * scanning listings.
+   */
+  kinds(): readonly HarnessKind[]
 }
 
 /**
@@ -271,29 +276,18 @@ export class CompositeSource extends EventEmitter implements SessionSource {
     for (const source of sources) {
       source.on('change', (kind: HarnessKind, id: string) => { this.emit('change', kind, id) })
       source.on('error', (error: unknown) => { this.emit('error', error) })
+      // Kinds are disjoint across sources — a later claim on the same kind
+      // would silently shadow the earlier source's sessions.
+      for (const kind of source.kinds()) this.byKind.set(kind, source)
     }
+  }
+
+  kinds(): readonly HarnessKind[] {
+    return [...this.byKind.keys()]
   }
 
   private sourceFor(kind: HarnessKind): SessionSource | undefined {
-    let source = this.byKind.get(kind)
-    if (source !== undefined) return source
-    // Sources that can serve a kind are discovered lazily: the fs index knows
-    // its kinds from its roots, a DB source from its own configuration.
-    for (const candidate of this.sources) {
-      if (candidate.list().some(session => session.kind === kind)) {
-        source = candidate
-        this.byKind.set(kind, source)
-        return source
-      }
-    }
-    // Before the first sweep no source lists anything; fall back to the kinds
-    // each source claims statically.
-    return undefined
-  }
-
-  /** Bind kinds explicitly when a source knows what it serves before listing. */
-  claim(kind: HarnessKind, source: SessionSource): void {
-    this.byKind.set(kind, source)
+    return this.byKind.get(kind)
   }
 
   /**
@@ -307,7 +301,7 @@ export class CompositeSource extends EventEmitter implements SessionSource {
   }
 
   livePaths(): string[] {
-    return this.sources.flatMap(source => [...(source.livePaths?.() ?? [])])
+    return this.sources.flatMap(source => [...source.livePaths()])
   }
 
   stop(): void {

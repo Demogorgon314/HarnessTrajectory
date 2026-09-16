@@ -225,6 +225,10 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     return [...this.book.files.values()].flatMap(entry => (entry.searchSkipped ? [] : [entry.path]))
   }
 
+  kinds(): readonly HarnessKind[] {
+    return [...new Set(this.roots.map(root => root.kind))]
+  }
+
   async start(): Promise<void> {
     this.stopped = false
     this.sweepRead = 0

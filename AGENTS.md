@@ -33,7 +33,11 @@ apps/server       Hono API: `src/source.ts` is the `SessionSource` contract + sh
                   filesystem implementation (scans harness roots, classifies files,
                   replays + tails JSONL over SSE); `src/devin/` is the SQLite-backed
                   implementation reading Devin CLI's `sessions.db` into virtual
-                  `devin://sessions/<id>` line streams.
+                  `devin://sessions/<id>` line streams. A composite routes kinds via
+                  each source's `kinds()` (disjoint by design) and is always attached:
+                  the Devin source self-heals — a missing/corrupt `sessions.db`
+                  degrades it to empty and a later tick re-opens and sweeps when the
+                  file appears, so a CLI installed mid-run needs no restart.
                   src/search = SQLite FTS5 (node:sqlite, trigram, detail=none, contentless)
                   full-text index: store.ts schema (doc text deflate-compressed in
                   docs.text, docs.file → files.id FK), extract.ts record → docs (tool

@@ -442,6 +442,32 @@ describe('DevinSource', () => {
     await expect(source.start()).resolves.toBeUndefined()
     expect(errors).toHaveLength(1)
     expect(source.list()).toEqual([])
+    // Retries keep failing quietly — the failure was already reported once.
+    await source.refresh()
+    await source.refresh()
+    expect(errors).toHaveLength(1)
+  })
+
+  it('attaches a store that appears after start — no restart needed', async () => {
+    // No file at all: Devin CLI "not installed yet" is not an error.
+    source = new DevinSource({ dbPath, watch: false })
+    const errors: unknown[] = []
+    source.on('error', error => errors.push(error))
+    await source.start()
+    expect(source.list()).toEqual([])
+    expect(errors).toEqual([])
+
+    const db = fixture()
+    createStore(db)
+    insertSession(db, 'alpha')
+    insertNode(db, 'alpha', 1, null, userMsg('u1', 'late arrival'))
+    db.close()
+    await source.refresh()
+    expect(source.list().map(session => session.id)).toEqual(['alpha'])
+    expect(
+      linesOf(await replay(source, 'alpha')).flatMap(chunk => chunk.lines)
+        .some(line => line.includes('late arrival')),
+    ).toBe(true)
   })
 
   it('drops the search watermark with the session so a re-appearing one re-indexes', async () => {

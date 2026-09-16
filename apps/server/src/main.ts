@@ -11,7 +11,7 @@ import { DevinSource } from './devin/source.ts'
 import { SessionIndex } from './index.ts'
 import { ListingCache } from './listing-cache.ts'
 import { defaultRoots, devinDbPath } from './roots.ts'
-import { CompositeSource } from './source.ts'
+import { CompositeSource, type SessionSource } from './source.ts'
 import { browserUrl, openBrowser, shouldOpenBrowser } from './open-browser.ts'
 import { createSearchService, type SearchService } from './search/index.ts'
 import { SettingsController, readSettings, settingsPath } from './settings.ts'
@@ -88,25 +88,22 @@ are editable in the UI.`)
     console.error('[harness-trajectory] listing cache unavailable:', error)
   }
   const devinDb = devinDbPath()
-  const hasDevin = existsSync(devinDb)
   const index = new SessionIndex({
     roots,
     ...(listing === undefined ? {} : { listing }),
     ...(search === undefined ? {} : { search: search.indexer }),
     // The composite closes the search backfill once every source has swept.
-    ...(hasDevin ? { deferBackfill: true } : {}),
+    deferBackfill: true,
   })
-  let source: SessionIndex | CompositeSource = index
-  if (hasDevin) {
-    const devin = new DevinSource({
-      dbPath: devinDb,
-      ...(search === undefined ? {} : { search: search.indexer }),
-    })
-    const composite = new CompositeSource([index, devin], search?.indexer)
-    composite.claim('devin', devin)
-    source = composite
-    console.log(`  devin: ${devinDb}`)
-  }
+  // DevinSource is attached unconditionally: a missing sessions.db degrades
+  // to an empty source that retries on every poll, so a Devin CLI installed
+  // or first-run while the viewer is up shows its sessions without a restart.
+  const devin = new DevinSource({
+    dbPath: devinDb,
+    ...(search === undefined ? {} : { search: search.indexer }),
+  })
+  const source: SessionSource = new CompositeSource([index, devin], search?.indexer)
+  console.log(`  devin: ${devinDb}${existsSync(devinDb) ? '' : ' (waiting for sessions.db)'}`)
   source.on('error', (error: unknown) => {
     console.error('[harness-trajectory] watcher error:', error)
   })

@@ -61,7 +61,7 @@
  */
 
 import { EventEmitter } from 'node:events'
-import { watch, type FSWatcher } from 'node:fs'
+import { existsSync, watch, type FSWatcher } from 'node:fs'
 import { asString, isRecord, type HarnessKind, type SessionFileRef, type SessionLiveEvent } from '@harness-trajectory/core'
 import { createMetaScanner } from '../meta.ts'
 import type { SearchIndexer } from '../search/indexer.ts'
@@ -234,6 +234,8 @@ export class DevinSource extends EventEmitter implements SessionSource {
   private watcher: FSWatcher | null = null
   private pollTimer: ReturnType<typeof setTimeout> | null = null
   private stopped = false
+  /** The last open attempt failed and was already reported — suppress repeats. */
+  private openFailed = false
 
   constructor(options: DevinSourceOptions) {
     super()
@@ -244,27 +246,47 @@ export class DevinSource extends EventEmitter implements SessionSource {
   }
 
   async start(): Promise<void> {
-    // An absent/corrupt/foreign database must not take the composite down:
-    // degrade to an empty source (every method tolerates `db === null`) and
-    // surface the failure through the usual error channel.
-    try {
-      this.db = new DevinDb(this.dbPath)
-      if (!this.db.hasSchema()) throw new Error('missing Devin tables')
-    } catch (error) {
-      this.db?.close()
-      this.db = null
-      this.emit('error', new Error(`${this.dbPath}: not a Devin session store`, { cause: error }))
-      return
-    }
+    this.openDb()
     await this.sweep()
     if (!this.watchEnabled) return
     this.poll = setInterval(() => {
       this.tick().catch((error: unknown) => { this.emit('error', error) })
     }, POLL_INTERVAL_MS)
     this.poll.unref()
-    // The WAL file's mtime moves on every commit; watch it for promptness and
-    // let the debounced poll do the real work (WAL may not exist yet — retry
-    // each tick is overkill, just watch the db file itself too).
+    this.attachWatcher()
+  }
+
+  /**
+   * (Re)open the store. A missing file is normal — Devin CLI may simply not
+   * be installed yet — so it degrades silently and the poll retries; a file
+   * that exists but will not open reports once per failure streak instead of
+   * crashing the composite.
+   */
+  private openDb(): boolean {
+    if (!existsSync(this.dbPath)) return false
+    try {
+      this.db = new DevinDb(this.dbPath)
+      if (!this.db.hasSchema()) throw new Error('missing Devin tables')
+    } catch (error) {
+      this.db?.close()
+      this.db = null
+      if (!this.openFailed) {
+        this.openFailed = true
+        this.emit('error', new Error(`${this.dbPath}: not a Devin session store`, { cause: error }))
+      }
+      return false
+    }
+    this.openFailed = false
+    return true
+  }
+
+  /**
+   * The WAL file's mtime moves on every commit; watch it for promptness and
+   * let the debounced poll do the real work (WAL may not exist yet — retry
+   * each tick is overkill, just watch the db file itself too).
+   */
+  private attachWatcher(): void {
+    if (this.watcher !== null) return
     try {
       this.watcher = watch(this.dbPath, () => this.scheduleTick())
     } catch {
@@ -283,6 +305,10 @@ export class DevinSource extends EventEmitter implements SessionSource {
   /** Streams this source feeds to the search index (its half of `finishBackfill`). */
   livePaths(): string[] {
     return [...this.book.files.values()].flatMap(entry => (entry.searchSkipped ? [] : [entry.path]))
+  }
+
+  kinds(): readonly HarnessKind[] {
+    return [KIND]
   }
 
   list() { return this.book.list() }
@@ -895,7 +921,17 @@ export class DevinSource extends EventEmitter implements SessionSource {
   }
 
   private async tick(): Promise<void> {
-    if (this.db === null || this.stopped) return
+    if (this.stopped) return
+    // The store can appear after start (Devin CLI installed, or its first
+    // session created while the viewer is already up): a tick retries the
+    // open, then sweeps once and announces the sessions it found.
+    if (this.db === null) {
+      if (!this.openDb()) return
+      this.attachWatcher()
+      await this.sweep()
+      for (const state of this.states.values()) this.emit('change', KIND, state.row.id)
+      return
+    }
     let rows: DevinSessionRow[]
     try {
       rows = this.db.sessions()
