@@ -499,6 +499,94 @@ describe('DevinSource', () => {
     expect(store.fileState(path)?.indexedLines).toBe(1)
   })
 
+  it('replays the exact stream live emitted — derived from the store, not retained', async () => {
+    const db = fixture()
+    createStore(db)
+    insertSession(db, 'alpha', { main_chain_id: 3 })
+    insertNode(db, 'alpha', 1, null, userMsg('u1', 'delegate'))
+    insertNode(db, 'alpha', 2, 1, assistantMsg('a1', 'spawning', [{ id: 'spawn-1', name: 'run_subagent' }]))
+    insertNode(db, 'alpha', 10, null, { message_id: 'c-sys', role: 'system', content: 'subagent prompt', metadata: {} })
+    insertNode(db, 'alpha', 3, 2, toolMsg('r1', 'spawn-1', 'done', {
+      'subagent/agent_id': 'eq1',
+      'subagent/chain_node_id': 10,
+    }))
+    db.close()
+    // Subscribe before start() so the first materialize's lines land too.
+    source = new DevinSource({ dbPath, watch: false })
+    const live: SessionLiveEvent[] = []
+    source.subscribe('devin', 'alpha', event => live.push(event))
+    await source.start()
+    // A second tick appends to both streams incrementally.
+    const write = new DevinDb(dbPath, { readOnly: false })
+    insertNode(write, 'alpha', 11, 10, assistantMsg('c-a1', 'on it'))
+    insertNode(write, 'alpha', 4, 3, assistantMsg('a2', 'wrapped'))
+    write.db.prepare(`UPDATE sessions SET last_activity_at = 1700000500 WHERE id = 'alpha'`).run()
+    write.close()
+    await source.refresh()
+    // Synthetic lines (the sidecar's startLine -1 chunks) are derived, not
+    // stream content — compare real stream lines only.
+    const liveLines = (fileId: string): string[] => live.flatMap(event =>
+      event.type === 'lines' && event.file.id === fileId && event.startLine >= 0 ? event.lines : [])
+    const events = await replay(source, 'alpha')
+    const replayedLines = (fileId: string): string[] => events.flatMap(event =>
+      event.type === 'lines' && event.file.id === fileId && event.startLine >= 0 ? event.lines : [])
+    // Every stream's replayed sequence equals what live emitted — the scratch
+    // rebuild is deterministic.
+    expect(replayedLines('alpha')).toEqual(liveLines('alpha'))
+    expect(replayedLines('agent-eq1')).toEqual(liveLines('agent-eq1'))
+    expect(replayedLines('alpha').length).toBeGreaterThan(0)
+  })
+
+  it('replay mutates nothing shared — no live events, no search movement', async () => {
+    const store = new SearchStore({ path: ':memory:' })
+    const indexer = new SearchIndexer({ store, flushDelayMs: 1, extract: extractSearchDocs, maxAgeDays: 0 })
+    const db = fixture()
+    createStore(db)
+    insertSession(db, 'alpha')
+    insertNode(db, 'alpha', 1, null, userMsg('u1', 'hello'))
+    insertNode(db, 'alpha', 2, 1, assistantMsg('a1', 'hi'))
+    db.close()
+    source = new DevinSource({ dbPath, watch: false, search: indexer })
+    await source.start()
+    indexer.flush()
+    const before = store.fileState('devin://sessions/alpha')?.indexedLines
+    const live: SessionLiveEvent[] = []
+    const changes: string[] = []
+    source.subscribe('devin', 'alpha', event => live.push(event))
+    source.on('change', (_kind, id) => changes.push(id))
+    const events = await replay(source, 'alpha')
+    expect(events.some(event => event.type === 'lines')).toBe(true)
+    // The scratch state's book has no subscribers and emits no `change`.
+    expect(live).toEqual([])
+    expect(changes).toEqual([])
+    indexer.flush()
+    expect(store.fileState('devin://sessions/alpha')?.indexedLines).toBe(before)
+  })
+
+  it('replays across a whole-forest rewrite that landed between ticks', async () => {
+    const db = fixture()
+    createStore(db)
+    insertSession(db, 'alpha')
+    insertNode(db, 'alpha', 1, null, userMsg('u1', 'first'))
+    insertNode(db, 'alpha', 2, 1, assistantMsg('a1', 'working'))
+    db.close()
+    const src = await start()
+    // The rewrite commits before live polls again: every row_id is now above
+    // the stale watermark. Replay must still serve the consumed stream — and
+    // NOT the row live hasn't seen (node 3), or its next emit doubles.
+    const write = new DevinDb(dbPath, { readOnly: false })
+    write.db.prepare(`DELETE FROM message_nodes WHERE session_id = 'alpha'`).run()
+    insertNode(write, 'alpha', 1, null, userMsg('u1', 'first'))
+    insertNode(write, 'alpha', 2, 1, assistantMsg('a1', 'working'))
+    insertNode(write, 'alpha', 3, 2, userMsg('u2', 'not yet consumed'))
+    write.close()
+    const msgs = linesOf(await replay(src, 'alpha'))
+      .flatMap(chunk => chunk.lines)
+      .filter(line => line.includes('devin.msg'))
+      .map(line => JSON.parse(line).node as number)
+    expect(msgs).toEqual([1, 2])
+  })
+
   it('keeps a session past the retention window browsable but unindexed', async () => {
     const store = new SearchStore({ path: ':memory:' })
     const indexer = new SearchIndexer({ store, flushDelayMs: 1, extract: extractSearchDocs, maxAgeDays: 30, now: () => Date.parse('2026-01-01T00:00:00Z') })

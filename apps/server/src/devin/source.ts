@@ -84,8 +84,6 @@ export interface DevinSourceOptions {
 }
 
 interface DevinEntry extends SourceEntry {
-  /** Lines emitted so far — replay reads them back. */
-  buffered: string[]
   /** First line index that still needs search indexing (`beginFile`'s answer). */
   searchFrom: number
   /** Session aged past the retention window: browsable, but never queued. */
@@ -162,12 +160,40 @@ interface ParsedNode {
   /** Carries `extensions['devin-rs/summary']` — emitting one to main ends an epoch. */
   compaction: boolean
   time: number
-  line: string
+}
+
+/**
+ * What a consumed node costs to keep: the fields a render-ancestor walk and
+ * a delayed (pending) emit need — NOT the parsed message graph or a second
+ * copy of the wire line. The wire form is re-synthesized on demand
+ * (`wireLine`); a transcript's memory footprint stays near one copy of
+ * `chat_message` instead of four or five.
+ */
+interface StoredNode {
+  nodeId: number
+  parentId: number | null
+  messageId: string | null
+  compaction: boolean
+  time: number
+  chatMessage: string
 }
 
 interface DevinSessionState {
   session: SourceSession<DevinEntry>
   row: DevinSessionRow
+  /**
+   * A live state emits events, feeds meta/search, and is the one `states`
+   * holds. A replay state (`live: false`) is a throwaway rebuild of the same
+   * rows used by `readAll`: it collects lines instead of buffering them and
+   * touches nothing shared — its `book` is private so `emitTo` reaches no
+   * real subscriber.
+   */
+  live: boolean
+  book: SessionBook<DevinEntry>
+  /** Replay mode only: emitted lines per entry, read back by `readAll`. */
+  replay?: Map<DevinEntry, string[]>
+  /** Replay mode only: the pinned row set (live's consumed frontier), so a union-conflict rebuild replays the same rows. */
+  replayRows?: DevinNodeRow[]
   groups: ChainGroups
   /** message_id → a node already carrying it (identity edges). */
   midAnchor: Map<string, number>
@@ -185,8 +211,8 @@ interface DevinSessionState {
   maxRowId: number
   /** node_id of the session's first row — the main-chain fallback root. */
   earliestNode: number
-  /** node_id → parsed row, for walking a render chain's ancestry. */
-  nodes: Map<number, ParsedNode>
+  /** node_id → retained row facts, for walking a render chain's ancestry. */
+  nodes: Map<number, StoredNode>
   /** tool_call_id → fingerprint of the last emitted `tool_call_state` row. */
   toolFingerprints: Map<string, string>
   /** Dedup key of the last emitted sidecar line. */
@@ -208,7 +234,7 @@ interface DevinSessionState {
    * a group that merges into the main chain drains to the main stream, and a
    * never-claimed one stays invisible.
    */
-  pending: Map<number, ParsedNode[]>
+  pending: Map<number, StoredNode[]>
   /** Dedup keys of the nodes in `pending` (same vocabulary as `emitted`). */
   pendingKeys: Set<string>
 }
@@ -364,8 +390,10 @@ export class DevinSource extends EventEmitter implements SessionSource {
         sources.push({ ref: main.ref, lines: toolLines, times: toolLines.map(() => time), synthetic: toolLines.length })
       }
     }
+    const replayed = this.replaySession(state)
     for (const entry of entries) {
-      sources.push({ ref: refOf(entry), lines: entry.buffered, times: lineTimes(entry.buffered) })
+      const lines = replayed.get(entry.path) ?? []
+      sources.push({ ref: refOf(entry), lines, times: lineTimes(lines) })
     }
     for (const chunk of mergeChronologically(sources)) {
       emit({ type: 'lines', file: chunk.ref, lines: chunk.lines, startLine: chunk.startLine })
@@ -379,10 +407,13 @@ export class DevinSource extends EventEmitter implements SessionSource {
     return `devin://sessions/${id}`
   }
 
-  private register(row: DevinSessionRow): DevinSessionState {
-    const existing = this.states.get(row.id)
-    if (existing !== undefined) return existing
-    const session = this.book.sessionFor(KIND, row.id)
+  /**
+   * Build the materialization state for `row` on `book`. Live states
+   * (`live: true`) emit events and feed meta/search; replay states collect
+   * lines instead — same materialization path, no observable side effects.
+   */
+  private buildState(row: DevinSessionRow, book: SessionBook<DevinEntry>, live: boolean): DevinSessionState {
+    const session = book.sessionFor(KIND, row.id)
     const entry: DevinEntry = {
       kind: KIND,
       path: DevinSource.sessionPath(row.id),
@@ -391,17 +422,19 @@ export class DevinSource extends EventEmitter implements SessionSource {
       size: 0,
       mtimeMs: row.last_activity_at * 1000,
       lines: 0,
-      meta: createMetaScanner(KIND, sessionSeed(row)),
-      buffered: [],
+      meta: live ? createMetaScanner(KIND, sessionSeed(row)) : null,
       searchFrom: 0,
-      searchSkipped: this.search !== undefined
-        && !this.search.shouldIndex({ mtimeMs: row.last_activity_at * 1000 }),
+      searchSkipped: !live || (this.search !== undefined
+        && !this.search.shouldIndex({ mtimeMs: row.last_activity_at * 1000 })),
     }
     session.main = entry
-    this.book.files.set(entry.path, entry)
-    const state: DevinSessionState = {
+    book.files.set(entry.path, entry)
+    return {
       session,
       row,
+      live,
+      book,
+      ...(live ? {} : { replay: new Map(), replayRows: [] }),
       groups: new ChainGroups(),
       midAnchor: new Map(),
       emitted: new Map(),
@@ -416,8 +449,15 @@ export class DevinSource extends EventEmitter implements SessionSource {
       pending: new Map(),
       pendingKeys: new Set(),
     }
+  }
+
+  private register(row: DevinSessionRow): DevinSessionState {
+    const existing = this.states.get(row.id)
+    if (existing !== undefined) return existing
+    const state = this.buildState(row, this.book, true)
     this.states.set(row.id, state)
-    if (this.search !== undefined && !entry.searchSkipped) {
+    const entry = state.session.main
+    if (entry !== null && this.search !== undefined && !entry.searchSkipped) {
       // The row watermark stands in for file size: monotonic while the store
       // appends, lower after a rebuild — exactly what `beginFile` checks.
       const maxRow = this.db?.maxRowId(row.id) ?? 0
@@ -426,6 +466,30 @@ export class DevinSource extends EventEmitter implements SessionSource {
       )
     }
     return state
+  }
+
+  /**
+   * Rebuild a session's emitted lines from the store for a replay, in a
+   * scratch state that runs the same materialization path but touches nothing
+   * shared: its book has no subscribers, search/meta stay off, and the
+   * collected lines come back by stream path. The row set is pinned to the
+   * node_ids live has consumed — rows it has not (appended since the last
+   * tick) must not replay, or the next live emit sends them a second time
+   * and the client's incremental fold doubles them. The node_id set also
+   * covers a whole-forest rewrite: re-inserted rows keep their node_ids, so
+   * the consumed set re-derives exactly what live shows even mid-rewrite.
+   */
+  private replaySession(state: DevinSessionState): Map<string, string[]> {
+    const byPath = new Map<string, string[]>()
+    if (this.db === null) return byPath
+    const scratch = this.buildState(state.row, new SessionBook<DevinEntry>(() => this.now()), false)
+    scratch.heads = new Map(
+      this.db.subagentHeads(state.row.id).map(head => [head.chain_node_id, head.agent_id]),
+    )
+    scratch.replayRows = this.db.nodes(state.row.id).filter(row => state.nodes.has(row.node_id))
+    this.materialize(scratch)
+    for (const [entry, lines] of scratch.replay ?? []) byPath.set(entry.path, lines)
+    return byPath
   }
 
   /** Forget a session (hidden or deleted from the store). */
@@ -457,12 +521,31 @@ export class DevinSource extends EventEmitter implements SessionSource {
     const metaCreated = Date.parse(asString(meta['created_at']) ?? '')
     const time = Number.isNaN(metaCreated) ? row.created_at * 1000 : metaCreated
     const messageId = asString(record['message_id']) ?? null
-    // The raw chat_message JSON rides the line verbatim — the adapter and the
-    // extractors parse it once, client side.
-    const line = `{"t":"devin.msg","node":${row.node_id},`
-      + `"parent":${row.parent_node_id === null ? 'null' : row.parent_node_id},`
-      + `"time":${time},"msg":${row.chat_message}}`
-    return { row, record, messageId, priors, compaction, time, line }
+    return { row, record, messageId, priors, compaction, time }
+  }
+
+  /** Slim a parsed row down to what stays in memory once its batch is done. */
+  private static storedOf(node: ParsedNode): StoredNode {
+    const { row } = node
+    return {
+      nodeId: row.node_id,
+      parentId: row.parent_node_id,
+      messageId: node.messageId,
+      compaction: node.compaction,
+      time: node.time,
+      chatMessage: row.chat_message,
+    }
+  }
+
+  /**
+   * A node's wire line — the raw `chat_message` JSON rides verbatim so the
+   * adapter and the extractors parse it once, client side. `kept` tags the
+   * render-ancestor flush (the synthesizer's claim-exemption marker).
+   */
+  private static wireLine(node: StoredNode, kept = false): string {
+    return `{"t":"devin.msg","node":${node.nodeId},`
+      + `"parent":${node.parentId === null ? 'null' : node.parentId},`
+      + `"time":${node.time},${kept ? '"kept":1,' : ''}"msg":${node.chatMessage}}`
   }
 
   /**
@@ -484,7 +567,7 @@ export class DevinSource extends EventEmitter implements SessionSource {
       ...entry.ref,
       agent: { ...entry.ref.agent, agentId, ...(profile === null ? {} : { agentType: profile }) },
     }
-    this.book.emitTo(state.session, { type: 'file', file: entry.ref })
+    state.book.emitTo(state.session, { type: 'file', file: entry.ref })
   }
 
   /**
@@ -497,14 +580,14 @@ export class DevinSource extends EventEmitter implements SessionSource {
     return state.groups.find(root) === state.groups.find(node)
   }
 
-  private childEntry(state: DevinSessionState, node: ParsedNode): DevinEntry | null {
+  private childEntry(state: DevinSessionState, node: StoredNode): DevinEntry | null {
     const session = state.session
     // A subagent chain is named by `subagent_heads` when populated, else by the
     // `subagent/*` extensions on the result of the call that spawned it.
     const named = [...state.heads.entries()].find(([chainNode]) =>
-      state.groups.find(chainNode) === state.groups.find(node.row.node_id))
+      state.groups.find(chainNode) === state.groups.find(node.nodeId))
     const learned = [...state.chainAgent.entries()].find(([chainNode]) =>
-      state.groups.find(chainNode) === state.groups.find(node.row.node_id))
+      state.groups.find(chainNode) === state.groups.find(node.nodeId))
     const agentId = named?.[1] ?? learned?.[1].agentId
     if (agentId === undefined) return null
     // The file is named by the claimed agent id, not a row-derived group key:
@@ -530,57 +613,64 @@ export class DevinSource extends EventEmitter implements SessionSource {
       size: 0,
       mtimeMs: node.time,
       lines: 0,
-      meta: createMetaScanner(KIND),
-      buffered: [],
+      meta: state.live ? createMetaScanner(KIND) : null,
       searchFrom: 0,
-      searchSkipped: this.search !== undefined
-        && !this.search.shouldIndex({ mtimeMs: state.row.last_activity_at * 1000 }),
+      searchSkipped: !state.live || (this.search !== undefined
+        && !this.search.shouldIndex({ mtimeMs: state.row.last_activity_at * 1000 })),
     }
     session.children.set(fileId, entry)
-    this.book.files.set(path, entry)
-    if (this.search !== undefined && !entry.searchSkipped) {
+    state.book.files.set(path, entry)
+    if (state.live && this.search !== undefined && !entry.searchSkipped) {
       entry.searchFrom = this.search.beginFile(
         searchKeyOf(entry), { size: state.maxRowId, mtimeMs: entry.mtimeMs },
       )
     }
-    this.book.emitTo(session, { type: 'file', file: entry.ref })
+    state.book.emitTo(session, { type: 'file', file: entry.ref })
     return entry
   }
 
   /**
    * Append `line` (the node's wire form, or a tagged variant such as the
-   * ancestor flush's `kept` line) to `entry`'s stream: buffer for replay,
+   * ancestor flush's `kept` line) to `entry`'s stream: advance counters,
    * feed the meta scanner, and queue it for search when fresh.
    */
   private emitLine(
     state: DevinSessionState,
     entry: DevinEntry,
-    node: ParsedNode,
-    indexable = true,
-    line = node.line,
+    node: StoredNode,
+    indexable: boolean,
+    line: string,
   ): void {
-    entry.buffered.push(line)
-    entry.lines = entry.buffered.length
+    // Lines are not retained: counters track the stream's position and a
+    // replay re-derives content from the store on demand.
+    entry.lines += 1
     entry.size += line.length + 1
     entry.mtimeMs = Math.max(entry.mtimeMs, node.time)
     entry.meta?.push(line)
     if (
-      indexable && !entry.searchSkipped && this.search !== undefined
-      && entry.buffered.length - 1 >= entry.searchFrom
+      state.live && indexable && !entry.searchSkipped && this.search !== undefined
+      && entry.lines - 1 >= entry.searchFrom
     ) {
-      this.search.queue(searchKeyOf(entry), entry.buffered.length - 1, line)
+      this.search.queue(searchKeyOf(entry), entry.lines - 1, line)
     }
   }
 
   /**
    * Fan a materialization batch out to subscribers as chunked `lines` events
-   * (one event per contiguous run per stream) and record search progress.
+   * (one event per contiguous run per stream) and record search progress. A
+   * replay state just collects them for `readAll` instead.
    */
   private flushBatch(state: DevinSessionState, emitted: Map<DevinEntry, string[]>): void {
     for (const [entry, lines] of emitted) {
-      const startLine = entry.buffered.length - lines.length
+      const startLine = entry.lines - lines.length
+      if (state.replay !== undefined) {
+        const list = state.replay.get(entry)
+        if (list === undefined) state.replay.set(entry, [...lines])
+        else list.push(...lines)
+        continue
+      }
       for (let offset = 0; offset < lines.length; offset += CHUNK_LINES) {
-        this.book.emitTo(state.session, {
+        state.book.emitTo(state.session, {
           type: 'lines',
           file: entry.ref,
           lines: lines.slice(offset, offset + CHUNK_LINES),
@@ -615,19 +705,22 @@ export class DevinSource extends EventEmitter implements SessionSource {
       state.maxRowId = 0
       for (const entry of [state.session.main, ...state.session.children.values()]) {
         if (entry === null) continue
-        entry.buffered = []
         entry.lines = 0
         entry.size = 0
         entry.searchFrom = 0
-        this.search?.reset(entry.path)
-        this.book.emitTo(state.session, { type: 'file', file: entry.ref, reset: true })
+        if (state.live) {
+          this.search?.reset(entry.path)
+          state.book.emitTo(state.session, { type: 'file', file: entry.ref, reset: true })
+        }
       }
       state.session.children.clear()
-      for (const [path, entry] of this.book.files) {
-        if (entry.sessionId === state.session.id && entry !== state.session.main) this.book.files.delete(path)
+      for (const [path, entry] of state.book.files) {
+        if (entry.sessionId === state.session.id && entry !== state.session.main) state.book.files.delete(path)
       }
     }
-    const rows = full ? this.db.nodes(state.row.id) : this.db.nodesAfter(state.row.id, state.maxRowId)
+    const rows = state.replayRows ?? (full
+      ? this.db.nodes(state.row.id)
+      : this.db.nodesAfter(state.row.id, state.maxRowId))
     if (rows.length === 0) return
     if (state.maxRowId === 0) state.earliestNode = rows[0]?.node_id ?? 0
     state.maxRowId = Math.max(state.maxRowId, rows[rows.length - 1]?.row_id ?? 0)
@@ -644,7 +737,7 @@ export class DevinSource extends EventEmitter implements SessionSource {
       // rewrite would append a whole extra generation to the stream.
       if (!state.nodes.has(node_id)) {
         fresh.add(node_id)
-        state.nodes.set(node_id, node)
+        state.nodes.set(node_id, DevinSource.storedOf(node))
       }
       state.groups.add(node_id)
       if (!state.groups.union(node_id, parent_node_id)) return this.materialize(state, true)
@@ -673,24 +766,25 @@ export class DevinSource extends EventEmitter implements SessionSource {
       // Store-rewrite copies never re-emit; the kept-copy re-emission past a
       // compaction boundary belongs to render nodes — always NEW node_ids.
       if (!fresh.has(node.row.node_id)) continue
+      const stored = DevinSource.storedOf(node)
       const owner = this.isMainGroup(state, node.row.node_id)
         ? state.session.main
-        : this.childEntry(state, node)
+        : this.childEntry(state, stored)
       if (owner === null) {
         const key = node.messageId ?? `node:${node.row.node_id}`
         if (state.pendingKeys.has(key)) continue
         state.pendingKeys.add(key)
         const root = state.groups.find(node.row.node_id)
         const list = state.pending.get(root)
-        if (list === undefined) state.pending.set(root, [node])
-        else list.push(node)
+        if (list === undefined) state.pending.set(root, [stored])
+        else list.push(stored)
         continue
       }
-      if (!this.tryEmitNode(state, owner, node, emitted)) continue
+      if (!this.tryEmitNode(state, owner, stored, emitted)) continue
     }
     if (emitted.size > 0) {
       this.flushBatch(state, emitted)
-      this.emit('change', KIND, state.row.id)
+      if (state.live) this.emit('change', KIND, state.row.id)
     }
   }
 
@@ -716,14 +810,14 @@ export class DevinSource extends EventEmitter implements SessionSource {
       if (owner === null) continue
       state.pending.delete(root)
       for (const node of nodes) {
-        const key = node.messageId ?? `node:${node.row.node_id}`
+        const key = node.messageId ?? `node:${node.nodeId}`
         state.pendingKeys.delete(key)
         if (!this.tryEmitNode(state, owner, node, emitted)) continue
       }
     }
     if (emitted.size > 0) {
       this.flushBatch(state, emitted)
-      this.emit('change', KIND, state.row.id)
+      if (state.live) this.emit('change', KIND, state.row.id)
     }
   }
 
@@ -738,10 +832,10 @@ export class DevinSource extends EventEmitter implements SessionSource {
   private tryEmitNode(
     state: DevinSessionState,
     owner: DevinEntry,
-    node: ParsedNode,
+    node: StoredNode,
     emitted: Map<DevinEntry, string[]>,
   ): boolean {
-    const key = node.messageId ?? `node:${node.row.node_id}`
+    const key = node.messageId ?? `node:${node.nodeId}`
     const epoch = state.epochs.get(owner) ?? 0
     const owners = state.emitted.get(key)
     const prevEpoch = owners?.get(owner)
@@ -758,11 +852,12 @@ export class DevinSource extends EventEmitter implements SessionSource {
       state.epochs.set(owner, epoch + 1)
       this.emitRenderAncestors(state, owner, node, emitted)
     }
-    state.groups.claim(node.row.node_id, owner)
-    this.emitLine(state, owner, node, indexable)
+    state.groups.claim(node.nodeId, owner)
+    const line = DevinSource.wireLine(node)
+    this.emitLine(state, owner, node, indexable, line)
     const list = emitted.get(owner)
-    if (list === undefined) emitted.set(owner, [node.line])
-    else list.push(node.line)
+    if (list === undefined) emitted.set(owner, [line])
+    else list.push(line)
     return true
   }
 
@@ -780,31 +875,29 @@ export class DevinSource extends EventEmitter implements SessionSource {
   private emitRenderAncestors(
     state: DevinSessionState,
     owner: DevinEntry,
-    summary: ParsedNode,
+    summary: StoredNode,
     emitted: Map<DevinEntry, string[]>,
   ): void {
     const epoch = state.epochs.get(owner) ?? 0
-    const ancestors: ParsedNode[] = []
-    const guard = new Set<number>([summary.row.node_id])
-    let cur = summary.row.parent_node_id
+    const ancestors: StoredNode[] = []
+    const guard = new Set<number>([summary.nodeId])
+    let cur = summary.parentId
     while (cur !== null && !guard.has(cur)) {
       guard.add(cur)
       const anc = state.nodes.get(cur)
       if (anc === undefined) break
       ancestors.push(anc)
-      cur = anc.row.parent_node_id
+      cur = anc.parentId
     }
     for (const anc of ancestors.reverse()) {
-      const key = anc.messageId ?? `node:${anc.row.node_id}`
+      const key = anc.messageId ?? `node:${anc.nodeId}`
       const owners = state.emitted.get(key)
       if (owners?.get(owner) === epoch) continue
       const indexable = owners === undefined || owners.get(owner) === undefined
       if (owners === undefined) state.emitted.set(key, new Map([[owner, epoch]]))
       else owners.set(owner, epoch)
-      state.groups.claim(anc.row.node_id, owner)
-      const line = `{"t":"devin.msg","node":${anc.row.node_id},`
-        + `"parent":${anc.row.parent_node_id === null ? 'null' : anc.row.parent_node_id},`
-        + `"time":${anc.time},"kept":1,"msg":${anc.row.chat_message}}`
+      state.groups.claim(anc.nodeId, owner)
+      const line = DevinSource.wireLine(anc, true)
       this.emitLine(state, owner, anc, indexable, line)
       const list = emitted.get(owner)
       if (list === undefined) emitted.set(owner, [line])
