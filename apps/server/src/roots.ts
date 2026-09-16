@@ -11,6 +11,22 @@ export interface HarnessRoot {
 }
 
 /**
+ * The Devin CLI data directory (`$XDG_DATA_HOME/devin/cli`, or
+ * `~/.local/share/devin/cli`): home of `sessions.db`, `session_locks/`, and
+ * the exported transcripts. `HARNESS_TRAJECTORY_DEVIN_DB` overrides the
+ * database file itself.
+ */
+export function devinDataDir(env: NodeJS.ProcessEnv = process.env): string {
+  const dataHome = env['XDG_DATA_HOME'] ?? join(homedir(), '.local', 'share')
+  return join(dataHome, 'devin', 'cli')
+}
+
+/** Absolute path of the Devin CLI session store (existing or not — the caller stats it). */
+export function devinDbPath(env: NodeJS.ProcessEnv = process.env): string {
+  return resolve(env['HARNESS_TRAJECTORY_DEVIN_DB'] ?? join(devinDataDir(env), 'sessions.db'))
+}
+
+/**
  * Resolve transcript roots, honouring the same overrides the harnesses use
  * (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `KIMI_CODE_HOME`, `GROK_HOME`) plus
  * explicit `HARNESS_TRAJECTORY_*` overrides.

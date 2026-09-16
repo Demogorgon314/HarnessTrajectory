@@ -38,9 +38,12 @@ export function requestContext(seq: number, data?: Record<string, unknown>): Tim
 export function userMessage(seq: number, content: ContentBlock[], source?: MessageSource | null, opts: {
   time?: number
   surfaceOp?: TimelineEvent['surfaceOp']
+  /** A re-rendered kept copy: surfaces but mints no bookkeeping. */
+  replay?: boolean
 } = {}): TimelineEvent {
   const data: Record<string, unknown> = { content }
   if (source !== undefined) data.source = source
+  if (opts.replay === true) data.replay = true
   return { type: 'user/message', seq, time: at(opts.time), data, surfaceOp: opts.surfaceOp ?? 'append' }
 }
 
@@ -80,6 +83,7 @@ export function toolResult(seq: number, opts: {
   meta?: unknown
   /** Synthesizer-stated file ops (the PORT ADDITION path). */
   fileOps?: unknown
+  replay?: boolean
   time?: number
 }): TimelineEvent {
   const message: Record<string, unknown> = {
@@ -91,6 +95,7 @@ export function toolResult(seq: number, opts: {
   if (opts.error === true) data.error = true
   if (opts.meta !== undefined) data.meta = opts.meta
   if (opts.fileOps !== undefined) data.fileOps = opts.fileOps
+  if (opts.replay === true) data.replay = true
   return { type: 'tool/result', seq, time: at(opts.time), data, surfaceOp: 'append' }
 }
 
@@ -103,6 +108,7 @@ export function assistantMessage(seq: number, opts: {
   usage?: Record<string, unknown>
   /** The embedded provider stream (raw `chunk` records and packed runs). */
   stream?: unknown
+  replay?: boolean
   time?: number
   surfaceOp?: TimelineEvent['surfaceOp']
 }): TimelineEvent {
@@ -111,6 +117,7 @@ export function assistantMessage(seq: number, opts: {
   if (opts.step !== undefined) data.step = opts.step
   if (opts.usage !== undefined) data.usage = opts.usage
   if (opts.stream !== undefined) data.stream = opts.stream
+  if (opts.replay === true) data.replay = true
   return { type: 'assistant/message', seq, time: at(opts.time), data, surfaceOp: opts.surfaceOp ?? 'append' }
 }
 

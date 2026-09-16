@@ -78,3 +78,39 @@ describe('the fold over a realistic log', () => {
     assert.equal(row(unbounded.nodes, 0).seq, 2)
   })
 })
+
+describe('replay copies (a context render\'s kept messages, surfaced again)', () => {
+  test('a replayed assistant message joins the surface but mints no request record', () => {
+    const { view } = driveTimeline([
+      header(1, { system: 'sys', model: 'm', provider: 'p' }),
+      userMessage(2, [{ type: 'text', text: 'hi' }], { kind: 'user' }),
+      assistantMessage(3, { turn: 1, step: 1, usage: { inputTokens: 10, outputTokens: 5 } }),
+      // The render's kept copy of that reply: same content, not a dispatch.
+      assistantMessage(4, { replay: true }),
+    ])
+    assert.equal(view.requests.length, 1, 'only the real dispatch records a request')
+    assert.equal(row(view.requests, 0).turn, 1)
+    assert.equal(row(view.requests, 0).prompt, 10)
+    assert.equal(view.nodes.filter(n => n.cat === 'assistant').length, 2, 'both copies live on the surface')
+  })
+
+  test('a replayed human message is not a second human input', () => {
+    const { view } = driveTimeline([
+      userMessage(1, [{ type: 'text', text: 'hi' }], { kind: 'user' }),
+      userMessage(2, [{ type: 'text', text: 'hi' }], { kind: 'user' }, { replay: true }),
+    ])
+    assert.equal(view.humanInputs, 1)
+    assert.equal(view.nodes.filter(n => n.cat === 'user').length, 2)
+  })
+
+  test('a replayed injection keeps its node label but does not re-list the event', () => {
+    const source = { kind: 'inject', form: 'context', plugin: 'rules-loaded' } as const
+    const { view } = driveTimeline([
+      userMessage(1, [{ type: 'text', text: '<rules/>' }], source),
+      userMessage(2, [{ type: 'text', text: '<rules/>' }], source, { replay: true }),
+    ])
+    assert.equal(view.events.filter(e => e.kind === 'inject').length, 1, 'the original already earned the row')
+    assert.equal(view.nodes.filter(n => n.cat === 'inject').length, 2, 'the kept copy still surfaces')
+    assert.equal(row(view.nodes.filter(n => n.cat === 'inject'), 1).name, 'rules-loaded')
+  })
+})

@@ -65,6 +65,8 @@ export class SearchIndexer {
   private readonly progress = new Map<string, FileProgress>()
   /** Files whose existing documents must be dropped before this batch lands. */
   private readonly resets = new Set<string>()
+  /** Files to remove ENTIRELY — documents and the `files` watermark row. */
+  private readonly drops = new Set<string>()
   private timer: NodeJS.Timeout | null = null
   private backfilling = true
   private backfillDone = 0
@@ -129,6 +131,10 @@ export class SearchIndexer {
    */
   beginFile(key: SearchFileKey, file: { size: number; mtimeMs: number }): number {
     this.keys.set(key.path, key)
+    // A queued reset/forget still has the old `files` row — the delete only
+    // lands at flush. Resuming from its watermark would leave the prefix
+    // unindexed once the pending delete and the new docs commit together.
+    if (this.resets.has(key.path) || this.drops.has(key.path)) return 0
     const state = this.store.fileState(key.path)
     if (state === undefined) return 0
     if (state.sessionId !== key.sessionId || state.fileId !== key.fileId) {
@@ -157,6 +163,23 @@ export class SearchIndexer {
       if (this.batch[index]?.path === path) this.batch.splice(index, 1)
     }
     this.progress.delete(path)
+    this.schedule()
+  }
+
+  /**
+   * Remove a file from the index completely — documents AND the `files`
+   * watermark row. `reset` alone would leave `indexed_lines` behind, so a
+   * source stream that drops and later re-registers (a Devin session
+   * un-hiding) would never re-index the lines before the watermark.
+   */
+  forget(path: string): void {
+    this.drops.add(path)
+    this.resets.delete(path)
+    for (let index = this.batch.length - 1; index >= 0; index -= 1) {
+      if (this.batch[index]?.path === path) this.batch.splice(index, 1)
+    }
+    this.progress.delete(path)
+    this.keys.delete(path)
     this.schedule()
   }
 
@@ -203,11 +226,13 @@ export class SearchIndexer {
       clearTimeout(this.timer)
       this.timer = null
     }
-    if (this.batch.length === 0 && this.progress.size === 0 && this.resets.size === 0) return
+    if (this.batch.length === 0 && this.progress.size === 0 && this.resets.size === 0 && this.drops.size === 0) return
     const resets = [...this.resets]
+    const drops = [...this.drops]
     const docs = this.batch.splice(0)
     const progress = [...this.progress]
     this.resets.clear()
+    this.drops.clear()
     this.progress.clear()
     const grouped = new Map<string, PendingDoc[]>()
     for (const doc of docs) {
@@ -217,6 +242,7 @@ export class SearchIndexer {
     }
     try {
       this.store.transaction(() => {
+        for (const path of drops) this.store.deleteFile(path)
         for (const path of resets) this.store.clearDocs(path)
         const progressMap = new Map(progress)
         // A size-triggered flush can land documents before `noteProgress` runs.
@@ -285,7 +311,7 @@ export class SearchIndexer {
   }
 
   stats(): SearchIndexing {
-    const pending = new Set<string>(this.resets)
+    const pending = new Set<string>([...this.resets, ...this.drops])
     for (const doc of this.batch) pending.add(doc.path)
     for (const path of this.progress.keys()) pending.add(path)
     return {

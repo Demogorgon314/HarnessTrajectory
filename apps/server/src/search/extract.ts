@@ -48,9 +48,9 @@
  */
 
 import {
-  asArray, asNumber, asString, classifyInjectedUser, grokMessageClass, isCodexHumanPrompt,
-  isRecord, kimiMessageClass, kimiTitleText, parseGrokLine, parseJsonLine, parseTime,
-  GROK_SIDECAR_METHOD, type HarnessKind, type SearchRole,
+  asArray, asNumber, asString, classifyInjectedUser, devinMessageClass, grokMessageClass,
+  isCodexHumanPrompt, isRecord, kimiMessageClass, kimiTitleText, parseDevinLine, parseGrokLine,
+  parseJsonLine, parseTime, GROK_SIDECAR_METHOD, type HarnessKind, type SearchRole,
 } from '@harness-trajectory/core'
 
 /** One document before the indexer stamps it with its line number. */
@@ -205,6 +205,7 @@ export function extractSearchDocs(kind: HarnessKind, line: string): SearchDocDra
       case 'codex': return codexDocs(line)
       case 'kimi': return kimiDocs(line)
       case 'grok': return grokDocs(line)
+      case 'devin': return devinDocs(line)
     }
   } catch {
     return []
@@ -471,6 +472,50 @@ function grokDocs(line: string): SearchDocDraft[] {
         .join('\n'))
       break
     default:
+      break
+  }
+  return builder.docs
+}
+
+// -- Devin CLI ---------------------------------------------------------------
+
+/**
+ * Devin's virtual lines wrap the `chat_message` record under `msg`; the
+ * `devin.session`/`devin.tool` records are server-synthesized sidecars and
+ * never reach the index. Human vs injected is `metadata.is_user_input`, the
+ * same structural flag the adapter and meta scanner read.
+ */
+function devinDocs(line: string): SearchDocDraft[] {
+  const record = parseDevinLine(line)
+  if (record === null || record.tag !== 'msg') return []
+  const builder = new DocBuilder(record.time)
+  const msg = record.msg
+  switch (asString(msg['role'])) {
+    case 'user':
+      if (devinMessageClass(msg)?.kind !== 'human') break
+      builder.add('human', blockText(msg['content']))
+      break
+    case 'assistant': {
+      builder.add('assistant', blockText(msg['content']))
+      const thinking = msg['thinking']
+      const thinkText = isRecord(thinking)
+        ? asString(thinking['thinking']) ?? ''
+        : asString(thinking) ?? ''
+      builder.add('other', thinkText)
+      for (const call of asArray(msg['tool_calls']) ?? []) {
+        if (!isRecord(call)) continue
+        const fn = isRecord(call['function']) ? call['function'] : undefined
+        const name = asString(call['name']) ?? asString(fn?.['name']) ?? 'tool'
+        builder.add('tool', renderToolCall(name, call['arguments'] ?? fn?.['arguments']))
+      }
+      break
+    }
+    case 'tool':
+      builder.add('tool', blockText(msg['content']), MAX_TOOL_OUTPUT_CHARS)
+      break
+    default:
+      // `system` prompt segments are harness boilerplate, like codex's
+      // session_meta: indexed once per session they would match everything.
       break
   }
   return builder.docs

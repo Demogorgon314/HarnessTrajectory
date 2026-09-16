@@ -10,7 +10,7 @@ import { readdir, readFile, stat } from 'node:fs/promises'
 import { basename, dirname, join, relative, sep } from 'node:path'
 import {
   asArray, asString, isRecord, GROK_SIDECAR_METHOD,
-  type AgentFileMeta, type HarnessKind, type SessionChildSummary, type SessionDetail, type SessionFileRef,
+  type AgentFileMeta, type HarnessKind, type SessionDetail, type SessionFileRef,
   type SessionLiveEvent, type SessionSummary,
 } from '@harness-trajectory/core'
 import {
@@ -20,13 +20,22 @@ import {
 import type { ListingCache } from './listing-cache.ts'
 import type { HarnessRoot } from './roots.ts'
 import type { SearchIndexer } from './search/indexer.ts'
-import type { SearchFileKey } from './search/store.ts'
+import {
+  lineTimes, mergeChronologically, scopeToFile, searchKeyOf,
+  SessionBook, sessionKey, standaloneRef, type SourceEntry, type SourceSession,
+  type SessionSource, type Subscriber,
+} from './source.ts'
 import { readFirstLine, readLines } from './tail.ts'
 
-const LIVE_WINDOW_MS = 2 * 60_000
+// The shared source plumbing lives in `source.ts`; these re-exports keep the
+// historical `index.ts` import surface (tests, app.ts) intact.
+export {
+  lineTime, lineTimes, mergeChronologically, scopeToFile, standaloneRef,
+  type LineChunk, type LineSource, type SessionSource, type Subscriber,
+} from './source.ts'
+
 const WATCH_DEBOUNCE_MS = 120
 const POLL_INTERVAL_MS = 1_500
-const CHUNK_LINES = 400
 /** Files the startup sweep registers at once; the reads overlap, the parsing does not. */
 const BACKFILL_CONCURRENCY = 8
 /**
@@ -41,7 +50,7 @@ function yieldTurn(): Promise<void> {
   return new Promise(resolve => setImmediate(resolve))
 }
 
-interface FileEntry {
+interface FileEntry extends SourceEntry {
   kind: HarnessKind
   path: string
   ref: SessionFileRef
@@ -87,12 +96,7 @@ interface FileEntry {
   grokUnresolved?: boolean
 }
 
-interface SessionRecord {
-  kind: HarnessKind
-  id: string
-  main: FileEntry | null
-  children: Map<string, FileEntry>
-}
+type SessionRecord = SourceSession<FileEntry>
 
 export interface SessionIndexOptions {
   roots: readonly HarnessRoot[]
@@ -111,12 +115,12 @@ export interface SessionIndexOptions {
   listing?: ListingCache
   /** Files registered concurrently during the startup sweep; 1 for a strict order. */
   backfillConcurrency?: number
-}
-
-type Subscriber = (event: SessionLiveEvent) => void
-
-function sessionKey(kind: HarnessKind, id: string): string {
-  return `${kind} ${id}`
+  /**
+   * Composed sources only: leave `search.finishBackfill` to the composite so
+   * every source's live paths — including a DB source's virtual ones — are
+   * counted before stale index rows are dropped.
+   */
+  deferBackfill?: boolean
 }
 
 /** Identify the transcript role of a file from its path; `null` when it is not a transcript. */
@@ -176,11 +180,10 @@ export function classifyPath(
   return null
 }
 
-export class SessionIndex extends EventEmitter {
+export class SessionIndex extends EventEmitter implements SessionSource {
   private readonly roots: readonly HarnessRoot[]
-  private readonly sessions = new Map<string, SessionRecord>()
-  private readonly files = new Map<string, FileEntry>()
-  private readonly subscribers = new Map<string, Set<Subscriber>>()
+  /** Sessions/files/subscriber bookkeeping, shared with the non-file sources. */
+  private readonly book = new SessionBook<FileEntry>(() => this.now())
   /**
    * Grok child → parent bindings read from `<parent>/subagents/<childId>/meta.json`.
    * A grok child is a top-level session directory that names no parent of its
@@ -200,6 +203,7 @@ export class SessionIndex extends EventEmitter {
   private readonly now: () => number
   private readonly search: SearchIndexer | undefined
   private readonly listing: ListingCache | undefined
+  private readonly deferBackfill: boolean
   /** Startup-sweep counters for the launch log. */
   private sweepRead = 0
   private sweepCached = 0
@@ -213,6 +217,16 @@ export class SessionIndex extends EventEmitter {
     this.now = options.now ?? Date.now
     this.search = options.search
     this.listing = options.listing
+    this.deferBackfill = options.deferBackfill ?? false
+  }
+
+  /** The transcript paths this source feeds to the search index. */
+  livePaths(): string[] {
+    return [...this.book.files.values()].flatMap(entry => (entry.searchSkipped ? [] : [entry.path]))
+  }
+
+  kinds(): readonly HarnessKind[] {
+    return [...new Set(this.roots.map(root => root.kind))]
   }
 
   async start(): Promise<void> {
@@ -266,13 +280,13 @@ export class SessionIndex extends EventEmitter {
     // files that are gone. Files the retention window skips are not live for
     // the index either, so rows an earlier run stored for them are dropped
     // here. Only now does search report itself as ready.
-    this.search?.finishBackfill(
-      [...this.files.values()].flatMap(entry => (entry.searchSkipped ? [] : [entry.path])),
-    )
+    if (this.deferBackfill !== true) {
+      this.search?.finishBackfill(this.livePaths())
+    }
     // Rows for transcripts that disappeared between runs are dropped here;
     // unlike the search index the listing cache also covers retention-skipped
     // files, so its live set is every registered path.
-    this.listing?.prune(new Set(this.files.keys()))
+    this.listing?.prune(new Set(this.book.files.keys()))
     if (this.watchEnabled) {
       this.poll = setInterval(() => { void this.pollSubscribed() }, POLL_INTERVAL_MS)
       this.poll.unref()
@@ -302,27 +316,16 @@ export class SessionIndex extends EventEmitter {
 
   /** Sessions with a main transcript, newest activity first. */
   list(): SessionSummary[] {
-    const summaries: SessionSummary[] = []
-    for (const session of this.sessions.values()) {
-      if (session.main === null) continue
-      summaries.push(this.summarize(session))
-    }
-    return summaries.sort((left, right) => right.updatedAt - left.updatedAt)
+    return this.book.list()
   }
 
   get(kind: HarnessKind, id: string): SessionDetail | undefined {
-    const session = this.sessions.get(sessionKey(kind, id))
-    if (session === undefined || session.main === null) return undefined
-    return {
-      ...this.summarize(session),
-      files: [session.main.ref, ...[...session.children.values()].map(entry => entry.ref)],
-      children: this.childSummaries(session),
-    }
+    return this.book.get(kind, id)
   }
 
   /** Whether a session has a child transcript with this id. */
   hasChild(kind: HarnessKind, id: string, fileId: string): boolean {
-    return this.sessions.get(sessionKey(kind, id))?.children.has(fileId) === true
+    return this.book.hasChild(kind, id, fileId)
   }
 
   /**
@@ -332,7 +335,7 @@ export class SessionIndex extends EventEmitter {
    */
   blobPath(kind: HarnessKind, id: string, fileId: string, hash: string): string | null {
     if (!/^[0-9a-f]{16,64}$/.test(hash)) return null
-    const session = this.sessions.get(sessionKey(kind, id))
+    const session = this.book.sessions.get(sessionKey(kind, id))
     if (session === undefined) return null
     const entry = fileId === id ? session.main : (session.children.get(fileId) ?? null)
     if (entry === null || entry === undefined) return null
@@ -353,7 +356,7 @@ export class SessionIndex extends EventEmitter {
     emit: (event: SessionLiveEvent) => void,
     fileId?: string,
   ): Promise<void> {
-    const session = this.sessions.get(sessionKey(kind, id))
+    const session = this.book.sessions.get(sessionKey(kind, id))
     if (session === undefined || session.main === null) return
     let entries: FileEntry[]
     let refOf: (entry: FileEntry) => SessionFileRef = entry => entry.ref
@@ -390,23 +393,11 @@ export class SessionIndex extends EventEmitter {
     for (const chunk of mergeChronologically(sources)) {
       emit({ type: 'lines', file: chunk.ref, lines: chunk.lines, startLine: chunk.startLine })
     }
-    emit({ type: 'meta', summary: this.summarize(session), children: this.childSummaries(session) })
+    emit({ type: 'meta', summary: this.book.summarize(session), children: this.book.childSummaries(session) })
   }
 
   subscribe(kind: HarnessKind, id: string, subscriber: Subscriber): () => void {
-    const key = sessionKey(kind, id)
-    let set = this.subscribers.get(key)
-    if (set === undefined) {
-      set = new Set()
-      this.subscribers.set(key, set)
-    }
-    set.add(subscriber)
-    return () => {
-      set.delete(subscriber)
-      // Only ever drop the set this key still holds: a stream that closes after
-      // a later one opened would otherwise unregister the new viewer with it.
-      if (set.size === 0 && this.subscribers.get(key) === set) this.subscribers.delete(key)
-    }
+    return this.book.subscribe(kind, id, subscriber)
   }
 
   // -- discovery -----------------------------------------------------------
@@ -488,12 +479,12 @@ export class SessionIndex extends EventEmitter {
       ...(root.kind === 'grok' ? { summaryTitle: grokSummaryTitle(grokSummary) } : {}),
       ...(grokUnresolved && role === 'main' ? { grokUnresolved: true } : {}),
     }
-    if (this.files.has(path)) return this.files.get(path)
-    this.files.set(path, entry)
-    const session = this.sessionFor(root.kind, sessionId)
+    if (this.book.files.has(path)) return this.book.files.get(path)
+    this.book.files.set(path, entry)
+    const session = this.book.sessionFor(root.kind, sessionId)
     if (role === 'main') session.main = entry
     else session.children.set(id, entry)
-    if (role === 'child' && !initial) this.emitTo(session, { type: 'file', file: ref })
+    if (role === 'child' && !initial) this.book.emitTo(session, { type: 'file', file: ref })
     // The meta scanner replays from byte 0 unless the listing cache restores
     // it; the search index answers with the first line it has not stored yet.
     // A transcript untouched for longer than the retention window stays
@@ -643,10 +634,10 @@ export class SessionIndex extends EventEmitter {
   private rehomeGrokChild(entry: FileEntry, parentId: string, agent: AgentFileMeta): void {
     if (entry.ref.role !== 'main' || entry.sessionId === parentId) return
     const previousKey = sessionKey(entry.kind, entry.sessionId)
-    const previous = this.sessions.get(previousKey)
+    const previous = this.book.sessions.get(previousKey)
     if (previous !== undefined) {
       if (previous.main === entry) previous.main = null
-      if (previous.main === null && previous.children.size === 0) this.sessions.delete(previousKey)
+      if (previous.main === null && previous.children.size === 0) this.book.sessions.delete(previousKey)
     }
     entry.ref = { ...entry.ref, role: 'child', parentId, agent }
     entry.sessionId = parentId
@@ -657,10 +648,10 @@ export class SessionIndex extends EventEmitter {
     // Its lines were indexed under its own id; move them to the parent so a hit
     // opens the parent session with this transcript selected.
     this.search?.rebind(searchKeyOf(entry))
-    const parent = this.sessionFor(entry.kind, parentId)
+    const parent = this.book.sessionFor(entry.kind, parentId)
     parent.children.set(entry.ref.id, entry)
-    this.emitTo(parent, { type: 'file', file: entry.ref })
-    this.emitTo(parent, { type: 'meta', summary: this.summarize(parent), children: this.childSummaries(parent) })
+    this.book.emitTo(parent, { type: 'file', file: entry.ref })
+    this.book.emitTo(parent, { type: 'meta', summary: this.book.summarize(parent), children: this.book.childSummaries(parent) })
     this.emit('change', entry.kind, parentId)
   }
 
@@ -670,7 +661,7 @@ export class SessionIndex extends EventEmitter {
     const agent = await readAgentMeta(entry.path)
     if (agent?.toolUseId === undefined) return
     entry.ref = { ...entry.ref, agent }
-    this.emitTo(session, { type: 'file', file: entry.ref })
+    this.book.emitTo(session, { type: 'file', file: entry.ref })
   }
 
   /**
@@ -717,33 +708,23 @@ export class SessionIndex extends EventEmitter {
     // `register` already fed this very object to the meta scanner.
     if (initial) return
     const key = sessionKey(entry.kind, entry.sessionId)
-    const session = this.sessions.get(key)
+    const session = this.book.sessions.get(key)
     if (session === undefined) return
     const summary = await readJsonRecord(join(dir, 'summary.json'))
     const title = grokSummaryTitle(summary)
     const titleChanged = title !== entry.summaryTitle
     entry.summaryTitle = title
     if (titleChanged && title !== null && entry.meta !== null) entry.meta.state.aiTitle = title
-    if (this.subscribers.get(key) === undefined) return
+    if (!this.book.hasSubscribers(entry.kind, entry.sessionId)) return
     const sidecar = await buildGrokSidecar(dir, entry.ref.id, summary)
     if (sidecar !== undefined && sidecar.key !== entry.sidecarKey) {
       entry.sidecarKey = sidecar.key
       // Synthetic: it belongs to no line of `updates.jsonl` (see `startLine`).
-      this.emitTo(session, { type: 'lines', file: entry.ref, lines: [sidecar.line], startLine: -1 })
+      this.book.emitTo(session, { type: 'lines', file: entry.ref, lines: [sidecar.line], startLine: -1 })
     } else if (!titleChanged) {
       return
     }
-    this.emitTo(session, { type: 'meta', summary: this.summarize(session), children: this.childSummaries(session) })
-  }
-
-  private sessionFor(kind: HarnessKind, id: string): SessionRecord {
-    const key = sessionKey(kind, id)
-    let session = this.sessions.get(key)
-    if (session === undefined) {
-      session = { kind, id, main: null, children: new Map() }
-      this.sessions.set(key, session)
-    }
-    return session
+    this.book.emitTo(session, { type: 'meta', summary: this.book.summarize(session), children: this.book.childSummaries(session) })
   }
 
   /**
@@ -861,7 +842,7 @@ export class SessionIndex extends EventEmitter {
 
   /** Consume appended bytes: update metadata and forward new lines to subscribers. */
   private async consumeInner(entry: FileEntry, size: number, mtimeMs: number, initial = false): Promise<void> {
-    const session = this.sessions.get(sessionKey(entry.kind, entry.sessionId))
+    const session = this.book.sessions.get(sessionKey(entry.kind, entry.sessionId))
     if (size < entry.offset) {
       // Truncated or rewritten: start over and tell subscribers to reset the file.
       entry.offset = 0
@@ -879,7 +860,7 @@ export class SessionIndex extends EventEmitter {
           ? await readJsonRecord(join(dirname(entry.path), 'summary.json'))
           : null)
         : null
-      if (session !== undefined) this.emitTo(session, { type: 'file', file: entry.ref, reset: true })
+      if (session !== undefined) this.book.emitTo(session, { type: 'file', file: entry.ref, reset: true })
     }
     entry.size = size
     entry.mtimeMs = Math.max(entry.mtimeMs, mtimeMs)
@@ -897,8 +878,8 @@ export class SessionIndex extends EventEmitter {
     if (result.lines.length === 0 || session === undefined) return
     this.applyChildListing(session)
     if (!initial) {
-      this.emitTo(session, { type: 'lines', file: entry.ref, lines: result.lines, startLine })
-      this.emitTo(session, { type: 'meta', summary: this.summarize(session), children: this.childSummaries(session) })
+      this.book.emitTo(session, { type: 'lines', file: entry.ref, lines: result.lines, startLine })
+      this.book.emitTo(session, { type: 'meta', summary: this.book.summarize(session), children: this.book.childSummaries(session) })
     }
     this.emit('change', entry.kind, entry.sessionId)
   }
@@ -929,20 +910,7 @@ export class SessionIndex extends EventEmitter {
 
   /** Listing facts for one session, for search result grouping. */
   facts(kind: HarnessKind, id: string): { title: string; cwd?: string; updatedAt?: number } | undefined {
-    const session = this.sessions.get(sessionKey(kind, id))
-    if (session === undefined || session.main === null) return undefined
-    const summary = this.summarize(session)
-    return {
-      title: summary.title,
-      ...(summary.cwd === null ? {} : { cwd: summary.cwd }),
-      updatedAt: summary.updatedAt,
-    }
-  }
-
-  private emitTo(session: SessionRecord, event: SessionLiveEvent): void {
-    const set = this.subscribers.get(sessionKey(session.kind, session.id))
-    if (set === undefined) return
-    for (const subscriber of set) subscriber(event)
+    return this.book.facts(kind, id)
   }
 
   /**
@@ -961,38 +929,7 @@ export class SessionIndex extends EventEmitter {
       const next = mergeChildAgent(id, fromParent?.get(id), child.meta?.state, child.ref.agent)
       if (next === undefined || agentMetaEqual(child.ref.agent, next)) continue
       child.ref = { ...child.ref, agent: next }
-      this.emitTo(session, { type: 'file', file: child.ref })
-    }
-  }
-
-  private childSummaries(session: SessionRecord): SessionChildSummary[] {
-    return [...session.children.values()].map(entry => ({
-      file: entry.ref,
-      updatedAt: entry.mtimeMs,
-      bytes: entry.size,
-    }))
-  }
-
-  private summarize(session: SessionRecord): SessionSummary {
-    const main = session.main
-    const meta = main?.meta?.state
-    const entries = [main, ...session.children.values()]
-      .filter((entry): entry is FileEntry => entry !== null)
-    const latestWrite = Math.max(0, ...entries.map(entry => entry.mtimeMs))
-    const updatedAt = Math.max(latestWrite, meta?.lastTime ?? 0)
-    const bytes = entries.reduce((sum, entry) => sum + entry.size, 0)
-    return {
-      id: session.id,
-      kind: session.kind,
-      title: meta?.aiTitle ?? meta?.title ?? session.id,
-      cwd: meta?.cwd ?? null,
-      model: meta?.model ?? null,
-      startedAt: meta?.startedAt ?? null,
-      updatedAt,
-      bytes,
-      live: this.now() - latestWrite < LIVE_WINDOW_MS,
-      childCount: session.children.size,
-      promptCount: meta?.promptCount ?? 0,
+      this.book.emitTo(session, { type: 'file', file: child.ref })
     }
   }
 
@@ -1026,7 +963,7 @@ export class SessionIndex extends EventEmitter {
   }
 
   private async refresh(root: HarnessRoot, path: string): Promise<void> {
-    const entry = this.files.get(path)
+    const entry = this.book.files.get(path)
     if (entry === undefined) {
       await this.register(root, path)
       return
@@ -1045,8 +982,8 @@ export class SessionIndex extends EventEmitter {
 
   /** Fallback for watchers that miss events: poll files of sessions someone is viewing. */
   private async pollSubscribed(): Promise<void> {
-    for (const key of this.subscribers.keys()) {
-      const session = this.sessions.get(key)
+    for (const key of this.book.subscribedKeys()) {
+      const session = this.book.sessions.get(key)
       if (session === undefined) continue
       for (const entry of [session.main, ...session.children.values()]) {
         if (entry === null) continue
@@ -1074,7 +1011,7 @@ export class SessionIndex extends EventEmitter {
       const childDir = liveChildDir(session.kind, session.id, main.path)
       if (childDir !== undefined) {
         for (const path of await walk(childDir)) {
-          if (!this.files.has(path)) await this.register(root, path)
+          if (!this.book.files.has(path)) await this.register(root, path)
         }
       }
     }
@@ -1095,7 +1032,7 @@ export class SessionIndex extends EventEmitter {
     for (const binding of await readGrokSubagentMetas(metaDir)) {
       this.noteGrokBinding(binding)
       for (const candidate of grokChildPaths(root.dir, main.path, binding)) {
-        const existing = this.files.get(candidate)
+        const existing = this.book.files.get(candidate)
         if (existing !== undefined) {
           // Registered before this meta.json existed, so it landed as a session
           // of its own: the parent has claimed it now.
@@ -1112,36 +1049,6 @@ export class SessionIndex extends EventEmitter {
       if (path.startsWith(root.dir + sep)) return root
     }
     return undefined
-  }
-}
-
-/**
- * How the search index addresses one transcript: the session a hit opens and
- * the `?file=` id that selects this file inside it. For a main file both are the
- * session id; for a child, `fileId` is the child's own ref id.
- */
-function searchKeyOf(entry: FileEntry): SearchFileKey {
-  return { path: entry.path, kind: entry.kind, sessionId: entry.sessionId, fileId: entry.ref.id }
-}
-
-/** The ref a child transcript is served with when it is viewed as a session of its own. */
-export function standaloneRef(ref: SessionFileRef): SessionFileRef {
-  const { parentId: _parentId, ...rest } = ref
-  return { ...rest, role: 'main' }
-}
-
-/**
- * Narrow a session's live event to one child transcript's own view: events
- * about other files are dropped and the child's ref is served as `main`.
- */
-export function scopeToFile(event: SessionLiveEvent, fileId: string): SessionLiveEvent | null {
-  switch (event.type) {
-    case 'lines':
-      return event.file.id === fileId ? { ...event, file: standaloneRef(event.file) } : null
-    case 'file':
-      return event.file.id === fileId ? { ...event, file: standaloneRef(event.file) } : null
-    default:
-      return event
   }
 }
 
@@ -1412,127 +1319,6 @@ async function readWholeFile(path: string, end: number): Promise<string[]> {
     lines.push(...result.lines)
   }
   return lines
-}
-
-const TIMESTAMP_PATTERN = /"timestamp"\s*:\s*(?:"([^"]+)"|(\d+(?:\.\d+)?))/
-/** Kimi records carry `"time":<epoch ms>` and no `timestamp`. */
-const TIME_PATTERN = /"time"\s*:\s*(\d+(?:\.\d+)?)/
-
-/** Epoch milliseconds from a numeric timestamp; values below 1e12 are seconds. */
-function epochMs(raw: string | undefined): number | null {
-  const numeric = Number(raw)
-  if (raw === undefined || !Number.isFinite(numeric)) return null
-  return numeric < 1e12 ? Math.round(numeric * 1000) : Math.round(numeric)
-}
-
-/**
- * Epoch milliseconds of a raw JSONL line's `timestamp` (or Kimi's `time`), or
- * `null`. Grok needs no branch of its own: its envelope's `"timestamp"` is
- * numeric epoch **seconds** and is the first key on the line, while the
- * millisecond stamp is spelled `agentTimestampMs` and never matches either
- * pattern (GROK-FORMAT §C.1).
- */
-export function lineTime(line: string): number | null {
-  const match = TIMESTAMP_PATTERN.exec(line)
-  if (match === null) return epochMs(TIME_PATTERN.exec(line)?.[1])
-  if (match[1] !== undefined) {
-    const parsed = Date.parse(match[1])
-    return Number.isNaN(parsed) ? null : parsed
-  }
-  return epochMs(match[2])
-}
-
-/**
- * Per-line sort keys: records without a timestamp (housekeeping rows) inherit
- * the previous timestamped line's time so they keep their file position.
- */
-export function lineTimes(lines: readonly string[]): number[] {
-  const times = new Array<number>(lines.length)
-  let last: number | null = null
-  for (const [index, line] of lines.entries()) {
-    const time = lineTime(line)
-    if (time !== null) last = time
-    times[index] = last ?? Number.NEGATIVE_INFINITY
-  }
-  // Leading lines before the first timestamp take that first timestamp.
-  const first = times.find(time => time !== Number.NEGATIVE_INFINITY)
-  if (first !== undefined) {
-    for (let index = 0; index < times.length && times[index] === Number.NEGATIVE_INFINITY; index += 1) {
-      times[index] = first
-    }
-  }
-  return times
-}
-
-export interface LineSource {
-  ref: SessionFileRef
-  lines: readonly string[]
-  times: readonly number[]
-  /**
-   * Leading entries of `lines` the server synthesized rather than read (grok's
-   * sidecar). They are in no file, so they take no line index and the entry
-   * after them is line 0.
-   */
-  synthetic?: number
-}
-
-/** One replayed run of lines, addressed the way live appends are. */
-export interface LineChunk {
-  ref: SessionFileRef
-  lines: string[]
-  /** 0-based index of `lines[0]` among the file's non-blank lines; negative when synthetic. */
-  startLine: number
-}
-
-/**
- * Stable k-way merge of per-file line sequences by time; earlier sources win
- * ties, so the main transcript precedes children at equal timestamps. Emits
- * runs of consecutive lines from one file, capped at `CHUNK_LINES`; synthetic
- * lines never share a chunk with real ones, so one `startLine` addresses the
- * whole run.
- */
-export function* mergeChronologically(sources: readonly LineSource[]): Generator<LineChunk> {
-  const cursors = sources.map(() => 0)
-  let current: (LineChunk & { source: number; synthetic: boolean }) | null = null
-  for (;;) {
-    let best = -1
-    let bestTime = Number.POSITIVE_INFINITY
-    for (const [index, source] of sources.entries()) {
-      const cursor = cursors[index] ?? 0
-      if (cursor >= source.lines.length) continue
-      const time = source.times[cursor] ?? Number.NEGATIVE_INFINITY
-      if (best === -1 || time < bestTime) {
-        best = index
-        bestTime = time
-      }
-    }
-    if (best === -1) break
-    const source = sources[best]
-    const cursor = cursors[best] ?? 0
-    if (source === undefined) break
-    const line = source.lines[cursor]
-    cursors[best] = cursor + 1
-    if (line === undefined) continue
-    const skipped = source.synthetic ?? 0
-    const synthetic = cursor < skipped
-    if (
-      current === null || current.source !== best
-      || current.synthetic !== synthetic || current.lines.length >= CHUNK_LINES
-    ) {
-      if (current !== null) yield { ref: current.ref, lines: current.lines, startLine: current.startLine }
-      current = {
-        ref: source.ref,
-        lines: [],
-        startLine: synthetic ? -1 : cursor - skipped,
-        source: best,
-        synthetic,
-      }
-    }
-    current.lines.push(line)
-  }
-  if (current !== null && current.lines.length > 0) {
-    yield { ref: current.ref, lines: current.lines, startLine: current.startLine }
-  }
 }
 
 /** Recursively list `.jsonl` files under a directory; missing directories yield nothing. */

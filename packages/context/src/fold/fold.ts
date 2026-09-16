@@ -1237,10 +1237,13 @@ export function applyTimeline(state: TimelineState, event: TimelineEvent, bounds
               rec.detail = source.summary
             }
           }
-          s.events.push(rec)
-        } else {
+          // PORT ADDITION: a `replay` copy keeps its node label but does not
+          // re-list — the original already earned the events row.
+          if (data?.replay !== true) s.events.push(rec)
+        } else if (data?.replay !== true) {
           // The user's own message (the exact set the surface's `user`
-          // category holds): one human input, whole-session tally.
+          // category holds): one human input, whole-session tally. A kept copy
+          // is not a new input.
           s.humanInputs = (s.humanInputs ?? 0) + 1
         }
         break
@@ -1328,7 +1331,11 @@ export function applyTimeline(state: TimelineState, event: TimelineEvent, bounds
             s.sums.tool -= node.tokens
             node.cat = 'skill'
             s.sums.skill += node.tokens
-            s.events.push({ seq: event.seq, time: event.time, kind: 'inject', form: 'instructions', sub: 'skill', name, tokens: node.tokens })
+            // A replayed skill result still re-buckets (the kept copy IS skill
+            // content) but must not re-list the inject row.
+            if (data?.replay !== true) {
+              s.events.push({ seq: event.seq, time: event.time, kind: 'inject', form: 'instructions', sub: 'skill', name, tokens: node.tokens })
+            }
           }
         }
         break
@@ -1339,6 +1346,14 @@ export function applyTimeline(state: TimelineState, event: TimelineEvent, bounds
         const usage = data?.usage as UsageLike | null | undefined
         const s = ensure()
         bumpDetailRev(s)
+        // PORT ADDITION — `replay` marks a re-rendered kept copy (Devin's
+        // post-compaction context render): it rejoins the surface because the
+        // context does carry it, but it is not a dispatch — no request record,
+        // no usage, no step timing; the original was already booked.
+        if (data?.replay === true) {
+          applySurface(s, event, event.type, data, deriveEventMessage(event))
+          break
+        }
         const total = s.systemTokens + s.toolsTokens + s.sums.user + s.sums.inject + s.sums.skill + s.sums.assistant + s.sums.tool
         const record: RequestRecord = {
           time: event.time, seq: event.seq,

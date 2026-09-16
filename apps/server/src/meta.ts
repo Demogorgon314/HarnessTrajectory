@@ -5,9 +5,9 @@
  */
 
 import {
-  agentMentions, asArray, asNumber, asString, classifyInjectedUser, grokMessageClass, isCodexHumanPrompt, isRecord,
-  kimiMessageClass, kimiTitleText, parseGrokLine, parseJsonLine, parseTime, titleFrom,
-  type AgentFileMeta, type HarnessKind,
+  agentMentions, asArray, asNumber, asString, classifyInjectedUser, devinMessageClass, grokMessageClass,
+  isCodexHumanPrompt, isRecord, kimiMessageClass, kimiTitleText, parseDevinLine, parseGrokLine,
+  parseJsonLine, parseTime, titleFrom, type AgentFileMeta, type HarnessKind,
 } from '@harness-trajectory/core'
 
 export interface FileHead {
@@ -131,11 +131,10 @@ export function hydrateMeta(scanner: MetaScanner, saved: string): boolean {
 }
 
 /**
- * Scanner for one transcript. `summary` is only read by the grok scanner: it is
- * the parsed `summary.json` sitting beside `updates.jsonl`, which carries the
- * facts grok keeps out of the transcript (GROK-FORMAT §B.1). The caller reads
- * that file — it already does, to decide whether the session is a subagent —
- * so the scanner itself performs no I/O.
+ * Scanner for one transcript. `summary` is read by the store-backed scanners:
+ * for grok it is the parsed `summary.json` sitting beside `updates.jsonl`
+ * (GROK-FORMAT §B.1), for devin the `sessions` row the source already loaded
+ * (title, cwd, model, `createdAt` ms). The scanner itself performs no I/O.
  */
 export function createMetaScanner(
   kind: HarnessKind,
@@ -146,6 +145,7 @@ export function createMetaScanner(
     case 'codex': return codexMetaScanner()
     case 'kimi': return kimiMetaScanner()
     case 'grok': return grokMetaScanner(summary ?? null)
+    case 'devin': return devinMetaScanner(summary ?? null)
   }
 }
 
@@ -521,12 +521,58 @@ function grokMetaScanner(summary: Record<string, unknown> | null): MetaScanner {
   }
 }
 
+/**
+ * Devin keeps title/cwd/model in the `sessions` row — handed in as `summary` —
+ * and its generated title lands late, so it goes to `aiTitle` like grok's
+ * `session_summary`. The prompt count comes from `is_user_input` on the
+ * emitted `devin.msg` lines; every stream gets its own scanner, so a
+ * subagent chain's delegated task (`is_user_input:true`, same as the main
+ * stream's prompts) counts toward the child file, never the parent's.
+ */
+function devinMetaScanner(session: Record<string, unknown> | null): MetaScanner {
+  const state = emptyMeta()
+  // Kept render copies re-emit past a summary boundary — same message_id, not
+  // a new prompt.
+  const seenMids = new Set<string>()
+  if (session !== null) {
+    const title = asString(session['title'])?.trim()
+    if (title !== undefined && title !== '') state.aiTitle = title
+    state.cwd = asString(session['cwd']) ?? null
+    state.model = asString(session['model']) ?? null
+    noteTime(state, session['createdAt'])
+  }
+  return {
+    state,
+    push(line) {
+      const record = parseDevinLine(line)
+      if (record === null) return
+      if (record.time !== null) noteTime(state, record.time)
+      if (record.tag !== 'msg') return
+      const mid = asString(record.msg['message_id'])
+      if (mid !== undefined) {
+        if (seenMids.has(mid)) return
+        seenMids.add(mid)
+      }
+      if (devinMessageClass(record.msg)?.kind !== 'human') return
+      state.promptCount += 1
+      const content = record.msg['content']
+      const text = typeof content === 'string'
+        ? content
+        : (asArray(content) ?? [])
+          .flatMap(block => (isRecord(block) && block['type'] === 'text' ? [asString(block['text']) ?? ''] : []))
+          .join('\n')
+      if (state.title === null && text.trim() !== '') state.title = titleFrom(text)
+    },
+  }
+}
+
 /** Read identity facts from the first record of a transcript. */
 export function readHead(kind: HarnessKind, firstLine: string): FileHead {
   // Kimi identity is path-derived (`session_<id>/agents/<agentId>/wire.jsonl`); nothing to probe.
   // Grok's is too (`<encoded-cwd>/<session-id>/updates.jsonl`), and its parent link lives in the
   // parent's `subagents/<id>/meta.json`, not in the first record (GROK-FORMAT §D.4).
-  if (kind === 'kimi' || kind === 'grok') return { id: null, parentId: null }
+  // Devin's likewise (`devin://sessions/<id>` — the source derives chains, not the head).
+  if (kind === 'kimi' || kind === 'grok' || kind === 'devin') return { id: null, parentId: null }
   const record = parseJsonLine(firstLine)
   if (!isRecord(record)) return { id: null, parentId: null }
   if (kind === 'codex') {
