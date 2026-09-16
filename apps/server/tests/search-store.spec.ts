@@ -370,4 +370,53 @@ describe('text dedup', () => {
     expect(store.db.prepare('select count(*) as n from docs_fts').get()?.['n']).toBe(0)
     expect(search(store, { q: 'nobody else typed' }).totalHits).toBe(0)
   })
+
+  it('applies the harness kind filter before the candidate cap, not after', () => {
+    const store = open()
+    // Three claude-only texts indexed first: they would exhaust a budget of 3.
+    add(store, key(), [0, 1, 2].map(index => ({
+      line: index, role: 'assistant' as const, text: `needle claude variant ${index}`,
+    })))
+    add(store, key({ path: '/r/codex/r-1.jsonl', kind: 'codex', sessionId: 'thread-1', fileId: 'thread-1' }), [
+      { line: 0, role: 'assistant', text: 'needle codex singleton' },
+    ])
+    // Unfiltered, the cap really does cut the codex text (indexed last)…
+    expect(search(store, { q: 'needle', candidateLimit: 3 }).groups
+      .some(group => group.kind === 'codex')).toBe(false)
+    // …but a kind-narrowed search counts only candidates that can hit codex.
+    const filtered = search(store, { q: 'needle', candidateLimit: 3, kind: 'codex' })
+    expect(filtered.totalHits).toBe(1)
+    expect(filtered.groups[0]).toMatchObject({ kind: 'codex', sessionId: 'thread-1', hitCount: 1 })
+  })
+
+  it('does not let orphaned texts spend the candidate budget', () => {
+    const store = open()
+    const doomed = key()
+    add(store, doomed, [0, 1, 2].map(index => ({
+      line: index, role: 'assistant' as const, text: `needle claude variant ${index}`,
+    })))
+    add(store, key({ path: '/r/codex/r-1.jsonl', kind: 'codex', sessionId: 'thread-1', fileId: 'thread-1' }), [
+      { line: 0, role: 'assistant', text: 'needle codex singleton' },
+    ])
+    // The claude file is rewritten away: docs cleared, texts orphaned until GC.
+    store.transaction(() => { store.clearDocs(doomed.path) })
+    expect(store.textCount()).toBe(4)
+    const response = search(store, { q: 'needle', candidateLimit: 3 })
+    expect(response.totalHits).toBe(1)
+    expect(response.groups[0]).toMatchObject({ kind: 'codex', sessionId: 'thread-1' })
+  })
+
+  it('bounds expansion for a text with very many occurrences, with exact totals', () => {
+    const store = open()
+    const n = 20_000
+    add(store, key(), Array.from({ length: n }, (_unused, index) => ({
+      line: index, role: 'tool' as const, text: 'shared boilerplate needle',
+    })))
+    // Materializing every occurrence here used to cost ~65 MiB per 200k rows.
+    const response = search(store, { q: 'boilerplate needle', limit: 5 })
+    expect(response.totalHits).toBe(5)
+    expect(response.truncated).toBe(true)
+    expect(response.groups[0]).toMatchObject({ sessionId: 'main-1', hitCount: n })
+    expect(response.groups[0]?.hits.map(hit => hit.line)).toEqual([0, 1, 2, 3, 4])
+  })
 })

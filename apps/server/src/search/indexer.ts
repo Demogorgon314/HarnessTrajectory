@@ -283,18 +283,19 @@ export class SearchIndexer {
     this.flush()
     const live = new Set(livePaths)
     const gone = this.store.paths().filter(path => !live.has(path))
-    if (gone.length > 0) {
-      try {
+    try {
+      if (gone.length > 0) {
         this.store.transaction(() => {
           for (const path of gone) this.store.deleteFile(path)
         })
-        // Files deleted on disk leave their texts orphaned; reclaim them
-        // (and with a retention purge, most of the database) before vacuum.
-        this.store.gcTexts()
-        this.store.compact()
-      } catch {
-        // Stale rows are harmless; the next startup tries again.
       }
+      // Runtime resets and forgets orphan texts without a file ever vanishing,
+      // so this runs whether or not the sweep deleted anything: the startup
+      // sweep is the one guaranteed chance to reclaim what piled up.
+      this.store.gcTexts()
+      if (gone.length > 0) this.store.compact()
+    } catch {
+      // Stale rows are harmless; the next startup tries again.
     }
     // The backfill is the one burst of heavy writing; fold its WAL back in now
     // so the cache directory settles at the database's real size.

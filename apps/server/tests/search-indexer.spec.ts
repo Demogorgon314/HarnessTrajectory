@@ -362,6 +362,23 @@ describe('SearchIndexer', () => {
     indexer.stop()
   })
 
+  it('reclaims runtime orphans at the startup sweep even when no file vanished', () => {
+    const indexer = new SearchIndexer({ store, flushDelayMs: 60_000 })
+    const key = { path: '/r/c/main.jsonl', kind: 'claude' as const, sessionId: 'm', fileId: 'm' }
+    store.transaction(() => {
+      store.insertDocs(key, [{ line: 0, role: 'human', text: 'orphan me later' }])
+      store.setFileState(key, { size: 200, mtimeMs: 1_000, indexedBytes: 200, indexedLines: 1 })
+    })
+    // A runtime reset deletes the docs but not the file row: the text is an
+    // orphan with no vanished file to trigger a GC.
+    indexer.reset(key.path)
+    indexer.flush()
+    expect(store.textCount()).toBe(1)
+    indexer.finishBackfill([key.path])
+    expect(store.textCount()).toBe(0)
+    indexer.stop()
+  })
+
   it('re-homes documents queued before a child was bound to its parent', () => {
     const indexer = new SearchIndexer({ store, flushDelayMs: 60_000 })
     const orphan = { path: '/r/g/child/updates.jsonl', kind: 'grok' as const, sessionId: 'child', fileId: 'child' }

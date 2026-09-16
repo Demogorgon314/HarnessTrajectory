@@ -29,6 +29,12 @@
  * are built only for the hits a page actually displays — never for the
  * thousands of candidates that verify but do not rank in.
  *
+ * Expansion is bounded too: texts are processed best-first, the displayed
+ * page is collected while scanning occurrences in chunks, and once the page
+ * is full the per-session totals keep counting per file instead of per row —
+ * a text pasted into 200k records costs one SQL aggregate, not 200k JS
+ * objects and an event-loop stall.
+ *
  * Trigram cannot index fewer than three characters, so a shorter query returns
  * no groups and reports `minLength: 3`; the UI asks for one more character
  * rather than falling back to a full `LIKE` scan over hundreds of megabytes.
@@ -79,9 +85,10 @@ export interface SearchSessionFacts {
 export interface SearchOptions {
   q: string
   /**
-   * Restrict hits to one harness. Applied during occurrence expansion, not
-   * in the candidate query: a unique text has no kind (it may span kinds),
-   * so the cap counts texts of every kind before this filter.
+   * Restrict hits to one harness. Pushed into the candidate query as an
+   * `EXISTS`, so the candidate cap only counts texts that can produce a hit
+   * in this harness (a text may still span kinds: expansion counts only the
+   * matching occurrences).
    */
   kind?: HarnessKind
   /** Maximum hits across all sessions; clamped to `SEARCH_MAX_LIMIT`. */
@@ -190,20 +197,54 @@ function buildSnippetFromFolded(
 
 /**
  * The candidate query: every unique text whose trigram set covers the
- * query's, in first-indexed order (the FTS rowid is the text id).
+ * query's, in first-indexed order (the FTS rowid is the text id). The
+ * `EXISTS` keeps two kinds of rows from spending the candidate budget:
+ * texts whose last occurrence was deleted (orphans await `gcTexts`, until
+ * then they would match and shadow live hits) and — for a kind-narrowed
+ * search — texts with no occurrence in that harness. Filtering in SQL, not
+ * after `LIMIT`, is what makes the cap count only candidates that can
+ * produce a hit.
  */
 const CANDIDATE_SQL = `
   select t.id as text_id, t.text as blob
   from docs_fts
   join texts t on t.id = docs_fts.rowid
   where docs_fts match ?
+    and exists (select 1 from docs d where d.text = docs_fts.rowid)
   order by docs_fts.rowid
   limit ?
 `
 
-/** Every occurrence of one text, addressed by file rowid, in insertion order. */
+const CANDIDATE_SQL_BY_KIND = `
+  select t.id as text_id, t.text as blob
+  from docs_fts
+  join texts t on t.id = docs_fts.rowid
+  where docs_fts match ?
+    and exists (
+      select 1 from docs d join files f on f.id = d.file
+      where d.text = docs_fts.rowid and f.kind = ?
+    )
+  order by docs_fts.rowid
+  limit ?
+`
+
+/**
+ * Occurrences of one text, paged so a text with hundreds of thousands of
+ * them never materializes at once. `id` drives both the page cursor and the
+ * remainder count. (`StatementSync.iterate` would avoid the chunking, but it
+ * only exists on Node 23+ and the floor here is 22.13.)
+ */
 const OCCURRENCE_SQL = `
-  select file, line, role, time_ms from docs where text = ? order by id
+  select id, file, line, role, time_ms from docs
+  where text = ? and id > ? order by id limit 256
+`
+
+/**
+ * Occurrence counts per file, for everything past the displayed page: group
+ * totals are exact without reading a quarter million rows into JS.
+ */
+const COUNT_BY_FILE_SQL = `
+  select file, count(*) as n from docs where text = ? and id > ? group by file
 `
 
 /** One verified text: the inflate and the fold happen exactly once per text. */
@@ -233,7 +274,9 @@ export function search(store: SearchStore, options: SearchOptions): SearchRespon
   let rows: Record<string, unknown>[]
   try {
     // One row over the cap tells the response the candidate set was cut short.
-    rows = store.db.prepare(CANDIDATE_SQL).all(toTrigramQuery(q), candidateLimit + 1)
+    rows = options.kind === undefined
+      ? store.db.prepare(CANDIDATE_SQL).all(toTrigramQuery(q), candidateLimit + 1)
+      : store.db.prepare(CANDIDATE_SQL_BY_KIND).all(toTrigramQuery(q), options.kind, candidateLimit + 1)
   } catch {
     // A malformed FTS expression or a database being rebuilt underneath us.
     return empty
@@ -262,44 +305,75 @@ export function search(store: SearchStore, options: SearchOptions): SearchRespon
     verified.set(asInt(row['text_id']), { text, folded, occurrences })
   }
 
-  // Expand verified texts to their occurrences; the kind filter applies here,
-  // where the session identity lives.
+  // Rank: every hit of a text shares its occurrence count, so ordering the
+  // verified texts by that count (stably — ties keep candidate order, and
+  // occurrences stay in insertion order within a text) yields the exact
+  // sequence a materialize-then-sort pipeline would produce, without
+  // materializing it.
+  const ranked = [...verified.entries()].sort((a, b) => b[1].occurrences - a[1].occurrences)
+
   const files = store.filesMap()
   const occurrence = store.db.prepare(OCCURRENCE_SQL)
-  const hits: { hit: SearchHit; textId: number }[] = []
+  const countByFile = store.db.prepare(COUNT_BY_FILE_SQL)
+  const page: { hit: SearchHit; textId: number }[] = []
   const totals = new Map<string, number>()
-  for (const [textId, entry] of verified) {
-    for (const row of occurrence.all(textId)) {
+  let pageFull = false
+
+  const keep = (file: { kind: HarnessKind }): boolean =>
+    options.kind === undefined || file.kind === options.kind
+  const countHit = (file: { kind: HarnessKind; sessionId: string }, n: number): void => {
+    const groupKey = `${file.kind} ${file.sessionId}`
+    totals.set(groupKey, (totals.get(groupKey) ?? 0) + n)
+  }
+  /** Totals for occurrences past `afterId`, counted per file — never per row. */
+  const countRemainder = (textId: number, afterId: number): void => {
+    for (const row of countByFile.all(textId, afterId)) {
       const file = files.get(asInt(row['file']))
-      if (file === undefined) continue
-      if (options.kind !== undefined && file.kind !== options.kind) continue
-      const groupKey = `${file.kind} ${file.sessionId}`
-      totals.set(groupKey, (totals.get(groupKey) ?? 0) + 1)
-      const timeMs = row['time_ms'] === null || row['time_ms'] === undefined ? undefined : asInt(row['time_ms'])
-      hits.push({
-        textId,
-        hit: {
-          kind: file.kind,
-          sessionId: file.sessionId,
-          fileId: file.fileId,
-          line: asInt(row['line']),
-          role: asRole(row['role']),
-          ...(timeMs === undefined ? {} : { timeMs }),
-          // Filled in for the displayed page only, after ranking.
-          snippet: '',
-          matches: [],
-          score: entry.occurrences,
-        },
-      })
+      if (file !== undefined && keep(file)) countHit(file, asInt(row['n']))
     }
   }
 
-  // Occurrence count is the ranking bm25 used to provide; ties keep the
-  // deterministic insertion order the candidate scan returned (sort is stable).
-  hits.sort((a, b) => b.hit.score - a.hit.score)
+  for (const [textId, entry] of ranked) {
+    if (pageFull) {
+      countRemainder(textId, -1)
+      continue
+    }
+    let afterId = -1
+    for (;;) {
+      const chunk = occurrence.all(textId, afterId)
+      for (const row of chunk) {
+        afterId = asInt(row['id'])
+        const file = files.get(asInt(row['file']))
+        if (file === undefined || !keep(file)) continue
+        countHit(file, 1)
+        // The first hit past the page marks truncation and stops the scan;
+        // everything after it only feeds the per-session totals.
+        if (page.length >= limit) { pageFull = true; break }
+        const timeMs = row['time_ms'] === null || row['time_ms'] === undefined ? undefined : asInt(row['time_ms'])
+        page.push({
+          textId,
+          hit: {
+            kind: file.kind,
+            sessionId: file.sessionId,
+            fileId: file.fileId,
+            line: asInt(row['line']),
+            role: asRole(row['role']),
+            ...(timeMs === undefined ? {} : { timeMs }),
+            // Filled in for the displayed hits only, after grouping.
+            snippet: '',
+            matches: [],
+            score: entry.occurrences,
+          },
+        })
+      }
+      if (pageFull || chunk.length < 256) break
+    }
+    // The chunk row that filled the page was counted inline; the rest of the
+    // text (if any) is counted in bulk.
+    if (pageFull) countRemainder(textId, afterId)
+  }
 
-  const truncated = capped || hits.length > limit
-  const page = hits.slice(0, limit)
+  const truncated = capped || pageFull
   const groups = new Map<string, SearchSessionGroup>()
   for (const { hit, textId } of page) {
     const groupKey = `${hit.kind} ${hit.sessionId}`

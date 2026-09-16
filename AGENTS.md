@@ -93,16 +93,19 @@ Logo credits live in the web registry and README license section.
   inverted index dedups too. `extract.ts` indexes tool *calls* (command, paths,
   patterns, write/edit contents) but never tool *outputs* — stdout is ~73% of
   the unique text on the reference corpus and duplicates what the trajectory
-  view's client-side search already covers. `indexer.ts` batches writes. `query.ts` ANDs trigrams, verifies each unique text once in JS,
-  expands occurrences through `docs_by_text` and the in-memory `files` snapshot
-  (kind filter applies at expansion), ranks by occurrence count, and builds
-  snippets only for displayed hits. FTS phrase queries, `snippet()`, and `bm25`
-  are not used.
+  view's client-side search already covers. `indexer.ts` batches writes.
+  `query.ts` ANDs trigrams, excludes orphaned texts (and, for a kind-narrowed
+  search, texts with no occurrence in that harness) with an `EXISTS` before
+  the candidate `LIMIT`, verifies each unique text once in JS, and expands
+  occurrences best-first: the displayed page is collected in bounded chunks
+  and, once full, per-session totals keep counting per file — expansion stays
+  bounded no matter how often a text repeats. Snippets are built only for
+  displayed hits. FTS phrase queries, `snippet()`, and `bm25` are not used.
 - Deletes remove only `docs` rows; texts orphaned when their last occurrence goes
-  away still match but expand to zero hits. `store.gcTexts()` reclaims them (with
-  their FTS rows) on the paths that already accept a multi-second cost —
-  `finishBackfill` after purging vanished files and `applyMaxAgeDays` — never
-  inline in a flush.
+  away still match but expand to zero hits (and the candidate `EXISTS` keeps
+  them out of the budget). `store.gcTexts()` reclaims them (with their FTS
+  rows) at every `finishBackfill` — runtime resets and forgets orphan texts
+  without a file vanishing — and in `applyMaxAgeDays`, never inline in a flush.
 - The search database is a cache: bump `SEARCH_SCHEMA_VERSION` instead of migrating.
 - `contentSearch` defaults off; `HARNESS_TRAJECTORY_SEARCH=1` forces it on. The setting
   takes effect at startup; disabling it preserves any existing database on disk.

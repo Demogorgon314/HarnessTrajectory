@@ -17,7 +17,8 @@ both ported to run on top of plain transcript files instead of a runtime.
 
 - **Session picker** grouped by project, filterable by harness, searchable by title, path, or id.
 - **Full-text search** across every transcript on the machine: prompts, assistant replies,
-  tool calls, and tool output. Substring matching (so `--project serv` or `packages/co` find
+  and tool calls (commands, paths, patterns, and the contents of writes and edits — but not
+  tool stdout). Substring matching (so `--project serv` or `packages/co` find
   something), case-insensitive, grouped by session, and each hit opens the exact record —
   including inside a subagent transcript. Built on SQLite FTS5 with the trigram tokenizer,
   updated incrementally as sessions run.
@@ -155,8 +156,9 @@ Tests use hand-written synthetic records only. Never commit real transcript cont
   server writes one `search.sqlite` under the cache directory (first build runs in the
   background). Delete the file to reclaim the space.
 - **Search granularity.** Queries shorter than three characters return nothing: the trigram
-  tokenizer cannot index them. Tool output is indexed up to 4 KB and other records up to
-  16 KB, so a match past that point in a very large record is not found. Only transcripts
+  tokenizer cannot index them. Tool output (stdout, command results) is not indexed at all —
+  the call that produced it is — and other records are indexed up to 16 KB, so a match past
+  that point in a very large record is not found. Only transcripts
   modified within the retention window are indexed: 90 days by default, adjustable in the
   settings dialog (`0` indexes everything; widening re-indexes older sessions on the next
   start). Compaction summaries, system reminders, images, and base64 payloads are
