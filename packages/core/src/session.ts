@@ -2,9 +2,9 @@
 
 import type { ImageAttachmentRef, TrajectorySnapshot } from './contract.ts'
 
-export type HarnessKind = 'claude' | 'codex' | 'kimi' | 'grok'
+export type HarnessKind = 'claude' | 'codex' | 'kimi' | 'grok' | 'devin'
 
-export const HARNESS_KINDS: readonly HarnessKind[] = ['claude', 'codex', 'kimi', 'grok']
+export const HARNESS_KINDS: readonly HarnessKind[] = ['claude', 'codex', 'kimi', 'grok', 'devin']
 
 /** Facts about a subagent transcript recorded next to it (Claude Code `agent-<id>.meta.json`). */
 export interface AgentFileMeta {
@@ -27,7 +27,11 @@ export interface SessionFileRef {
   /** Stable identity within the session (main transcript id, or the child's own id). */
   id: string
   role: 'main' | 'child'
-  /** Absolute path on the scanned machine. */
+  /**
+   * Where the transcript lives. For file-backed harnesses the absolute path on
+   * the scanned machine; for store-backed ones (Devin's `sessions.db`) a stable
+   * source URI such as `devin://sessions/<id>` that identifies the stream.
+   */
   path: string
   /** For a child transcript, the parent transcript id when known. */
   parentId?: string

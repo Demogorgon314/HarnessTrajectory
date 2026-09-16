@@ -1,6 +1,6 @@
 # harness-trajectory — agent guide
 
-Local viewer for coding-agent sessions (Claude Code, Codex, Kimi Code, Grok Build): a
+Local viewer for coding-agent sessions (Claude Code, Codex, Kimi Code, Grok Build, Devin CLI): a
 Trajectory view (ported from deepseek-harness) and a Context dashboard (ported from
 dsh-context). Everything runs on this machine; transcripts are read from the harness
 home directories and never leave it.
@@ -28,7 +28,12 @@ packages/ui       Trajectory view + vendored dsh primitives/theme (MIT).
 packages/context  dsh-context port (Apache-2.0; keep LICENSE + NOTICE):
                   src/fold = vendored fold (do not change its event vocabulary),
                   src/synth/<kind>.ts = transcript → fold events, src/client = dashboard.
-apps/server       Hono API: scans harness roots, classifies files, replays + tails JSONL over SSE.
+apps/server       Hono API: `src/source.ts` is the `SessionSource` contract + shared
+                  `SessionBook`/`CompositeSource`; `src/index.ts` (`SessionIndex`) is the
+                  filesystem implementation (scans harness roots, classifies files,
+                  replays + tails JSONL over SSE); `src/devin/` is the SQLite-backed
+                  implementation reading Devin CLI's `sessions.db` into virtual
+                  `devin://sessions/<id>` line streams.
                   src/search = SQLite FTS5 (node:sqlite, trigram, detail=none, contentless)
                   full-text index: store.ts schema (doc text deflate-compressed in
                   docs.text, docs.file → files.id FK), extract.ts record → docs (tool
@@ -54,7 +59,8 @@ apps/server       Hono API: scans harness roots, classifies files, replays + tai
 apps/web          Vite/React shell: sidebar, routes, harness registry (src/harnesses.tsx).
 ```
 
-Data flow: server finds transcript files → SSE replays raw JSONL lines → the browser
+Data flow: a `SessionSource` finds transcript content (files for fs harnesses, virtual
+streams for Devin) → SSE replays raw lines → the browser
 feeds each line to the core adapter (Trajectory) and the context synthesizer (Context tab).
 Both parsers are incremental and must never throw on a malformed or unknown record.
 
@@ -146,3 +152,17 @@ kind in `index.ts` to stamp those facts.
   `_meta.totalTokens`. Children are top-level session dirs bound through the parent's
   `subagents/<id>/meta.json`, never by tool call id. Title, cwd, system prompt, and tool
   schemas live outside the JSONL and reach the parsers through the server's sidecar line.
+- Devin: no files — `sessions.db` (WAL, live-written) holds `sessions`, `message_nodes`,
+  `tool_call_state`; `subagent_heads` exists but is empty in practice. Column timestamps
+  are epoch SECONDS; `chat_message.metadata.created_at`/`started_generation_at` are ISO
+  ms. `message_nodes` is a forest that re-renders context as copied chains: dedupe by
+  `message_id` (first `row_id` wins) and group chains by union-find over
+  `parent_node_id` + `compact/prior_node_ids` + shared `message_id`; the group holding
+  `main_chain_id` is the main stream, every other group is a child `agent-<min row_id>`
+  stream (compactor chains surface as children but never bind a spawn). A child names its
+  agent from the `subagent/agent_id`/`chain_node_id`/`profile_name` extensions on the
+  `run_subagent` result, which can arrive after the child's lines. Human vs injected is
+  `metadata.is_user_input`; usage lives in `metadata.metrics`, tool wall time in
+  `chisel/tool_call_timing.duration_ms`, and ACP state in `tool_call_state` (settles a
+  call whose result message never landed). `devin.session`/`devin.tool` are synthetic
+  sidecar lines (`startLine: -1`, never indexed).

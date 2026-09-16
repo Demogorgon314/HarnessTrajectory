@@ -1,7 +1,7 @@
 # Harness Trajectory
 
 A local viewer for coding-agent sessions. It reads the transcripts that **Claude Code**,
-**Codex**, **Kimi Code**, and **Grok Build** write on your machine and renders each session
+**Codex**, **Kimi Code**, **Grok Build**, and **Devin CLI** write on your machine and renders each session
 as a turn-by-turn trajectory with timing, token usage, subagents, and a context dashboard.
 Live sessions update as they run. Nothing leaves your machine.
 
@@ -88,6 +88,7 @@ directory and are editable in the UI's settings dialog (the gear button in the s
 | `KIMI_CODE_HOME` | `~/.kimi-code` | Kimi Code home (`<home>/sessions`) |
 | `GROK_HOME` | `~/.grok` | Grok Build home (`<home>/sessions`) |
 | `HARNESS_TRAJECTORY_{CLAUDE,CODEX,KIMI,GROK}_ROOT` | derived | Point one harness at an arbitrary directory |
+| `HARNESS_TRAJECTORY_DEVIN_DB` | `$XDG_DATA_HOME/devin/cli/sessions.db`, else `~/.local/share/devin/cli/sessions.db` | Devin CLI session store — read directly (read-only); no transcript files exist |
 | `HARNESS_TRAJECTORY_CACHE_DIR` | `$XDG_CACHE_HOME/harness-trajectory`, else `~/.cache/harness-trajectory` | Holds `search.sqlite` and `settings.json`, the only files the server writes |
 | `HARNESS_TRAJECTORY_SEARCH` | off | `1`, `true`, or `on` forces indexing on for the launch; otherwise the Content search toggle in `settings.json` decides. While off, `/api/search` answers `{ "enabled": false }` |
 | `HARNESS_TRAJECTORY_NO_OPEN` | off | `1`, `true`, or `on` skips opening the default browser (same as `--no-open`). SSH sessions never open one. |
@@ -112,6 +113,13 @@ view and the context synthesizer for the Context tab. Replays merge a session wi
 subagent transcripts by timestamp. Parsers never throw on malformed or unknown records, so a
 newer harness version degrades to "unknown record" rather than a blank page.
 
+Devin CLI is the exception: it keeps sessions in a SQLite store (`sessions.db`), so the
+server's `DevinSource` reads it read-only and materializes the message forest as virtual
+line streams (`devin://sessions/<id>` URIs — nothing is written to disk). Context renders
+duplicate the chain under shared `message_id`s, so the logical transcript dedupes them;
+subagent chains are the forest components disjoint from the main chain, named by the
+`subagent/agent_id` metadata on the spawning `run_subagent` result.
+
 Adding a harness means one adapter, one synthesizer, a server root and classifier, and a
 web registry entry. See [AGENTS.md](AGENTS.md) for the checklist and per-harness format
 traps.
@@ -132,7 +140,9 @@ Tests use hand-written synthetic records only. Never commit real transcript cont
   the response, so tool durations are not recoverable. Grok Build tool durations are deltas
   between update stamps, not measured values.
 - **Context window.** Claude Code does not record it: 200k is assumed, 1M when the model tag
-  is `[1m]`. Grok Build assumes 500k unless a compaction record reports one.
+  is `[1m]`. Grok Build assumes 500k unless a compaction record reports one. Devin CLI
+  records neither a window nor per-request prompts — the Context tab shows what the store
+  carries (per-call `input_tokens`, `ttft_ms`, tool durations from `tool_call_state`).
 - **System prompt and tool schemas.** Only newer Claude Code transcripts record them. Codex
   records instructions but no schemas. Grok Build keeps both outside the JSONL and newest
   builds only write the schemas.
@@ -161,5 +171,6 @@ MIT, except where noted:
 - `packages/context` derives from [dsh-context](https://github.com/bowenliang123/dsh-context)
   and is Apache-2.0, see `packages/context/LICENSE` and `NOTICE`.
 - Harness marks use path data from [Simple Icons](https://simpleicons.org) (CC0) and
-  [lobe-icons](https://github.com/lobehub/lobe-icons) (MIT). Claude, Codex, Kimi, and Grok are
+  [lobe-icons](https://github.com/lobehub/lobe-icons) (MIT); the Devin mark is drawn
+  in-house. Claude, Codex, Kimi, Grok, and Devin are
   trademarks of their respective owners. This project is not affiliated with any of them.

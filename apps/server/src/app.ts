@@ -9,7 +9,7 @@ import {
   HARNESS_KINDS, SEARCH_DEFAULT_LIMIT, SEARCH_INDEXING_IDLE, SEARCH_MAX_LIMIT, SEARCH_MIN_QUERY_LENGTH,
   type HarnessKind, type SearchResponse, type SessionLiveEvent,
 } from '@harness-trajectory/core'
-import { scopeToFile, type SessionIndex } from './index.ts'
+import { scopeToFile, type SessionSource } from './index.ts'
 import { search, type SearchService } from './search/index.ts'
 import type { SettingsController } from './settings.ts'
 
@@ -32,7 +32,7 @@ function isKind(value: string): value is HarnessKind {
 }
 
 export interface AppOptions {
-  index: SessionIndex
+  index: SessionSource
   /** Directory holding the built web UI; omitted or missing disables static serving. */
   staticDir?: string | undefined
   /** Full-text index; omitted (search is off by default) disables `/api/search`. */
@@ -139,7 +139,7 @@ export function createApp({ index, staticDir, search: searchService, settings }:
       return c.json({ error: 'bad blobref' }, 400)
     }
     const fileId = c.req.query('file') ?? c.req.param('id')
-    const path = index.blobPath(kind, c.req.param('id'), fileId, match[2])
+    const path = index.blobPath?.(kind, c.req.param('id'), fileId, match[2]) ?? null
     if (path === null) return c.json({ error: 'blob not found' }, 404)
     try {
       const body = await readFile(path)

@@ -7,9 +7,11 @@ import { fileURLToPath } from 'node:url'
 import { serve } from '@hono/node-server'
 import { createApp } from './app.ts'
 import { listingDbPath, searchDbPath, searchEnabled } from './cache.ts'
+import { DevinSource } from './devin/source.ts'
 import { SessionIndex } from './index.ts'
 import { ListingCache } from './listing-cache.ts'
-import { defaultRoots } from './roots.ts'
+import { defaultRoots, devinDataDir, devinDbPath } from './roots.ts'
+import { CompositeSource } from './source.ts'
 import { browserUrl, openBrowser, shouldOpenBrowser } from './open-browser.ts'
 import { createSearchService, type SearchService } from './search/index.ts'
 import { SettingsController, readSettings, settingsPath } from './settings.ts'
@@ -36,11 +38,13 @@ async function main(): Promise<void> {
     console.log(`harness-trajectory [--port N] [--host H] [--static DIR] [--no-open]
 
 Scans Claude Code (~/.claude/projects), Codex (~/.codex/sessions), Kimi Code
-(~/.kimi-code/sessions) and Grok Build (~/.grok/sessions) transcripts on this machine
+(~/.kimi-code/sessions), Grok Build (~/.grok/sessions) and Devin CLI
+(~/.local/share/devin/cli/sessions.db) transcripts on this machine
 and serves the trajectory viewer. Harness home overrides (CLAUDE_CONFIG_DIR /
 CODEX_HOME / KIMI_CODE_HOME / GROK_HOME) are honoured; override a root directly with
 HARNESS_TRAJECTORY_CLAUDE_ROOT / HARNESS_TRAJECTORY_CODEX_ROOT /
-HARNESS_TRAJECTORY_KIMI_ROOT / HARNESS_TRAJECTORY_GROK_ROOT.
+HARNESS_TRAJECTORY_KIMI_ROOT / HARNESS_TRAJECTORY_GROK_ROOT /
+HARNESS_TRAJECTORY_DEVIN_DB.
 
 A local launch opens the UI in the default browser. Pass --no-open (or set
 HARNESS_TRAJECTORY_NO_OPEN=1) to skip. An SSH session never opens a browser.
@@ -83,16 +87,32 @@ are editable in the UI.`)
   } catch (error) {
     console.error('[harness-trajectory] listing cache unavailable:', error)
   }
+  const devinDb = devinDbPath()
+  const hasDevin = existsSync(devinDb)
   const index = new SessionIndex({
     roots,
     ...(listing === undefined ? {} : { listing }),
     ...(search === undefined ? {} : { search: search.indexer }),
+    // The composite closes the search backfill once every source has swept.
+    ...(hasDevin ? { deferBackfill: true } : {}),
   })
-  index.on('error', (error: unknown) => {
+  let source: SessionIndex | CompositeSource = index
+  if (hasDevin) {
+    const devin = new DevinSource({
+      dbPath: devinDb,
+      dataDir: devinDataDir(),
+      ...(search === undefined ? {} : { search: search.indexer }),
+    })
+    const composite = new CompositeSource([index, devin], search?.indexer)
+    composite.claim('devin', devin)
+    source = composite
+    console.log(`  devin: ${devinDb}`)
+  }
+  source.on('error', (error: unknown) => {
     console.error('[harness-trajectory] watcher error:', error)
   })
   const staticDir = findStaticDir()
-  const app = createApp({ index, staticDir, search, settings })
+  const app = createApp({ index: source, staticDir, search, settings })
   const open = shouldOpenBrowser()
   serve({ fetch: app.fetch, port, hostname }, (info) => {
     const url = browserUrl(info.address, info.port)
@@ -129,9 +149,9 @@ are editable in the UI.`)
     console.log(line)
   }
   const progressTimer = search === undefined ? null : setInterval(logSearchProgress, 1000)
-  index.start().then(() => {
+  source.start().then(() => {
     if (progressTimer !== null) clearInterval(progressTimer)
-    const sessions = index.list()
+    const sessions = source.list()
     const sweep = index.sweepStats()
     const cached = listing === undefined ? '' : ` (${sweep.cached} cached, ${sweep.read} re-read)`
     console.log(`[harness-trajectory] indexed ${sessions.length} sessions in ${Date.now() - started}ms${cached}`)
@@ -152,7 +172,7 @@ are editable in the UI.`)
   })
   const shutdown = () => {
     if (progressTimer !== null) clearInterval(progressTimer)
-    index.stop()
+    source.stop()
     listing?.close()
     search?.close()
     process.exit(0)

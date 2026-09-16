@@ -5,7 +5,7 @@ import { MAX_DOC_CHARS, MAX_TOOL_OUTPUT_CHARS, extractSearchDocs, type SearchDoc
 const T0 = Date.parse('2026-09-14T10:00:00.000Z')
 const iso = (offsetMs: number) => new Date(T0 + offsetMs).toISOString()
 
-function docs(kind: 'claude' | 'codex' | 'kimi' | 'grok', record: unknown): SearchDocDraft[] {
+function docs(kind: 'claude' | 'codex' | 'kimi' | 'grok' | 'devin', record: unknown): SearchDocDraft[] {
   return extractSearchDocs(kind, JSON.stringify(record))
 }
 
@@ -341,6 +341,62 @@ describe('extractSearchDocs — Grok Build', () => {
       params: { sessionId: SESSION, summary: { session_summary: 'Grok status line' }, systemPrompt: 'You are Grok.', toolDefinitions: [] },
     })).toEqual([])
     for (const line of ['', '{ not json', 'null', '[]']) expect(extractSearchDocs('grok', line)).toEqual([])
+  })
+})
+
+describe('extractSearchDocs — Devin CLI', () => {
+  // Devin records are the server's virtual lines: `{t:'devin.msg', msg}` wraps
+  // a raw chat_message; sidecars (`devin.session`, `devin.tool`) never index.
+  const devinMsg = (msg: Record<string, unknown>): unknown =>
+    ({ t: 'devin.msg', node: 1, parent: null, time: T0, msg })
+
+  it('indexes human prompts, assistant text/thinking/calls, and tool results', () => {
+    expect(pairs(docs('devin', devinMsg({
+      role: 'user', content: [{ type: 'text', text: 'Update the roadmap' }],
+      metadata: { is_user_input: true },
+    })))).toEqual(['human: Update the roadmap'])
+
+    expect(pairs(docs('devin', devinMsg({
+      role: 'assistant',
+      content: [{ type: 'text', text: 'Reading the file.' }],
+      thinking: { thinking: 'Plan first.' },
+      tool_calls: [{ id: 'c1', name: 'read_file', arguments: '{"path":"a.ts"}' }],
+    })))).toEqual([
+      'assistant: Reading the file.',
+      'other: Plan first.',
+      'tool: read_file\npath: a.ts',
+    ])
+
+    expect(pairs(docs('devin', devinMsg({
+      role: 'tool', tool_call_id: 'c1',
+      content: [{ type: 'text', text: 'contents of a.ts' }],
+    })))).toEqual(['tool: contents of a.ts'])
+  })
+
+  it('counts only is_user_input as human — injected user text indexes nowhere', () => {
+    for (const msg of [
+      { role: 'user', content: 'system_guidance: continue', metadata: {} },
+      { role: 'user', content: '<system-reminder>x</system-reminder>', metadata: { is_user_input: false } },
+    ]) {
+      expect(docs('devin', devinMsg(msg)), JSON.stringify(msg)).toEqual([])
+    }
+  })
+
+  it('skips synthetic sidecars, system segments, and malformed lines', () => {
+    expect(docs('devin', { t: 'devin.session', title: 'work', agents: [] })).toEqual([])
+    expect(docs('devin', { t: 'devin.tool', id: 'c1', call: { title: 'shell' } })).toEqual([])
+    expect(docs('devin', devinMsg({ role: 'system', content: 'You are Devin.' }))).toEqual([])
+    for (const line of ['', '{ nope', 'null', '{"t":"devin.msg"}']) {
+      expect(extractSearchDocs('devin', line)).toEqual([])
+    }
+  })
+
+  it('caps a devin tool output at 4 KB', () => {
+    const long = 'chunk of output text. '.repeat(4_000)
+    const [doc] = docs('devin', devinMsg({
+      role: 'tool', tool_call_id: 'c1', content: [{ type: 'text', text: long }],
+    }))
+    expect(doc?.text).toHaveLength(MAX_TOOL_OUTPUT_CHARS)
   })
 })
 
