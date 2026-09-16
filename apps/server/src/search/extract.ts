@@ -9,40 +9,46 @@
  *
  * - **Claude**: `{type, timestamp (ISO), message:{content}}`. A human prompt is
  *   a `user` record whose `message.content` is a **string**; an array means
- *   `tool_result` blocks, which are the harness answering itself. A
- *   `tool_result`'s own `content` is again either a string or a block array.
- *   2.1.x no longer writes `<system-reminder>` as its own record: it is a text
- *   block inside a tool result, and injected context arrives as
- *   `type:"attachment"` records, which carry no `message` and are skipped.
- *   Images are `{type:'image', source:{data}}` — never a `text` field.
+ *   `tool_result` blocks, which are the harness answering itself. Tool results
+ *   are not indexed (see below). 2.1.x no longer writes `<system-reminder>` as
+ *   its own record: it is a text block inside a tool result, and injected
+ *   context arrives as `type:"attachment"` records, which carry no `message`
+ *   and are skipped. Images are `{type:'image', source:{data}}` — never a
+ *   `text` field.
  * - **Codex**: `{timestamp (ISO), ordinal, type, payload}`. Only `response_item`
  *   carries content; `event_msg` mirrors it and `session_meta` holds the system
  *   prompt, so both are skipped. `custom_tool_call` (the `exec` sandbox) is the
  *   dominant call and its `input` is raw **JavaScript**, not JSON;
- *   `function_call.arguments` is a JSON **string**. Outputs are an array of
- *   `{type:'input_text', text}` blocks, or a JSON string. `reasoning` keeps its
- *   real text in `encrypted_content`, which is opaque and skipped; only
- *   `summary[]`/`content[]` are indexed. `role:'developer'` is injection.
+ *   `function_call.arguments` is a JSON **string**. `*_output` items are not
+ *   indexed. `reasoning` keeps its real text in `encrypted_content`, which is
+ *   opaque and skipped; only `summary[]`/`content[]` are indexed.
+ *   `role:'developer'` is injection.
  * - **Kimi**: `{type, time (epoch MILLISECONDS), agentId, …payload}` with the
  *   payload inlined at the top level. Loop events nest one level deeper under
  *   `event`. `message.origin` — never the text — decides human vs injected.
- *   `tool.result.output` is always a plain string. Argument keys are `path`,
- *   not `file_path`. No image blocks exist in the corpus.
+ *   `tool.result` records are not indexed. Argument keys are `path`, not
+ *   `file_path`. No image blocks exist in the corpus.
  * - **Grok**: the `{timestamp (epoch SECONDS), method, params}` envelope that
  *   `parseGrokLine` unwraps; `params._meta.agentTimestampMs` is the millisecond
  *   stamp. `content` on a message chunk is a single object, not an array. Tool
  *   names come from `update._meta['x.ai/tool']`, else `title`; arguments from
- *   `rawInput`. Results are `content[]` blocks of `{type:'content',
- *   content:{text}}` or `{type:'diff', path, oldText, newText}` — never
- *   `rawOutput`, whose `output` can be an array of raw byte integers. The
- *   server's own synthetic sidecar line is skipped.
+ *   `rawInput`. `tool_call_update` results are not indexed; `rawOutput.output`
+ *   can be an array of raw byte integers. The server's own synthetic sidecar
+ *   line is skipped.
+ * - **Devin**: `{t:'devin.msg', msg}` wraps a raw `chat_message`;
+ *   `devin.session`/`devin.tool` sidecars and `role:'tool'` outputs are not
+ *   indexed. Human vs injected is `metadata.is_user_input`, the same
+ *   structural flag the adapter and meta scanner read.
  *
  * The rules that are the same everywhere: the human/injected split reuses the
  * classifier the meta scanner and the adapters use, image blocks are skipped,
  * embedded base64 runs are stripped (the surrounding prose is kept), and each
- * document is capped — 16 KB for prose, 4 KB for tool output, which is the
- * bulk of every transcript — so one `Write` of a large file cannot dominate
- * the index.
+ * document is capped at 16 KB. **Tool outputs are never indexed**: stdout and
+ * command results are 73% of the unique text on the reference corpus, and the
+ * searchable record of what a tool *did* is its call — the command, paths,
+ * patterns, and the `content`/`old_string`/`new_string` of writes and edits.
+ * Searching inside an open trajectory is unaffected: that index is built
+ * client-side from the loaded records.
  *
  * Never throws: an unknown or malformed record yields no documents.
  */
@@ -62,14 +68,6 @@ export interface SearchDocDraft {
 
 /** Longest text stored per document, in UTF-16 code units. */
 export const MAX_DOC_CHARS = 16 * 1024
-
-/**
- * Longest text stored per tool-*output* document. Tool output is the bulk of
- * every transcript (~95% of indexed text on the reference corpus), so it gets
- * a tighter cap than prose: the head still answers "which session ran this"
- * queries, and the rest is re-readable in the session itself.
- */
-export const MAX_TOOL_OUTPUT_CHARS = 4 * 1024
 
 /** Control characters never reach the index. */
 const CONTROL = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g
@@ -98,12 +96,12 @@ class DocBuilder {
 
   constructor(private readonly timeMs: number | null) {}
 
-  add(role: SearchRole, text: string, maxChars: number = MAX_DOC_CHARS): void {
+  add(role: SearchRole, text: string): void {
     const cleaned = scrub(text)
     if (cleaned === '') return
     this.drafts.push({
       role,
-      text: cleaned.length > maxChars ? cleaned.slice(0, maxChars) : cleaned,
+      text: cleaned.length > MAX_DOC_CHARS ? cleaned.slice(0, MAX_DOC_CHARS) : cleaned,
       ...(this.timeMs === null ? {} : { timeMs: this.timeMs }),
     })
   }
@@ -231,8 +229,8 @@ function claudeDocs(line: string): SearchDocDraft[] {
     const results = blocks.filter((block): block is Record<string, unknown> =>
       isRecord(block) && asString(block['type']) === 'tool_result')
     if (results.length > 0) {
-      // A tool_result-only turn is the harness replying to itself, not a prompt.
-      for (const result of results) builder.add('tool', blockText(result['content']), MAX_TOOL_OUTPUT_CHARS)
+      // A tool_result-only turn is the harness replying to itself, not a
+      // prompt — and tool outputs are not indexed at all.
       return builder.docs
     }
     const text = typeof content === 'string' ? content : blockText(content)
@@ -267,16 +265,6 @@ function claudeDocs(line: string): SearchDocDraft[] {
 }
 
 // -- Codex -------------------------------------------------------------------
-
-/** Codex wraps a tool's output in `{"output": "...", "metadata": {...}}` more often than not. */
-function codexOutputText(output: unknown): string {
-  if (Array.isArray(output)) return blockText(output)
-  const text = asString(output)
-  if (text === undefined) return isRecord(output) ? (asString(output['output']) ?? '') : ''
-  const parsed = parseJsonLine(text)
-  if (isRecord(parsed)) return asString(parsed['output']) ?? text
-  return text
-}
 
 /** `reasoning` items carry their text in `summary[]`, `content[]`, or both. */
 function codexReasoningText(payload: Record<string, unknown>): string {
@@ -354,11 +342,6 @@ function codexDocs(line: string): SearchDocDraft[] {
     case 'local_shell_call':
       builder.add('tool', renderToolCall('local_shell', payload['action']))
       break
-    case 'function_call_output':
-    case 'custom_tool_call_output':
-    case 'local_shell_call_output':
-      builder.add('tool', codexOutputText(payload['output']), MAX_TOOL_OUTPUT_CHARS)
-      break
     case 'web_search_call':
       builder.add('tool', renderToolCall('web_search', payload['action']))
       break
@@ -370,14 +353,6 @@ function codexDocs(line: string): SearchDocDraft[] {
     case 'tool_search_call':
       builder.add('tool', renderToolCall('tool_search', payload['arguments']))
       break
-    case 'tool_search_output': {
-      // `tools` is a schema array — index the discovered tool names.
-      const names = (asArray(payload['tools']) ?? [])
-        .flatMap(tool => (isRecord(tool) ? [asString(tool['name']) ?? ''] : []))
-        .filter(name => name !== '')
-      builder.add('tool', names.join('\n'), MAX_TOOL_OUTPUT_CHARS)
-      break
-    }
     case 'agent_message': {
       // Inter-agent traffic: sender/recipient + plaintext content parts.
       const route = [asString(payload['author']), asString(payload['recipient'])]
@@ -390,6 +365,7 @@ function codexDocs(line: string): SearchDocDraft[] {
       builder.add('other', `${route}\n${text}`)
       break
     }
+    // `*_output` items carry tool stdout, which is not indexed.
     default:
       // `compaction`/`context_compaction` (encrypted replays),
       // `configuration_update`, and future items.
@@ -441,15 +417,7 @@ function kimiDocs(line: string): SearchDocDraft[] {
     case 'tool.call':
       builder.add('tool', renderToolCall(asString(event['name']) ?? 'tool', event['args']))
       break
-    case 'tool.result': {
-      const result = isRecord(event['result']) ? event['result'] : {}
-      const note = asString(result['note']) ?? ''
-      const raw = result['output']
-      // `output` is a plain string, or a content-part array when media ride along.
-      const output = typeof raw === 'string' ? raw : blockText(raw)
-      builder.add('tool', note === '' ? output : `${output}\n${note}`, MAX_TOOL_OUTPUT_CHARS)
-      break
-    }
+    // `tool.result` carries tool stdout, which is not indexed.
     default:
       break
   }
@@ -465,28 +433,6 @@ function grokToolIdentity(update: Record<string, unknown>): Record<string, unkno
   const identity = meta['x.ai/tool']
   return isRecord(identity) ? identity : undefined
 }
-
-/** Result blocks of a terminal `tool_call_update`; images are dropped, diffs kept as paths. */
-function grokResultText(update: Record<string, unknown>): string {
-  const parts: string[] = []
-  for (const item of asArray(update['content']) ?? []) {
-    if (!isRecord(item)) continue
-    if (asString(item['type']) === 'diff') {
-      const path = asString(item['path'])
-      const newText = asString(item['newText']) ?? ''
-      parts.push(`${path ?? ''}\n${newText}`)
-      continue
-    }
-    const inner = isRecord(item['content']) ? item['content'] : item
-    if (asString(inner['type']) === 'image') continue
-    const text = asString(inner['text'])
-    if (text !== undefined) parts.push(text)
-  }
-  return parts.join('\n')
-}
-
-/** `tool_call_update.status` values that carry a result rather than a progress merge. */
-const GROK_TERMINAL_STATUS: ReadonlySet<string> = new Set(['completed', 'failed'])
 
 function grokDocs(line: string): SearchDocDraft[] {
   const record = parseGrokLine(line)
@@ -520,12 +466,7 @@ function grokDocs(line: string): SearchDocDraft[] {
       builder.add('tool', renderToolCall(name, identity?.['input'] ?? update['rawInput']))
       break
     }
-    case 'tool_call_update': {
-      const status = asString(update['status'])
-      if (status === undefined || !GROK_TERMINAL_STATUS.has(status)) break
-      builder.add('tool', grokResultText(update), MAX_TOOL_OUTPUT_CHARS)
-      break
-    }
+    // `tool_call_update` carries tool stdout, which is not indexed.
     case 'plan':
       builder.add('other', (asArray(update['entries']) ?? [])
         .flatMap(entry => (isRecord(entry) ? [asString(entry['content']) ?? ''] : []))
@@ -571,9 +512,7 @@ function devinDocs(line: string): SearchDocDraft[] {
       }
       break
     }
-    case 'tool':
-      builder.add('tool', blockText(msg['content']), MAX_TOOL_OUTPUT_CHARS)
-      break
+    // `role: 'tool'` messages carry tool stdout, which is not indexed.
     default:
       // `system` prompt segments are harness boilerplate, like codex's
       // session_meta: indexed once per session they would match everything.

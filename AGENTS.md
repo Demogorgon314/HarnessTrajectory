@@ -90,8 +90,10 @@ Logo credits live in the web registry and README license section.
   `store.ts` deduplicates document text: `texts` holds each unique text once
   (8-byte SHA-1-prefix key, deflate-compressed) and `docs` stores only occurrences
   (`file, line, role, time_ms → texts.id`); the FTS rowid is the text id, so the
-  inverted index dedups too. `extract.ts` caps tool outputs at 4 KB; `indexer.ts`
-  batches writes. `query.ts` ANDs trigrams, verifies each unique text once in JS,
+  inverted index dedups too. `extract.ts` indexes tool *calls* (command, paths,
+  patterns, write/edit contents) but never tool *outputs* — stdout is ~73% of
+  the unique text on the reference corpus and duplicates what the trajectory
+  view's client-side search already covers. `indexer.ts` batches writes. `query.ts` ANDs trigrams, verifies each unique text once in JS,
   expands occurrences through `docs_by_text` and the in-memory `files` snapshot
   (kind filter applies at expansion), ranks by occurrence count, and builds
   snippets only for displayed hits. FTS phrase queries, `snippet()`, and `bm25`

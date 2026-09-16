@@ -49,7 +49,11 @@ import { DatabaseSync } from 'node:sqlite'
 import { deflateSync, inflateSync } from 'node:zlib'
 import type { HarnessKind, SearchRole } from '@harness-trajectory/core'
 
-/** Bumped whenever the schema below changes; a mismatch drops and rebuilds. */
+/**
+ * Bumped whenever the schema below — or the indexing policy that decides what
+ * lands in it — changes; a mismatch drops and rebuilds. v7 combines Codex
+ * logical-history indexing with deduplicated text and excludes tool outputs.
+ */
 export const SEARCH_SCHEMA_VERSION = 7
 
 /** Identity of one indexed transcript, as the SSE route addresses it. */
