@@ -155,6 +155,14 @@ export class DevinDb {
     ).all(sessionId, rowId) as unknown as DevinNodeRow[]
   }
 
+  /** Rows at or before `rowId`, in insertion order (a consumed prefix). */
+  nodesBefore(sessionId: string, rowId: number): DevinNodeRow[] {
+    return this.db.prepare(
+      `SELECT row_id, node_id, parent_node_id, chat_message, created_at, metadata
+       FROM message_nodes WHERE session_id = ? AND row_id <= ? ORDER BY row_id`,
+    ).all(sessionId, rowId) as unknown as DevinNodeRow[]
+  }
+
   /** All rows of a session, in insertion order (replay / re-materialization). */
   nodes(sessionId: string): DevinNodeRow[] {
     return this.nodesAfter(sessionId, 0)

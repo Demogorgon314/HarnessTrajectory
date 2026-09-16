@@ -473,11 +473,14 @@ export class DevinSource extends EventEmitter implements SessionSource {
    * scratch state that runs the same materialization path but touches nothing
    * shared: its book has no subscribers, search/meta stay off, and the
    * collected lines come back by stream path. The row set is pinned to the
-   * node_ids live has consumed — rows it has not (appended since the last
-   * tick) must not replay, or the next live emit sends them a second time
-   * and the client's incremental fold doubles them. The node_id set also
-   * covers a whole-forest rewrite: re-inserted rows keep their node_ids, so
-   * the consumed set re-derives exactly what live shows even mid-rewrite.
+   * rows live has consumed — rows it has not (appended since the last tick)
+   * must not replay, or the next live emit sends them a second time and the
+   * client's incremental fold doubles them. In the common case that set is
+   * the indexed prefix `row_id <= maxRowId`; a whole-forest rewrite between
+   * live's last consume and now makes every current row_id sit above the
+   * stale watermark, so that case falls back to matching the consumed
+   * node_ids (rewrite copies keep theirs — the consumed set re-derives
+   * exactly what live shows even mid-rewrite).
    */
   private replaySession(state: DevinSessionState): Map<string, string[]> {
     const byPath = new Map<string, string[]>()
@@ -486,7 +489,11 @@ export class DevinSource extends EventEmitter implements SessionSource {
     scratch.heads = new Map(
       this.db.subagentHeads(state.row.id).map(head => [head.chain_node_id, head.agent_id]),
     )
-    scratch.replayRows = this.db.nodes(state.row.id).filter(row => state.nodes.has(row.node_id))
+    let rows = this.db.nodesBefore(state.row.id, state.maxRowId)
+    if (rows.length === 0 && state.nodes.size > 0) {
+      rows = this.db.nodes(state.row.id).filter(row => state.nodes.has(row.node_id))
+    }
+    scratch.replayRows = rows
     this.materialize(scratch)
     for (const [entry, lines] of scratch.replay ?? []) byPath.set(entry.path, lines)
     return byPath
@@ -713,6 +720,11 @@ export class DevinSource extends EventEmitter implements SessionSource {
           state.book.emitTo(state.session, { type: 'file', file: entry.ref, reset: true })
         }
       }
+      // Lines collected so far are re-derived with the rest of the batch —
+      // counters restarted, so keeping them would ship them twice. Today the
+      // map is provably empty here (the union conflicts that trigger `full`
+      // surface in pass 1, before any flush); keep the invariant structural.
+      state.replay?.clear()
       state.session.children.clear()
       for (const [path, entry] of state.book.files) {
         if (entry.sessionId === state.session.id && entry !== state.session.main) state.book.files.delete(path)

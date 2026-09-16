@@ -202,4 +202,11 @@ kind in `index.ts` to stamp those facts.
   vs injected is `metadata.is_user_input`; usage lives in `metadata.metrics`, tool wall
   time in `chisel/tool_call_timing.duration_ms`, and ACP state in `tool_call_state`
   (settles a call whose result message never landed). `devin.session`/`devin.tool` are
-  synthetic sidecar lines (`startLine: -1`, never indexed).
+  synthetic sidecar lines (`startLine: -1`, never indexed). Stream lines are never
+  retained — the store IS the buffer: entries keep counters, and `readAll` re-derives
+  the stream by re-running materialization on a scratch state pinned to live's
+  consumed node_ids (unconsumed rows must not replay or the next live emit doubles
+  them). The cost is one full replay per SSE open — ~250 ms on a 2.5k-node session,
+  and reconnects re-derive again; caching replay output is a follow-up that first
+  needs rewrite/epoch invalidation solved. If sessions.db is deleted mid-run the
+  open read handle keeps serving its last snapshot (sessions go stale, not empty).
