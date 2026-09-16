@@ -164,7 +164,13 @@ kind in `index.ts` to stamp those facts.
   children — compactor/render chains look identical to subagent chains — so unclaimed
   groups buffer as `pending` and surface only when a `subagent_heads` row or a spawn
   result's `subagent/agent_id`/`chain_node_id`/`profile_name` extensions claim them
-  (claims can land after the child's lines; the child file is `agent-<agentId>`). Dedup
+  (claims can land after the child's lines; the child file is `agent-<agentId>`). The
+  CLI periodically rewrites a session's whole forest in one commit — same node_ids
+  re-inserted in node order under fresh AUTOINCREMENT row_ids (row_ids form contiguous
+  per-generation blocks, ~8 generations observed in one session) — so `row_id` is an
+  append watermark within a generation only; content is keyed by `node_id`
+  (byte-identical across generations), and materialization skips already-seen
+  node_ids or every rewrite would append a whole extra copy of the transcript. Dedup
   is per `(message_id, stream, compaction epoch)`: a `system` node with
   `extensions['devin-rs/summary']` ends a render — copies of pre-summary mids then
   re-emit because they are kept context, and the summary's chain ancestors (re-rendered

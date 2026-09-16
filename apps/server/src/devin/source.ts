@@ -41,6 +41,15 @@
  * and kept injections) emit with it via `emitRenderAncestors`; same-epoch
  * copies of still-live messages stay deduped, and re-emissions skip search
  * indexing so the index never double-counts.
+ *
+ * Store rewrites: the CLI periodically rewrites a session's whole forest in
+ * one commit — same node_ids re-inserted in node order under fresh row_ids,
+ * so the row watermark ADVANCES (never a `dropped` regression) and the batch
+ * looks like a giant append. Content is keyed by node_id — verified
+ * byte-identical across generations — so pass 2 skips any node_id already
+ * materialized; without that guard every rewrite appends a whole extra copy
+ * of the transcript. `state.nodes` keeps the FIRST parse of a node so
+ * ancestor re-emissions stay byte-stable.
  */
 
 import { EventEmitter } from 'node:events'
@@ -380,7 +389,6 @@ export class DevinSource extends EventEmitter implements SessionSource {
 
   /** Forget a session (hidden or deleted from the store). */
   private drop(state: DevinSessionState): void {
-    this.dbg(state, `drop maxRowId=${state.maxRowId}`)
     const paths = this.book.dropSession(state.session)
     for (const path of paths) this.search?.reset(path)
     this.states.delete(state.row.id)
@@ -494,16 +502,7 @@ export class DevinSource extends EventEmitter implements SessionSource {
     return entry
   }
 
-  /** Temporary forensic log; gated by HT_DEVIN_DEBUG=<path>. */
-  private dbg(state: DevinSessionState, msg: string): void {
-    const path = process.env['HT_DEVIN_DEBUG']
-    if (path === undefined) return
-    const line = `${Date.now()} ${state.row.id} ${msg}\n`
-    void import('node:fs').then(fs => fs.appendFileSync(path, line))
-  }
-
   private emitLine(state: DevinSessionState, entry: DevinEntry, node: ParsedNode, indexable = true): void {
-    this.dbg(state, `emit entry=${entry.ref.id} node=${node.row.node_id} mid=${node.messageId} epoch=${state.summaryEpoch} via=${new Error().stack?.split('\n')[2]?.trim() ?? '?'}`)
     entry.buffered.push(node.line)
     entry.lines = entry.buffered.length
     entry.size += node.line.length + 1
@@ -544,7 +543,6 @@ export class DevinSource extends EventEmitter implements SessionSource {
    */
   private materialize(state: DevinSessionState, full = false): void {
     if (this.db === null) return
-    this.dbg(state, `materialize full=${full} maxRowId=${state.maxRowId} mainBuffered=${state.session.main?.buffered.length ?? -1}`)
     if (full) {
       state.groups = new ChainGroups()
       state.midAnchor.clear()
@@ -575,25 +573,27 @@ export class DevinSource extends EventEmitter implements SessionSource {
     const parsed = rows.map(row => this.parseNode(row))
     // Pass 1 — structure: parent + prior + identity edges before any line is
     // attributed, so a render committed in this batch is already merged.
+    const fresh = new Set<number>()
     for (const node of parsed) {
       const { node_id, parent_node_id } = node.row
-      state.nodes.set(node_id, node)
-      state.groups.add(node_id)
-      if (!state.groups.union(node_id, parent_node_id)) {
-        this.dbg(state, `union-conflict parent a=${node_id} b=${parent_node_id}`)
-        return this.materialize(state, true)
+      // The CLI periodically rewrites a session's whole forest in one commit
+      // (fresh row_ids, in node order — not an append). Content is keyed by
+      // node_id: a row whose node_id already materialized is a rewrite copy —
+      // its edges are idempotent and its line must not re-emit, or every
+      // rewrite would append a whole extra generation to the stream.
+      if (!state.nodes.has(node_id)) {
+        fresh.add(node_id)
+        state.nodes.set(node_id, node)
       }
+      state.groups.add(node_id)
+      if (!state.groups.union(node_id, parent_node_id)) return this.materialize(state, true)
       for (const prior of node.priors) {
         state.groups.add(prior)
-        if (!state.groups.union(node_id, prior)) {
-          this.dbg(state, `union-conflict prior a=${node_id} b=${prior}`)
-          return this.materialize(state, true)
-        }
+        if (!state.groups.union(node_id, prior)) return this.materialize(state, true)
       }
       if (node.messageId !== null) {
         const anchor = state.midAnchor.get(node.messageId)
         if (anchor !== undefined && !state.groups.union(node_id, anchor)) {
-          this.dbg(state, `union-conflict mid a=${node_id} b=${anchor} mid=${node.messageId}`)
           return this.materialize(state, true)
         }
         state.midAnchor.set(node.messageId, node_id)
@@ -609,6 +609,9 @@ export class DevinSource extends EventEmitter implements SessionSource {
     this.drainPending(state)
     const emitted = new Map<DevinEntry, ParsedNode[]>()
     for (const node of parsed) {
+      // Store-rewrite copies never re-emit; the kept-copy re-emission past a
+      // compaction boundary belongs to render nodes — always NEW node_ids.
+      if (!fresh.has(node.row.node_id)) continue
       const owner = this.isMainGroup(state, node.row.node_id)
         ? state.session.main
         : this.childEntry(state, node)

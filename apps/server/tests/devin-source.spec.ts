@@ -356,6 +356,33 @@ describe('DevinSource', () => {
     expect(src.get('devin', 'alpha')).toBeUndefined()
   })
 
+  it('ignores store rewrites — re-inserted rows under new row_ids are copies', async () => {
+    const db = fixture()
+    createStore(db)
+    insertSession(db, 'alpha')
+    insertNode(db, 'alpha', 1, null, userMsg('u1', 'first'))
+    insertNode(db, 'alpha', 2, 1, assistantMsg('a1', 'working'))
+    db.close()
+    const src = await start()
+    const write = new DevinDb(dbPath, { readOnly: false })
+    // The CLI periodically rewrites the whole forest in one commit: every node
+    // re-inserted in node order under fresh AUTOINCREMENT row_ids (the row
+    // watermark advances, so the batch looks like a giant append), plus any
+    // genuinely new tail rows.
+    write.db.prepare(`DELETE FROM message_nodes WHERE session_id = 'alpha'`).run()
+    insertNode(write, 'alpha', 1, null, userMsg('u1', 'first'))
+    insertNode(write, 'alpha', 2, 1, assistantMsg('a1', 'working'))
+    insertNode(write, 'alpha', 3, 2, userMsg('u2', 'more work'))
+    write.db.prepare(`UPDATE sessions SET last_activity_at = 1700000500 WHERE id = 'alpha'`).run()
+    write.close()
+    await src.refresh()
+    const msgs = linesOf(await replay(src, 'alpha'))
+      .flatMap(chunk => chunk.lines)
+      .filter(line => line.includes('devin.msg'))
+      .map(line => JSON.parse(line).node as number)
+    expect(msgs).toEqual([1, 2, 3])
+  })
+
   it('re-materializes when the row watermark regresses (store rebuilt)', async () => {
     const db = fixture()
     createStore(db)
