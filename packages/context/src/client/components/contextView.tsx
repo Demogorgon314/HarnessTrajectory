@@ -21,6 +21,7 @@ import { numOf } from '../services'
 import type { ConversationNodeLike, ImageLoader } from '../services'
 import { activityOf, activityOfOps, locateStepOf } from '../fileActivity'
 import type { FileOp } from '../fileActivity'
+import type { ModelPriceRules } from '@harness-trajectory/core'
 import type { ContextSettings } from '../settings'
 import type { ContextLocale, Translate } from '../i18n'
 import { makeViewKit, type ViewKit } from '../viewkit'
@@ -99,6 +100,19 @@ export interface ContextViewProps {
   showBreadcrumb?: boolean | undefined
   /** Optional durable-image resolver for attachment cards. */
   loadImage?: ImageLoader | undefined
+  /**
+   * PORT ADDITION — the user's model-price rules (`ServerSettings.modelPricing`),
+   * handed to the Cost cell's pricing math. The host's fold must be driven by
+   * the same table (`ContextSessionOptions.costPeriod`), or an `off` bucket a
+   * rule's schedule produced would price at list.
+   */
+  pricingRules?: ModelPriceRules | undefined
+  /**
+   * PORT ADDITION — when set, each unpriced billed model in the Cost cell's
+   * note becomes a button reporting its fold (provider, model) key, so the
+   * host can open a prefilled price-rule editor.
+   */
+  onPriceModel?: ((provider: string, model: string) => void) | undefined
 }
 
 /**
@@ -566,9 +580,16 @@ export function makeContextView(
             // cost and cache-hit cells already answer for the whole family,
             // and `agents` always carries every transcript file of it.
             subagents={agents.filter(a => a.subagent).length}
+            pricingRules={props.pricingRules}
+            onPriceModel={props.onPriceModel}
             locale={props.locale}
           />
-          <SessionInfoCard info={props.sessionInfo} />
+          <SessionInfoCard
+            info={props.sessionInfo}
+            pricingRules={props.pricingRules}
+            onPriceModel={props.onPriceModel}
+            locale={props.locale}
+          />
         </div>
         <div className="lc-cols lc-head">
           <StatsTokens usage={usage} current={data.current} breakdown={null} />

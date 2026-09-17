@@ -5,7 +5,7 @@
  * reopens the stream.
  */
 
-import { ContextSession } from '@harness-trajectory/context'
+import { ContextSession, type ContextSessionOptions } from '@harness-trajectory/context'
 import {
   createSessionParser, EMPTY_TRAJECTORY_SNAPSHOT,
   type HarnessKind, type ImageAttachmentRef, type ParsedSessionMeta, type SessionChildSummary,
@@ -55,6 +55,8 @@ export class SessionRuntime {
   private publishTimer: ReturnType<typeof setTimeout> | null = null
   private lineCount = 0
   private closed = false
+  /** Fold options every ContextSession (re)build keeps — the price-period resolver among them. */
+  private readonly contextOptions: ContextSessionOptions
   /** Stream/refold generation: an existence probe applies only to its own. */
   private epoch = 0
   /** Epoch owning the in-flight probe — one probe per disconnect, never global. */
@@ -64,9 +66,15 @@ export class SessionRuntime {
    * @param fileId - a child transcript id to fold on its own (the subagent
    * view); omitted, the whole session folds with children nested.
    */
-  constructor(readonly kind: HarnessKind, readonly id: string, readonly fileId: string | null = null) {
+  constructor(
+    readonly kind: HarnessKind,
+    readonly id: string,
+    readonly fileId: string | null = null,
+    contextOptions?: ContextSessionOptions,
+  ) {
+    this.contextOptions = contextOptions ?? {}
     this.parser = createSessionParser(kind)
-    this.context = new ContextSession(kind)
+    this.context = new ContextSession(kind, undefined, this.contextOptions)
     this.store = createSnapshotStore<SessionRuntimeState>({
       snapshot: EMPTY_TRAJECTORY_SNAPSHOT,
       loading: true,
@@ -224,7 +232,7 @@ export class SessionRuntime {
   private rebuild(): void {
     this.epoch += 1
     this.parser = createSessionParser(this.kind)
-    this.context = new ContextSession(this.kind)
+    this.context = new ContextSession(this.kind, undefined, this.contextOptions)
     this.lineCount = 0
     this.patch({
       snapshot: EMPTY_TRAJECTORY_SNAPSHOT, loading: true, lines: 0, files: [], subagents: [],

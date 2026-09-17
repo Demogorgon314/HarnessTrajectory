@@ -10,7 +10,9 @@ import { HarnessFilter } from './HarnessFilter.tsx'
 import { SessionList } from './SessionList.tsx'
 import { SessionPane } from './SessionPane.tsx'
 import { IndexProgress, SessionSearch } from './SessionSearch.tsx'
+import { PriceRuleDialog } from './PriceRuleDialog.tsx'
 import { SettingsDialog } from './SettingsDialog.tsx'
+import { loadSettings } from './settings-store.ts'
 import {
   SIDEBAR_AUTO_COLLAPSE, SIDEBAR_COLLAPSED, clampSidebarWidth, setSidebarCollapsed, setSidebarWidth,
   sidebarStore, toggleGroupFold,
@@ -173,6 +175,19 @@ export function App() {
   const [listQuery, setListQuery] = useState('')
   const [locale, setLocale] = useState<TrajectoryLocale>(defaultLocale)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  /**
+   * The cost cell's "price this model" click opens the rule dialog keyed on
+   * the billed pair. The nonce re-arms the seed so re-clicking the same pair
+   * remounts a fresh editor.
+   */
+  const [priceSeed, setPriceSeed] = useState<{ provider: string; model: string; nonce: number } | undefined>()
+  const onPriceModel = useCallback((provider: string, model: string) => {
+    setPriceSeed(prev => ({ provider, model, nonce: (prev?.nonce ?? 0) + 1 }))
+  }, [])
+
+  // Settings also drive the open session's price rules — fetch once at mount,
+  // not only when the dialog opens.
+  useEffect(() => { void loadSettings() }, [])
   const t = useMemo(() => createTrajectoryTranslate(locale), [locale])
   const durationStore = useMemo(() => createTrajectoryDurationStore(), [])
   const theme = useSnapshotSelector(themeStore, value => value)
@@ -359,6 +374,7 @@ export function App() {
               t={t}
               locale={locale}
               durationStore={durationStore}
+              onPriceModel={onPriceModel}
             />
           )}
       </main>
@@ -367,6 +383,14 @@ export function App() {
         <DragHandle left={sidebarWidth} onStart={onDragStart} onDrag={onDrag} onEnd={onDragEnd} />
       )}
       <SettingsDialog open={settingsOpen} onClose={() => { setSettingsOpen(false) }} />
+      {priceSeed !== undefined && (
+        <PriceRuleDialog
+          key={`${priceSeed.provider}/${priceSeed.model}:${priceSeed.nonce}`}
+          provider={priceSeed.provider}
+          model={priceSeed.model}
+          onClose={() => { setPriceSeed(undefined) }}
+        />
+      )}
     </div>
   )
 }

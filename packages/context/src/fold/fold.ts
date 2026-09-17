@@ -49,7 +49,7 @@ import type {
   TimingTotals,
   ToolTimingTotals,
 } from '../shared/types.ts'
-import { isDeepSeekProvider } from '../shared/providers.ts'
+import { defaultCostPeriod, type CostPeriodResolver } from '../shared/pricingRules.ts'
 import { estimateSystemContent, estimateSystemTokens } from '../shared/estimate.ts'
 import type { FoldBounds } from './config.ts'
 import {
@@ -819,21 +819,6 @@ function tokenCountOf(value: unknown): number | null {
 }
 
 /**
- * DeepSeek's peak windows (the official list: UTC 01:00–04:00 and 06:00–10:00,
- * Monday through Friday — Beijing Time 09:00–12:00 and 14:00–18:00). All other
- * hours, plus entire weekends, bill at the half-price off-peak rate. Harmless
- * for anthropic/openai: `isDeepSeekProvider` is false there and everything
- * books under `peak`.
- */
-function isPeakUtc(time: number): boolean {
-  const at = new Date(time)
-  const day = at.getUTCDay()
-  if (day === 0 || day === 6) return false
-  const h = at.getUTCHours()
-  return (h >= 1 && h < 4) || (h >= 6 && h < 10)
-}
-
-/**
  * Fold one billed request into the session-cost totals, cloning along the
  * mutated path only (the untouched branch stays shared with the previous
  * state — the apply contract never mutates it in place). The buckets arrive
@@ -841,12 +826,23 @@ function isPeakUtc(time: number): boolean {
  * (provider, model) face — the exact lookup the client's model-price book
  * resolves (models.dev). A request without a provider still accumulates
  * (under the '' key); without a model there is nothing to price.
+ *
+ * The pricing PERIOD is the caller's `costPeriod` resolver's say: by default
+ * DeepSeek's period-based list splits off-peak buckets (peak windows bill at
+ * list price, all other hours at half); user price rules can hand any
+ * (provider, model) its own schedule. Harmless either way for flat-priced
+ * providers: they book everything under `peak`.
  */
-function accumulateCost(st: TimelineState, time: number, usage: BilledUsage): void {
+function accumulateCost(
+  st: TimelineState,
+  time: number,
+  usage: BilledUsage,
+  costPeriod: CostPeriodResolver,
+): void {
   const model = st.model
   if (model === undefined) return
   const provider = st.provider ?? ''
-  const period = isDeepSeekProvider(provider) && !isPeakUtc(time) ? 'off' : 'peak'
+  const period = costPeriod(provider, model, time)
   const models = st.cost?.[provider] ?? {}
   const periods = models[model] ?? {}
   const b = periods[period] ?? { uncached: 0, cacheRead: 0, cacheWrite: 0, output: 0 }
@@ -954,7 +950,12 @@ function bumpToolTotals(timing: TimingTotals, name: string, ms: number): void {
  * in place by the caller. `bounds` are retention only — they never change the
  * state shape.
  */
-export function applyTimeline(state: TimelineState, event: TimelineEvent, bounds: FoldBounds): TimelineState {
+export function applyTimeline(
+  state: TimelineState,
+  event: TimelineEvent,
+  bounds: FoldBounds,
+  costPeriod: CostPeriodResolver = defaultCostPeriod,
+): TimelineState {
   let st: TimelineState | undefined
   const ensure = (): TimelineState => st ??= {
     ...state,
@@ -1408,7 +1409,7 @@ export function applyTimeline(state: TimelineState, event: TimelineEvent, bounds
               cacheWrite: cacheWrite ?? 0,
               cacheWrite1h,
               output: output ?? 0,
-            })
+            }, costPeriod)
           }
         }
         // PORT ADDITION — the DERIVED system remainder. When the transcript

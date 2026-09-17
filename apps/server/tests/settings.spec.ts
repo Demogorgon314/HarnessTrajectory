@@ -58,6 +58,27 @@ describe('settings file', () => {
     await writeFile(path, JSON.stringify({ contentSearch: 'yes', searchMaxAgeDays: 30 }))
     expect(readSettings(path)).toEqual({ contentSearch: false, searchMaxAgeDays: 30 })
   })
+
+  it('round-trips price rules and drops hand-edited junk inside them', async () => {
+    const dir = await tempDir()
+    const path = join(dir, 'settings.json')
+    writeSettings({
+      contentSearch: false,
+      searchMaxAgeDays: 90,
+      modelPricing: {
+        'cognition/swe-2-max': {
+          rates: { input: 1.5, output: 6 },
+          offPeak: { peakHours: [[9, 12], [14, 18]], timezone: 'Asia/Shanghai', weekdaysOnly: true, factor: 0.5 },
+        },
+      },
+    }, path)
+    expect(readSettings(path).modelPricing?.['cognition/swe-2-max']?.offPeak?.factor).toBe(0.5)
+
+    await writeFile(path, JSON.stringify({
+      modelPricing: { '/bad-key': { rates: { input: 1, output: 1 } }, ok: { rates: { input: 1, output: 2 } } },
+    }))
+    expect(readSettings(path).modelPricing).toEqual({ ok: { rates: { input: 1, output: 2 } } })
+  })
 })
 
 describe('SettingsController', () => {
@@ -118,6 +139,18 @@ describe('SettingsController', () => {
     const update = controller.update({ searchMaxAgeDays: 14 })
     expect(update).toEqual({ value: { contentSearch: false, searchMaxAgeDays: 14 }, purged: 0 })
     expect(readSettings(path)).toEqual({ contentSearch: false, searchMaxAgeDays: 14 })
+  })
+
+  it('a modelPricing update replaces the table wholesale and keeps the other fields', async () => {
+    const dir = await tempDir()
+    const path = join(dir, 'settings.json')
+    const controller = new SettingsController(path, () => undefined)
+
+    controller.update({ contentSearch: true, modelPricing: { 'a/b': { rates: { input: 1, output: 1 } } } })
+    // A rules-only PUT keeps the toggle; an empty table clears the field.
+    const update = controller.update({ modelPricing: {} })
+    expect(update.value).toEqual({ contentSearch: true, searchMaxAgeDays: 90 })
+    expect(readSettings(path).modelPricing).toBeUndefined()
   })
 
   it('announces every persisted value through onChange, after retention applied', async () => {

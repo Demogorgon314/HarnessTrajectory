@@ -40,13 +40,15 @@
  */
 
 import { type ReactElement, type ReactNode, useId } from 'react'
+import type { ModelPriceRules } from '@harness-trajectory/core'
 import type { ContextEventRecord, RequestRecord, SessionCostUsage, TimelineCounts, TokenUsage } from '../../shared/types'
-import { estimateSessionCost, formatCost, formatPriceRate, offPeakOf, priceOf, toCurrency, unpricedCostModels, write1hOf } from '../cost'
+import { estimateSessionCost, formatCost, formatPriceRate, offRateOf, priceOf, toCurrency, unpricedCostPairs, write1hOf } from '../cost'
 import type { CostCurrency, ModelPrices, PriceTriple } from '../cost'
 import { cacheHitPercent } from '../format'
 import { useModelPrices } from '../modelPrices'
 import { asRecord, numOf } from '../services'
 import { isDeepSeekProvider } from '../../shared/providers'
+import { matchRule } from '../../shared/pricingRules'
 import type { ViewKit } from '../viewkit'
 
 /**
@@ -101,21 +103,27 @@ export interface CostPart {
  * with an off-peak bucket (DeepSeek's period-based list) shows the
  * peak | off-peak pair.
  */
-function priceRowsOf(usage: SessionCostUsage | undefined, prices: ModelPrices | null): PriceRow[] {
-  if (usage === undefined || prices === null) return []
+function priceRowsOf(
+  usage: SessionCostUsage | undefined,
+  prices: ModelPrices | null,
+  rules?: ModelPriceRules | null,
+): PriceRow[] {
+  if (usage === undefined || (prices === null && (rules === null || rules === undefined))) return []
   const rows: PriceRow[] = []
   const multi = Object.keys(usage).length > 1
   for (const provider of Object.keys(usage)) {
     const models = asRecord(usage[provider])
     if (models === null) continue
     for (const model of Object.keys(models)) {
-      const rate = priceOf(prices, provider, model)
+      const rate = priceOf(prices, provider, model, rules)
       if (rate === null) continue
       const periods = asRecord(models[model])
-      // The peak | off-peak pair is DeepSeek's alone (shared/providers):
-      // other providers bill everything at list price.
-      const off = isDeepSeekProvider(provider) && periods !== null && periods.off !== undefined
-        ? offPeakOf(rate)
+      const rule = matchRule(rules, provider, model)
+      // The peak | off-peak pair shows when an off-peak bucket exists AND a
+      // scheme prices it: the rule's own `offPeak`, else DeepSeek's built-in.
+      const off = periods !== null && periods.off !== undefined
+        && (rule?.offPeak !== undefined || isDeepSeekProvider(provider))
+        ? offRateOf(rule, provider, rate)
         : undefined
       const has1h = wrote1h(periods)
       rows.push({
@@ -232,6 +240,19 @@ export interface StatsContextProps {
   images?: number | undefined
   /** PORT ADDITION — child agents of the session, main agent excluded. Absent (not zero) dashes the cell. */
   subagents?: number | undefined
+  /**
+   * PORT ADDITION — the user's model-price rules (`ServerSettings.modelPricing`):
+   * rates/aliases/off-peak schedules for models the registry cannot price.
+   * The same table must drive the fold's `costPeriod`, or an `off` bucket a
+   * rule's schedule produces would price at list here.
+   */
+  pricingRules?: ModelPriceRules | undefined
+  /**
+   * PORT ADDITION — offers "add a price rule" on each unpriced billed model
+   * (the note renders the fold key `provider/model`); absent, the names stay
+   * plain text.
+   */
+  onPriceModel?: ((provider: string, model: string) => void) | undefined
   locale: string
 }
 
@@ -240,13 +261,18 @@ export function makeStatsContext(kit: ViewKit): (props: StatsContextProps) => Re
   return function StatsContext(props: StatsContextProps): ReactElement {
     const currency: CostCurrency = props.locale === 'zh' ? 'cny' : 'usd'
     const { prices, failed } = useModelPrices()
+    const rules = props.pricingRules ?? null
     const tipIdBase = useId()
-    const cost = estimateSessionCost(props.cost, prices, currency)
+    const cost = estimateSessionCost(props.cost, prices, currency, rules)
     const fmtRate = (usd: number): string => formatPriceRate(toCurrency(usd, currency), currency)
-    const rows = priceRowsOf(props.cost, prices)
+    const rows = priceRowsOf(props.cost, prices, rules)
     // DeepSeek's peak/off-peak scheme is explained only when the session
     // actually billed a DeepSeek provider — other sessions see nothing of it.
     const deepseek = props.cost !== undefined && Object.keys(props.cost).some(p => isDeepSeekProvider(p))
+    // A rule's own peak schedule gets the generic period note.
+    const customPeriod = props.cost !== undefined && Object.keys(props.cost).some(
+      p => !isDeepSeekProvider(p) && Object.keys(asRecord(props.cost?.[p]) ?? {}).some(
+        m => matchRule(rules, p, m)?.offPeak !== undefined))
     const anyPair = rows.some(r => r.offRate !== undefined)
     // PORT ADDITION — which billed models the book could NOT price. The
     // estimate leaves them out entirely, so the cell has to say so: with a
@@ -254,18 +280,20 @@ export function makeStatsContext(kit: ViewKit): (props: StatsContextProps) => Re
     // book outage dsh-context already noted. Settled-book only: while the
     // fetch is still in flight every model reads as unpriced.
     const settled = failed || prices !== null
-    const unpricedModels = settled ? unpricedCostModels(props.cost, prices) : []
-    const nonePriced = cost === null && unpricedModels.length > 0
-    const partial = cost !== null && unpricedModels.length > 0
+    const unpricedPairs = settled ? unpricedCostPairs(props.cost, prices, rules) : []
+    const nonePriced = cost === null && unpricedPairs.length > 0
+    const partial = cost !== null && unpricedPairs.length > 0
     // PORT ADDITION — the per-agent itemization. Only agents that actually
     // billed are listed (a subagent that never reached the model contributes
     // no line), and the block appears only when more than one did, so a
     // childless session's bubble is exactly the one dsh-context showed.
     const parts = (props.costParts ?? [])
-      .map(part => ({ id: part.id, label: part.label, amount: estimateSessionCost(part.cost, prices, currency) }))
+      .map(part => ({ id: part.id, label: part.label, amount: estimateSessionCost(part.cost, prices, currency, rules) }))
       .filter((part): part is { id: string; label: string; amount: number } => part.amount !== null && part.amount > 0)
     const costTip: ReactNode = [
-      t('stats.costTip') + (deepseek ? ' ' + t('stats.costTipDeepseek') : ''),
+      t('stats.costTip')
+        + (deepseek ? ' ' + t('stats.costTipDeepseek') : '')
+        + (customPeriod ? ' ' + t('stats.costTipPeriod') : ''),
       parts.length > 1 ? (
         <span key="parts" className="lc-stat-tip-prices">
           <span className="lc-stat-tip-head">{t('stats.costByAgent')}</span>
@@ -323,10 +351,12 @@ export function makeStatsContext(kit: ViewKit): (props: StatsContextProps) => Re
         numOf(props.usage.uncachedInputTokens) + numOf(props.usage.cacheReadTokens) + numOf(props.usage.cacheWriteTokens),
       )
     /** The scope lines under a value; each keeps its full text in the title. */
-    const notes = (lines: readonly (string | null)[]): ReactNode => {
-      const shown = lines.filter((line): line is string => line !== null)
+    const notes = (lines: readonly (ReactNode | null)[]): ReactNode => {
+      const shown = lines.filter((line): line is ReactNode => line !== null)
       if (shown.length === 0) return undefined
-      return shown.map(line => <span key={line} className="lc-stat-note" title={line}>{line}</span>)
+      return shown.map((line, index) => (
+        <span key={index} className="lc-stat-note" title={typeof line === 'string' ? line : undefined}>{line}</span>
+      ))
     }
     // PORT ADDITION — the second row's derived figures. The peak prompt reads
     // as a SHARE whenever the route's window is known (the figure the reader
@@ -382,10 +412,31 @@ export function makeStatsContext(kit: ViewKit): (props: StatsContextProps) => Re
             costTip,
             // Two scope notes, both about what the figure does NOT say on its
             // own: whose spending it covers, and which billed models it had to
-            // leave out.
+            // leave out (each a "price it" button when the host offers one).
             notes([
               parts.length > 1 ? t('stats.costChildren', { n: parts.length - 1 }) : null,
-              partial ? t('stats.costPartial', { n: unpricedModels.length, models: unpricedModels.join(', ') }) : null,
+              unpricedPairs.length > 0
+                ? (
+                  <>
+                    {partial
+                      ? t('stats.costPartial', { n: unpricedPairs.length })
+                      : t('stats.costNoPriced', { n: unpricedPairs.length })}
+                    {props.onPriceModel === undefined
+                      ? unpricedPairs.map(u => u.label).join(', ')
+                      : unpricedPairs.map((u, index) => (
+                        <span key={u.provider + '/' + u.model}>
+                          {index > 0 ? ', ' : ''}
+                          <button
+                            type="button"
+                            className="lc-stat-price-link"
+                            title={t('stats.costPriceAdd')}
+                            onClick={() => props.onPriceModel?.(u.provider, u.model)}
+                          >{u.label}</button>
+                        </span>
+                      ))}
+                  </>
+                )
+                : null,
             ]),
           )}
           {/* The second row: the same six-cell rhythm, answering what the shape

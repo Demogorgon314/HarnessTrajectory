@@ -9,7 +9,7 @@
  */
 
 import { useCallback, useMemo } from 'react'
-import type { HarnessKind, SessionFileRef, SessionSummary } from '@harness-trajectory/core'
+import type { HarnessKind, ModelPriceRules, SessionFileRef, SessionSummary } from '@harness-trajectory/core'
 import { childKeyOf, type AgentSpawn, type ContextTimeline, type SynthMeta } from '@harness-trajectory/context'
 import {
   ContextView, createContextSettings, createContextTranslate, headlineOf, mergeCostUsage, usageOfRequests,
@@ -29,6 +29,13 @@ export interface ContextPaneProps {
   locale: ContextLocale
   /** Open another agent's Context view (null returns to the main agent). */
   onOpenAgent: (fileId: string | null) => void
+  /**
+   * The persisted price rules — the same table `makeCostPeriod` resolved for
+   * this runtime's fold, so the cost cell's math and the fold's buckets agree.
+   */
+  pricingRules?: ModelPriceRules | undefined
+  /** The cost cell's "price this model" affordance — opens the rule editor seeded for the pair. */
+  onPriceModel?: ((provider: string, model: string) => void) | undefined
 }
 
 /** Display preferences persist per browser, not per session. */
@@ -224,6 +231,8 @@ export function ContextPane(props: ContextPaneProps) {
     cost,
     costParts: onMainAgent ? costParts : undefined,
     sessionUsage,
+    pricingRules: props.pricingRules,
+    onPriceModel: props.onPriceModel,
     // The pane header already carries the session → agent lineage for both
     // tabs, so the dashboard's own back link would only stack on it.
     showBreadcrumb: false,

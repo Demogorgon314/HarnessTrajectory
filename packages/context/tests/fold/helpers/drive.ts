@@ -12,6 +12,7 @@ import type { Config } from '../../../src/fold/config.ts'
 import { resolveBounds } from '../../../src/fold/config.ts'
 import type { TimelineEvent, TimelineState } from '../../../src/fold/fold.ts'
 import { applyTimeline, buildTimelineView, createTimelineState } from '../../../src/fold/fold.ts'
+import type { CostPeriodResolver } from '../../../src/shared/pricingRules.ts'
 import type { ContextTimeline } from '../../../src/shared/types.ts'
 
 /** Indexed read that fails the test instead of the type checker (noUncheckedIndexedAccess). */
@@ -27,11 +28,11 @@ export interface TimelineDefLike {
   view(state: TimelineState): ContextTimeline
 }
 
-export function timelineDef(config?: Config): TimelineDefLike {
+export function timelineDef(config?: Config, costPeriod?: CostPeriodResolver): TimelineDefLike {
   const bounds = resolveBounds(config)
   return {
     init: () => createTimelineState(),
-    apply: (state, event) => applyTimeline(state, event, bounds),
+    apply: (state, event) => applyTimeline(state, event, bounds, costPeriod),
     view: state => buildTimelineView(state, bounds),
   }
 }
@@ -97,8 +98,8 @@ export interface TimelineDrive {
 }
 
 /** Fold the whole log and build the inline view. */
-export function driveTimeline(events: TimelineEvent[], config?: Config): TimelineDrive {
-  const def = timelineDef(config)
+export function driveTimeline(events: TimelineEvent[], config?: Config, costPeriod?: CostPeriodResolver): TimelineDrive {
+  const def = timelineDef(config, costPeriod)
   let state = def.init()
   const states = [state]
   for (const ev of events) {

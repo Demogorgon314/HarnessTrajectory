@@ -1,0 +1,433 @@
+/* Model price rules: the settings-page rule list plus the shared
+   `PriceRuleEditor` form. Shared primitives (.text, .number, .error,
+   .btnGhost) live in settings.module.css — components import both. */
+
+.priceRules {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.priceRule {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 0.5px solid var(--dsw-alias-border-l1);
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-1);
+  font-size: 12px;
+}
+
+.priceRule:hover {
+  border-color: var(--dsw-alias-border-l3, var(--dsw-alias-border-l1));
+}
+
+.priceRuleKey {
+  flex: none;
+  color: var(--dsw-alias-label-primary);
+}
+
+.priceRuleSummary {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-secondary, var(--dsw-alias-label-primary));
+  opacity: 0.75;
+}
+
+.priceRuleButton {
+  flex: none;
+  padding: 2px 6px;
+  border: 0;
+  border-radius: 6px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  color: var(--dsw-alias-label-secondary, var(--dsw-alias-label-primary));
+  background: transparent;
+}
+
+.priceRuleButton:hover {
+  background: var(--dsw-alias-state-hover, rgb(127 127 127 / 12%));
+}
+
+.priceRuleActions {
+  flex: none;
+  display: flex;
+  gap: 2px;
+}
+
+.priceIconBtn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: 0;
+  border-radius: 6px;
+  font: inherit;
+  cursor: pointer;
+  color: var(--dsw-alias-label-secondary, var(--dsw-alias-label-primary));
+  background: transparent;
+}
+
+.priceIconBtn:hover {
+  background: var(--dsw-alias-state-hover, rgb(127 127 127 / 12%));
+}
+
+.priceIconBtn[data-danger]:hover {
+  color: var(--dsw-alias-state-error-primary, #d3453d);
+}
+
+.priceConfirm {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.priceConfirmText {
+  color: var(--dsw-alias-label-secondary, var(--dsw-alias-label-primary));
+}
+
+.priceConfirmDelete {
+  flex: none;
+  padding: 2px 6px;
+  border: 0;
+  border-radius: 6px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  color: var(--dsw-alias-state-error-primary, #d3453d);
+  background: transparent;
+}
+
+.priceConfirmDelete:hover {
+  background: var(--dsw-alias-state-hover, rgb(127 127 127 / 12%));
+}
+
+.priceEmpty {
+  margin-top: 8px;
+  padding: 14px;
+  border: 0.5px dashed var(--dsw-alias-border-l1);
+  border-radius: 10px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--dsw-alias-label-secondary, var(--dsw-alias-label-primary));
+}
+
+.priceEditorCard {
+  margin-top: 8px;
+  padding: 12px 14px;
+  border: 0.5px solid var(--dsw-alias-border-l1);
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-1);
+}
+
+/* Inside the rule list the flex gap already spaces the card. */
+.priceRules > .priceEditorCard {
+  margin-top: 0;
+}
+
+.priceAdd {
+  align-self: flex-start;
+  flex: none;
+  margin-top: 8px;
+  padding: 6px 10px;
+  border: 0.5px dashed var(--dsw-alias-border-l1);
+  border-radius: 8px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  color: var(--dsw-alias-state-business-primary);
+  background: transparent;
+}
+
+.priceAdd:hover {
+  background: var(--dsw-alias-state-hover, rgb(127 127 127 / 12%));
+}
+
+.priceEditor {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 12px 0 0;
+}
+
+.priceEditorCard > .priceEditor {
+  margin-top: 0;
+}
+
+/* A labeled form row: an 80px label column, then the control. */
+.field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.fieldLabel {
+  flex: none;
+  width: 80px;
+  color: var(--dsw-alias-label-secondary, var(--dsw-alias-label-primary));
+  opacity: 0.85;
+}
+
+.fieldControl {
+  flex: 1;
+  min-width: 0;
+}
+
+/* A text input that fills its control slot (paired with `.text` from
+   settings.module.css, which styles the chrome). */
+.fieldInput {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* Rows whose control is a block (rate grid, model picker) align the label
+   with the control's top edge. */
+.field[data-top] {
+  align-items: flex-start;
+}
+
+.field[data-top] .fieldLabel {
+  padding-top: 6px;
+}
+
+/* A control cell that stacks its children (Match segment over the input). */
+.controlColumn {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.controlColumn > .segment {
+  align-self: flex-start;
+}
+
+.priceDim {
+  color: var(--dsw-alias-label-secondary, var(--dsw-alias-label-primary));
+}
+
+/* Link-styled affordances inside the form (manual alias, copy rates). Kept
+   after `.priceHint` so the business-primary color wins on the same node. */
+.priceHint {
+  margin: -2px 0 0 88px;
+  font-size: 11px;
+  color: var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary));
+}
+
+.priceLink {
+  align-self: flex-start;
+  border: 0;
+  padding: 0;
+  background: none;
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+  color: var(--dsw-alias-state-business-primary);
+}
+
+.priceLink:hover {
+  text-decoration: underline;
+}
+
+/* The picked alias shown under the picker instead of a free text input —
+   one line; an overlong id truncates, the rates and the ✕ never shrink. */
+.aliasChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  white-space: nowrap;
+  padding: 3px 8px;
+  border: 0.5px solid var(--dsw-alias-border-l1);
+  border-radius: 6px;
+  background: var(--dsw-alias-bg-layer-1);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--dsw-alias-label-primary);
+}
+
+.aliasChipId {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.aliasChipRates {
+  flex: none;
+  font-family: inherit;
+  font-size: 11px;
+  color: var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary));
+}
+
+.aliasChipClear {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: 5px;
+  padding: 0;
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+  color: var(--dsw-alias-label-secondary, var(--dsw-alias-label-primary));
+  background: transparent;
+}
+
+.aliasChipClear:hover {
+  background: var(--dsw-alias-state-hover, rgb(127 127 127 / 12%));
+}
+
+/* The rate-card grid: five labeled cells under one "Rates" row label. */
+.ratesCell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.ratesGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
+  gap: 6px 8px;
+}
+
+.ratesField {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.ratesFieldLabel {
+  font-size: 11px;
+  color: var(--dsw-alias-label-secondary, var(--dsw-alias-label-primary));
+}
+
+/* Paired with `.number` from settings.module.css — the cell's input fills it. */
+.ratesInput {
+  width: 100%;
+  box-sizing: border-box;
+  text-align: left;
+}
+
+.ratesCaption {
+  font-size: 11px;
+  color: var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary));
+}
+
+.priceInlineHint {
+  margin-left: 8px;
+  font-size: 11px;
+  color: var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary));
+}
+
+.priceCheck {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.check {
+  accent-color: var(--dsw-alias-state-business-primary);
+}
+
+/* Radio groups rendered as a segmented control; the real input stays
+   focusable but invisible so keyboard users get the outline. */
+.segment {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border: 0.5px solid var(--dsw-alias-border-l1);
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-1);
+}
+
+.segmentItem {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  color: var(--dsw-alias-label-secondary, var(--dsw-alias-label-primary));
+}
+
+/* Plain-button segment items (the Match scope shortcuts) lose the UA chrome. */
+.segmentBtn {
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: 12px;
+}
+
+.segmentItem:has(input:checked),
+.segmentItem[aria-pressed='true'] {
+  background: var(--dsw-alias-state-business-tertiary, rgb(77 107 254 / 14%));
+  color: var(--dsw-alias-state-business-primary);
+  font-weight: 500;
+  box-shadow: inset 0 0 0 0.5px var(--dsw-alias-state-business-primary);
+}
+
+.segmentItem:has(input:focus-visible) {
+  outline: 2px solid var(--dsw-alias-state-business-primary);
+}
+
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  opacity: 0;
+}
+
+.factorNumber {
+  width: 88px;
+}
+
+/* Off-peak rows group under a left rail; their labels share the outer 80px
+   column so the inputs line up with the rest of the form. */
+.priceOff {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 4px 0 4px 12px;
+  border-left: 2px solid var(--dsw-alias-border-l1);
+}
+
+.priceActions {
+  display: flex;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.btnPrimary {
+  padding: 6px 12px;
+  border: 0;
+  border-radius: 8px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  color: #fff;
+  background: var(--dsw-alias-state-business-primary);
+}
+
+.btnPrimary:disabled {
+  opacity: 0.5;
+  cursor: default;
+}

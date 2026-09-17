@@ -19,8 +19,10 @@
  * per request) and a harness's own regional surcharges.
  */
 
+import type { ModelPriceRule, ModelPriceRules, ModelRateInput } from '@harness-trajectory/core'
 import type { SessionCostUsage } from '../shared/types'
-import { isDeepSeekProvider, modelsDevProviderOf } from '../shared/providers'
+import { isDeepSeekProvider, modelsDevProviderOf, vendorProviderOf } from '../shared/providers'
+import { matchRule } from '../shared/pricingRules'
 import { asRecord, numOf } from './services'
 
 /** The display currencies the stats board ships; the locale picks one. */
@@ -72,15 +74,46 @@ export function write1hOf(rate: PriceTriple): number {
   return rate.write1h ?? rate.miss * CACHE_WRITE_1H_FACTOR
 }
 
-/** One rate triple at the half-price off-peak rate (the tooltip's `peak | off` pair). */
-export function offPeakOf(rate: PriceTriple): PriceTriple {
+/** One rate triple at the given off-peak factor (the tooltip's `peak | off` pair). */
+export function offPeakOf(rate: PriceTriple, factor = OFF_PEAK_FACTOR): PriceTriple {
   return {
-    hit: rate.hit * OFF_PEAK_FACTOR,
-    miss: rate.miss * OFF_PEAK_FACTOR,
-    write: rate.write * OFF_PEAK_FACTOR,
-    out: rate.out * OFF_PEAK_FACTOR,
-    ...(rate.write1h === undefined ? {} : { write1h: rate.write1h * OFF_PEAK_FACTOR }),
+    hit: rate.hit * factor,
+    miss: rate.miss * factor,
+    write: rate.write * factor,
+    out: rate.out * factor,
+    ...(rate.write1h === undefined ? {} : { write1h: rate.write1h * factor }),
   }
+}
+
+/**
+ * A rule's stated rates as a price triple — the same fallback semantics the
+ * registry extraction uses (absent cache fields bill at the input rate, an
+ * absent 1h-write rate derives from the input rate downstream).
+ */
+export function tripleOf(rates: ModelRateInput): PriceTriple {
+  return {
+    hit: rates.cacheRead ?? rates.input,
+    miss: rates.input,
+    write: rates.cacheWrite ?? rates.input,
+    out: rates.output,
+    ...(rates.cacheWrite1h === undefined ? {} : { write1h: rates.cacheWrite1h }),
+  }
+}
+
+/**
+ * The price of a matched rule's OFF-peak buckets: the rule's own off-peak
+ * rate card when it states one, else its factor over the peak triple (factor
+ * absent — an unclamped hand-edit — degrades to the DeepSeek convention). A
+ * rule without `offPeak` leaves the provider's own scheme in force: DeepSeek
+ * still halves, every other provider's `off` bucket (which its schedule then
+ * never produces) would bill at list price.
+ */
+export function offRateOf(rule: ModelPriceRule | null, provider: string, rate: PriceTriple): PriceTriple {
+  const off = rule?.offPeak
+  if (off !== undefined) {
+    return off.rates !== undefined ? tripleOf(off.rates) : offPeakOf(rate, off.factor ?? OFF_PEAK_FACTOR)
+  }
+  return isDeepSeekProvider(provider) ? offPeakOf(rate) : rate
 }
 
 /** One book branch (a provider's models), as far as runtime can prove it. */
@@ -136,25 +169,71 @@ function lookupRouted(models: Record<string, PriceTriple>, model: string): Price
 }
 
 /**
- * The book's rates for one folded (provider, model) bucket, or null when
- * the book cannot price it: the dsh provider id resolves through
- * modelsDevProviderOf (unmapped ids pass through) and prices by model id —
- * exact, case-insensitive, suffix, or (for a routed id) the same three over
- * the untagged base id; a provider the book does not carry falls back to a
- * cross-provider scan, priced only when exactly one branch carries the model.
+ * The registry lookup for one (provider, model): the provider id resolves
+ * through modelsDevProviderOf (unmapped ids pass through) and prices by model
+ * id — exact, case-insensitive, suffix, or (for a routed id) the same three
+ * over the untagged base id. A billed branch that does not carry the model —
+ * or a provider the book lacks outright (a harness client id like
+ * `cognition`, or `anthropic` proxying a DeepSeek model) — falls back to a
+ * book-wide scan: exactly one hit prices; several resolve to the model's own
+ * VENDOR (the official list, not a reseller's re-pricing — a provider id the
+ * model's own name prefixes, or the MODEL_VENDOR_PROVIDERS map); a still-tied
+ * scan prices nothing rather than guessing between resellers.
  */
-export function priceOf(prices: ModelPrices | null | undefined, provider: string, model: string): PriceTriple | null {
-  if (prices === null || prices === undefined) return null
-  const direct = branchOf(prices, modelsDevProviderOf(provider))
-  if (direct !== null) return lookupRouted(direct, model)
+function registryPriceOf(prices: ModelPrices, provider: string, model: string): PriceTriple | null {
+  const own = modelsDevProviderOf(provider)
+  const direct = branchOf(prices, own)
+  const hit = direct === null ? null : lookupRouted(direct, model)
+  if (hit !== null) return hit
+  const vendor = vendorProviderOf(model)
+  const lower = model.toLowerCase()
   let found: PriceTriple | null = null
-  for (const models of Object.values(prices)) {
+  let candidates = 0
+  for (const id of Object.keys(prices)) {
+    if (id === own) continue
+    const models = branchOf(prices, id)
+    if (models === null) continue
     const rate = lookupRouted(models, model)
     if (rate === null) continue
-    if (found !== null) return null
-    found = rate
+    candidates += 1
+    if (id === vendor || lower.startsWith(id + '-')) return rate
+    if (found === null) found = rate
   }
-  return found
+  return candidates === 1 ? found : null
+}
+
+/** An alias's `provider/model` split at the FIRST '/' (model ids may carry slashes). */
+function aliasPriceOf(prices: ModelPrices, alias: string): PriceTriple | null {
+  const slash = alias.indexOf('/')
+  if (slash <= 0 || slash === alias.length - 1) return null
+  const branch = branchOf(prices, alias.slice(0, slash))
+  return branch === null ? null : lookupRouted(branch, alias.slice(slash + 1))
+}
+
+/**
+ * The rates for one folded (provider, model) bucket, or null when nothing
+ * prices it. A matching user rule speaks FIRST: `alias` borrows the registry
+ * rates of the named entry (resolved against the registry only — rules never
+ * chain), falling back to the rule's own `rates` when the book lacks the
+ * alias; `rates` alone state the card outright. No rule — or no rule rate —
+ * takes the registry path.
+ */
+export function priceOf(
+  prices: ModelPrices | null | undefined,
+  provider: string,
+  model: string,
+  rules?: ModelPriceRules | null,
+): PriceTriple | null {
+  const rule = matchRule(rules, provider, model)
+  if (rule !== null) {
+    if (prices !== null && prices !== undefined && rule.alias !== undefined) {
+      const aliased = aliasPriceOf(prices, rule.alias)
+      if (aliased !== null) return aliased
+    }
+    if (rule.rates !== undefined) return tripleOf(rule.rates)
+    if (rule.alias !== undefined) return null
+  }
+  return prices === null || prices === undefined ? null : registryPriceOf(prices, provider, model)
 }
 
 /**
@@ -175,32 +254,35 @@ export function estimateSessionCost(
   usage: SessionCostUsage | null | undefined,
   prices: ModelPrices | null | undefined,
   currency: CostCurrency,
+  rules?: ModelPriceRules | null,
 ): number | null {
-  if (usage === null || usage === undefined || prices === null || prices === undefined) return null
+  // No early bail on `prices === null`: a rule's own rate card prices a
+  // session even while the registry fetch is in flight or failed.
+  if (usage === null || usage === undefined) return null
   let total = 0
   let any = false
   for (const provider of Object.keys(usage)) {
     const models = asRecord(usage[provider])
     if (models === null) continue
-    // The half-price off-peak period is DeepSeek's alone (shared/providers):
-    // every other provider bills every bucket at list price.
-    const offPeak = isDeepSeekProvider(provider)
     for (const model of Object.keys(models)) {
-      const rate = priceOf(prices, provider, model)
+      const rate = priceOf(prices, provider, model, rules)
       const periods = asRecord(models[model])
       if (rate === null || periods === null) continue
+      // The period's own card: `off` prices through the matching rule's
+      // offPeak (or the provider's built-in scheme — see offRateOf).
+      const off = offRateOf(matchRule(rules, provider, model), provider, rate)
       for (const period of ['peak', 'off'] as const) {
         const bucket = asRecord(periods[period])
         if (bucket === null) continue
+        const r = period === 'off' ? off : rate
         // `cacheWrite1h` is a SUBSET of `cacheWrite`: the 1h share bills at
         // the 1h rate and the remainder at the 5m rate, so the two can never
         // between them bill more tokens than the write bucket holds.
         const write = numOf(bucket.cacheWrite)
         const write1h = Math.min(Math.max(0, numOf(bucket.cacheWrite1h)), write)
-        const price = (numOf(bucket.cacheRead) * rate.hit + numOf(bucket.uncached) * rate.miss
-          + (write - write1h) * rate.write + write1h * write1hOf(rate)
-          + numOf(bucket.output) * rate.out) / 1e6
-        total += offPeak && period === 'off' ? price * OFF_PEAK_FACTOR : price
+        total += (numOf(bucket.cacheRead) * r.hit + numOf(bucket.uncached) * r.miss
+          + (write - write1h) * r.write + write1h * write1hOf(r)
+          + numOf(bucket.output) * r.out) / 1e6
         any = true
       }
     }
@@ -208,32 +290,50 @@ export function estimateSessionCost(
   return any ? toCurrency(total, currency) : null
 }
 
+/** One billed model the book prices not: its fold key and its display label. */
+export interface UnpricedModel {
+  provider: string
+  model: string
+  /** `model · provider` when the session billed more than one provider. */
+  label: string
+}
+
 /**
  * The billed (provider, model) keys the book cannot price — every one of them
  * is tokens the session really spent that {@link estimateSessionCost} left
  * out. A session whose models ALL price returns an empty list; a session that
- * prices none returns every key it billed (the cell's "no prices" case). Keys
- * are `model` alone, or `model · provider` when the session billed more than
- * one provider — the same label shape as the tooltip's rate rows.
+ * prices none returns every key it billed (the cell's "no prices" case).
+ * The pair travels with the label so a caller can offer "add a price rule
+ * for this" straight off the fold key.
  */
-export function unpricedCostModels(
+export function unpricedCostPairs(
   usage: SessionCostUsage | null | undefined,
   prices: ModelPrices | null | undefined,
-): string[] {
+  rules?: ModelPriceRules | null,
+): UnpricedModel[] {
   if (usage === null || usage === undefined) return []
   const providers = Object.keys(usage)
   const multi = providers.length > 1
-  const out: string[] = []
+  const out: UnpricedModel[] = []
   for (const provider of providers) {
     const models = asRecord(usage[provider])
     if (models === null) continue
     for (const model of Object.keys(models)) {
-      if (priceOf(prices, provider, model) !== null) continue
+      if (priceOf(prices, provider, model, rules) !== null) continue
       if (asRecord(models[model]) === null) continue
-      out.push(multi && provider !== '' ? `${model} · ${provider}` : model)
+      out.push({ provider, model, label: multi && provider !== '' ? `${model} · ${provider}` : model })
     }
   }
   return out
+}
+
+/** The unpriced pairs' display labels (the cell note's wording). */
+export function unpricedCostModels(
+  usage: SessionCostUsage | null | undefined,
+  prices: ModelPrices | null | undefined,
+  rules?: ModelPriceRules | null,
+): string[] {
+  return unpricedCostPairs(usage, prices, rules).map(u => u.label)
 }
 
 export function formatCost(amount: number, currency: CostCurrency): string {

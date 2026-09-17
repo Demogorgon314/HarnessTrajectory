@@ -29,6 +29,7 @@ import type { EventSynthesizer, SynthesizerFactory, SynthMeta } from '../synth/t
 import { createSynthesizer } from '../synth/index.ts'
 import type { Config, FoldBounds } from './config.ts'
 import { resolveBounds } from './config.ts'
+import { defaultCostPeriod, type CostPeriodResolver } from '../shared/pricingRules.ts'
 import type { TimelineState } from './fold.ts'
 import { applyTimeline, buildTimelineView, createTimelineState } from './fold.ts'
 import type { HeadersState, ToolSourceResolver } from './headers.ts'
@@ -40,6 +41,13 @@ export interface ContextSessionOptions {
   bounds?: Config
   /** Tool → producer attribution applied to the header views (default: MCP servers). */
   resolveToolSource?: ToolSourceResolver
+  /**
+   * Which pricing period a billed request books under (default: DeepSeek's
+   * period-based list, everything else `peak`). Pass
+   * `makeCostPeriod(settings.modelPricing)` to honor the user's price rules;
+   * changing the resolver only takes effect through a refold.
+   */
+  costPeriod?: CostPeriodResolver
 }
 
 interface FileFold {
@@ -112,6 +120,7 @@ export class ContextSession {
   private readonly factory: SynthesizerFactory
   private readonly bounds: FoldBounds
   private readonly resolveToolSource: ToolSourceResolver
+  private readonly costPeriod: CostPeriodResolver
   private readonly folds = new Map<string, FileFold>()
   private filesCache: readonly SessionFileRef[] | null = null
   private rev = 0
@@ -126,6 +135,7 @@ export class ContextSession {
     this.factory = factory ?? (file => createSynthesizer(kind, file))
     this.bounds = resolveBounds(options.bounds)
     this.resolveToolSource = options.resolveToolSource ?? toolSourceOf
+    this.costPeriod = options.costPeriod ?? defaultCostPeriod
   }
 
   /** Bumps on every change to any file's fold — the UI store's dirty marker. */
@@ -160,7 +170,7 @@ export class ContextSession {
       return
     }
     for (const event of events) {
-      const timeline = applyTimeline(fold.timeline, event, this.bounds)
+      const timeline = applyTimeline(fold.timeline, event, this.bounds, this.costPeriod)
       if (timeline !== fold.timeline) {
         fold.timeline = timeline
         fold.rev++

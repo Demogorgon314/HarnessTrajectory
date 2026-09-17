@@ -6,7 +6,9 @@
 
 import assert from './helpers/assert.ts'
 import { describe, test } from 'vitest'
+import type { ModelPriceRules } from '@harness-trajectory/core'
 import type { TimelineEvent } from '../../src/fold/fold.ts'
+import { makeCostPeriod } from '../../src/shared/pricingRules.ts'
 import {
   assistantMessage,
   at,
@@ -701,6 +703,51 @@ describe('session-cost accumulation', () => {
     assert.deepEqual(state.cost?.['deepseek-official']?.['deepseek-v4-pro']?.peak, {
       uncached: 10, cacheRead: 20, cacheWrite: 30, output: 40,
     })
+  })
+
+  // PORT ADDITION — a user price rule hands any model its own peak schedule.
+  test('a rule-matched model splits peak/off-peak on its own schedule', () => {
+    const rules: ModelPriceRules = {
+      'cognition/swe-2-max': {
+        rates: { input: 1, output: 1 },
+        offPeak: { peakHours: [[9, 12]], timezone: 'Asia/Shanghai', factor: 0.5 },
+      },
+    }
+    const { state } = driveTimeline([
+      header(1, { provider: 'cognition', model: 'swe-2-max' }),
+      at100(2, Date.UTC(2024, 0, 1, 2, 0, 0)), // Mon 10:00 Beijing — peak
+      at100(3, Date.UTC(2024, 0, 1, 5, 0, 0)), // Mon 13:00 Beijing — off-peak
+      at100(4, Date.UTC(2024, 0, 6, 2, 0, 0)), // Sat 10:00 Beijing — no weekdaysOnly: inside the window
+    ], undefined, makeCostPeriod(rules))
+    const usage = state.cost?.['cognition']?.['swe-2-max']
+    assert.equal(usage?.peak?.uncached, 200)
+    assert.equal(usage?.off?.uncached, 100)
+    assertPlainJson(state)
+  })
+
+  test('a rule CAN re-schedule even a DeepSeek model', () => {
+    const rules: ModelPriceRules = {
+      'deepseek-official/*': {
+        rates: { input: 1, output: 1 },
+        offPeak: { peakHours: [[9, 12]], timezone: 'Asia/Shanghai', factor: 0.5 },
+      },
+    }
+    const { state } = driveTimeline([
+      header(1, { provider: 'deepseek-official', model: 'deepseek-v4-flash' }),
+      at100(2, Date.UTC(2024, 0, 1, 6, 0, 0)), // Mon 14:00 Beijing — DeepSeek-peak, rule-off
+    ], undefined, makeCostPeriod(rules))
+    const usage = state.cost?.['deepseek-official']?.['deepseek-v4-flash']
+    assert.equal(usage?.off?.uncached, 100, 'the rule’s schedule, not the built-in one')
+    assert.equal(usage?.peak, undefined)
+  })
+
+  test('an unmatched model folds exactly as before under a rule table', () => {
+    const rules: ModelPriceRules = { 'elsewhere/x': { rates: { input: 1, output: 1 } } }
+    const { state } = driveTimeline([
+      header(1, { provider: 'deepseek-official', model: 'deepseek-v4-flash' }),
+      at100(2, Date.UTC(2024, 0, 1, 5, 0, 0)), // Mon 13:00 Beijing — built-in off-peak
+    ], undefined, makeCostPeriod(rules))
+    assert.equal(state.cost?.['deepseek-official']?.['deepseek-v4-flash']?.off?.uncached, 100)
   })
 })
 

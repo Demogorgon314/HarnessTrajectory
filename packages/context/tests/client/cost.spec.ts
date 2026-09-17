@@ -5,8 +5,9 @@
 
 import assert from './helpers/assert.ts'
 import { describe, test } from 'vitest'
-import { estimateSessionCost, formatCost, formatPriceRate, offPeakOf, priceOf, toCurrency, unpricedCostModels, write1hOf } from '../../src/client/cost'
+import { estimateSessionCost, formatCost, formatPriceRate, offPeakOf, offRateOf, priceOf, toCurrency, tripleOf, unpricedCostModels, unpricedCostPairs, write1hOf } from '../../src/client/cost'
 import type { ModelPrices } from '../../src/client/cost'
+import type { ModelPriceRules } from '@harness-trajectory/core'
 import type { CostBucketTotals } from '../../src/shared/types'
 
 const M = 1_000_000
@@ -65,15 +66,40 @@ describe('priceOf', () => {
     assert.equal(priceOf(book, 'kimi-coding', 'k3'), null)
   })
 
-  test('a known provider with an unknown model prices null (no cross-provider guess)', () => {
-    assert.equal(priceOf(BOOK, 'deepseek', 'kimi-k2.7-code'), null)
+  test('a known provider missing the model falls back to the book-wide scan', () => {
+    // deepseek's own branch lacks the id; moonshotai is its only carrier.
+    assert.equal(priceOf(BOOK, 'deepseek', 'kimi-k2.7-code'), KIMI)
+    assert.equal(priceOf(BOOK, 'deepseek', 'mystery'), null, 'no branch carries it')
   })
 
   test('a provider the book does not carry prices the model only when unambiguous book-wide', () => {
     assert.equal(priceOf(BOOK, '', 'kimi-k2.7-code'), KIMI, 'unambiguous: exactly one branch carries it')
     assert.equal(priceOf(BOOK, 'future-provider', 'kimi-k2.7-code'), KIMI)
-    assert.equal(priceOf(BOOK, '', 'deepseek-v4-flash'), null, 'ambiguous: two branches carry it')
+    assert.equal(priceOf(BOOK, '', 'deepseek-v4-flash'), FLASH, 'two carriers, but the vendor is one of them')
     assert.equal(priceOf(BOOK, '', 'mystery'), null)
+  })
+
+  test('several carriers resolve to the model\'s own vendor (the official list)', () => {
+    // Billed under another provider's client id: the vendor branch wins over
+    // a reseller's re-pricing of the same id.
+    const book: ModelPrices = {
+      anthropic: { 'claude-opus-5': K3 },
+      mirror: { 'claude-opus-5': KIMI },
+    }
+    assert.equal(priceOf(book, 'openai', 'claude-opus-5'), K3, 'claude → anthropic')
+    assert.equal(priceOf(book, 'openai', 'claude-opus-5[1m]'), K3, 'the routed id too')
+    const gpt: ModelPrices = { azure: { 'gpt-9': KIMI }, openai: { 'gpt-9': PRO } }
+    assert.equal(priceOf(gpt, 'copilot', 'gpt-9'), PRO, 'the billed client id prices at the vendor\'s list, not the reseller\'s')
+    const miss: ModelPrices = { openai: { 'other-model': KIMI }, azure: { 'gpt-9': PRO } }
+    assert.equal(priceOf(miss, 'openai', 'gpt-9'), PRO, 'the billed branch misses → the unique carrier prices')
+    const prefixed: ModelPrices = { deepseek: { 'deepseek-v9': PRO }, reseller: { 'deepseek-v9': K3 } }
+    assert.equal(priceOf(prefixed, 'kilo', 'deepseek-v9'), PRO, 'the model id prefixes the vendor provider id')
+  })
+
+  test('several carriers with no vendor among them still price nothing', () => {
+    const book: ModelPrices = { 'reseller-a': { 'acme-x': KIMI }, 'reseller-b': { 'acme-x': K3 } }
+    assert.equal(priceOf(book, 'openai', 'acme-x'), null)
+    assert.equal(priceOf(book, '', 'acme-x'), null)
   })
 
   test('a null or missing book prices nothing', () => {
@@ -92,7 +118,7 @@ describe('estimateSessionCost', () => {
   test('usage without any priced bucket returns null', () => {
     assert.equal(estimateSessionCost({}, BOOK, 'usd'), null)
     assert.equal(estimateSessionCost({ 'deepseek-official': { unknown: { peak: bucket(0, M, 0, 0) } } }, BOOK, 'usd'), null)
-    assert.equal(estimateSessionCost({ unmapped: { 'deepseek-v4-flash': { peak: bucket(0, M, 0, 0) } } }, BOOK, 'usd'), null)
+    assert.equal(estimateSessionCost({ unmapped: { 'acme-x': { peak: bucket(0, M, 0, 0) } } }, BOOK, 'usd'), null)
   })
 
   test('prices every period bucket at its own rate (hit / miss / write / out)', () => {
@@ -183,8 +209,12 @@ describe('routed model ids', () => {
 
   test('the cross-provider fallback untags too, and stays ambiguity-safe', () => {
     assert.equal(priceOf(TAGGED, 'future-provider', 'claude-opus-5[1m]'), OPUS)
+    // Two carriers resolve to the vendor (claude → anthropic), not a guess.
     const two: ModelPrices = { anthropic: { 'claude-opus-5': OPUS }, mirror: { 'claude-opus-5': K3 } }
-    assert.equal(priceOf(two, 'future-provider', 'claude-opus-5[1m]'), null)
+    assert.equal(priceOf(two, 'future-provider', 'claude-opus-5[1m]'), OPUS)
+    // Two carriers, neither the model's vendor: still no guess.
+    const resellers: ModelPrices = { 'reseller-a': { 'acme-9': K3 }, 'reseller-b': { 'acme-9': OPUS } }
+    assert.equal(priceOf(resellers, 'future-provider', 'acme-9[1m]'), null)
   })
 })
 
@@ -282,5 +312,110 @@ describe('formatPriceRate', () => {
   test('strips the dot left behind when every decimal was a zero', () => {
     assert.equal(formatPriceRate(9.0, 'cny'), '¥9')
     assert.equal(formatPriceRate(1.5, 'cny'), '¥1.5')
+  })
+})
+
+describe('user price rules', () => {
+  // K3's book rates are {hit: .3, miss: 3, write: 3, out: 15}.
+  const RULES: ModelPriceRules = {
+    'cognition/swe-2-max': { alias: 'moonshotai/kimi-k3' },
+    'cognition/swe-lite': { rates: { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 1.5, cacheWrite1h: 3 } },
+    'peak-billed': { rates: { input: 2, output: 4 }, offPeak: { peakHours: [[9, 12]], factor: 0.25 } },
+    'off-card': { rates: { input: 2, output: 4 }, offPeak: { peakHours: [[9, 12]], rates: { input: 0.5, output: 1 } } },
+  }
+
+  test('an alias borrows the named registry entry', () => {
+    assert.equal(priceOf(BOOK, 'cognition', 'swe-2-max', RULES), K3)
+  })
+
+  test('an alias the book lacks falls back to the rule’s own rates', () => {
+    const rules: ModelPriceRules = { 'x/y': { alias: 'nowhere/model', rates: { input: 7, output: 8 } } }
+    assert.deepEqual(priceOf(BOOK, 'x', 'y', rules), { hit: 7, miss: 7, write: 7, out: 8 })
+    // With no fallback card the model stays honestly unpriced.
+    assert.equal(priceOf(BOOK, 'x', 'y', { 'x/y': { alias: 'nowhere/model' } }), null)
+  })
+
+  test('an alias never chains back into the rules', () => {
+    // 'x/y' aliases to a key only the RULES table prices — the book has no
+    // 'cognition' branch, so the alias misses and the fallback card bills.
+    const rules: ModelPriceRules = {
+      ...RULES,
+      'x/y': { alias: 'cognition/swe-lite', rates: { input: 9, output: 9 } },
+    }
+    assert.deepEqual(priceOf(BOOK, 'x', 'y', rules), { hit: 9, miss: 9, write: 9, out: 9 })
+  })
+
+  test('a rates-only rule prices even with no book at all', () => {
+    assert.deepEqual(priceOf(null, 'cognition', 'swe-lite', RULES), {
+      hit: 0.1, miss: 1, write: 1.5, out: 2, write1h: 3,
+    })
+  })
+
+  test('a rule shadows the book’s own entry', () => {
+    const rules: ModelPriceRules = { 'deepseek-official/deepseek-v4-flash': { rates: { input: 1, output: 1 } } }
+    assert.deepEqual(priceOf(BOOK, 'deepseek-official', 'deepseek-v4-flash', rules), {
+      hit: 1, miss: 1, write: 1, out: 1,
+    })
+  })
+
+  test('unmatched models keep the registry path untouched', () => {
+    assert.equal(priceOf(BOOK, 'deepseek-official', 'deepseek-v4-flash', RULES), FLASH)
+    assert.equal(priceOf(BOOK, 'elsewhere', 'unknown', RULES), null)
+  })
+
+  test('tripleOf fills absent cache fields with the input rate, like the book does', () => {
+    assert.deepEqual(tripleOf({ input: 2, output: 8 }), { hit: 2, miss: 2, write: 2, out: 8 })
+    assert.deepEqual(tripleOf({ input: 2, output: 8, cacheRead: 0.5, cacheWrite1h: 4 }), {
+      hit: 0.5, miss: 2, write: 2, out: 8, write1h: 4,
+    })
+  })
+
+  test('offRateOf: rule card > rule factor > the provider’s built-in scheme', () => {
+    const rate = { hit: 1, miss: 2, write: 2, out: 4 }
+    assert.deepEqual(
+      offRateOf(RULES['off-card'] ?? null, 'x', rate),
+      { hit: 0.5, miss: 0.5, write: 0.5, out: 1 },
+      'an explicit off-peak card prices the off buckets outright',
+    )
+    assert.deepEqual(
+      offRateOf(RULES['peak-billed'] ?? null, 'x', rate),
+      { hit: 0.25, miss: 0.5, write: 0.5, out: 1 },
+      'a factor discounts every component of the peak card',
+    )
+    assert.deepEqual(offRateOf(null, 'deepseek-official', rate), { hit: 0.5, miss: 1, write: 1, out: 2 })
+    assert.deepEqual(offRateOf(null, 'x', rate), rate, 'a flat provider’s off bucket bills at list')
+  })
+
+  test('estimateSessionCost prices a rule-matched model the book lacks', () => {
+    const usage = { cognition: { 'swe-lite': { peak: bucket(0, M, 0, M) } } }
+    close(estimateSessionCost(usage, null, 'usd', RULES), 1 + 2, 'no book needed — the rule states the card')
+    close(estimateSessionCost(usage, BOOK, 'usd', RULES), 1 + 2)
+  })
+
+  test('estimateSessionCost prices the off bucket through the rule’s offPeak', () => {
+    const usage = { anywhere: { 'peak-billed': { peak: bucket(0, M, 0, 0), off: bucket(0, M, 0, 0) } } }
+    close(estimateSessionCost(usage, null, 'usd', RULES), 2 + 0.5, 'off = 0.25 × the $2 input rate')
+    const card = { anywhere: { 'off-card': { off: bucket(0, M, 0, M) } } }
+    close(estimateSessionCost(card, null, 'usd', RULES), 0.5 + 1, 'explicit off rates bill as stated')
+  })
+
+  test('a rule without offPeak leaves DeepSeek’s built-in halving in force', () => {
+    const rules: ModelPriceRules = { 'deepseek-official/*': { rates: { input: 2, output: 6 } } }
+    const usage = { 'deepseek-official': { 'deepseek-v4-flash': { peak: bucket(0, M, 0, 0), off: bucket(0, M, 0, 0) } } }
+    close(estimateSessionCost(usage, null, 'usd', rules), 2 + 1, 'the rule reprices; the schedule stays DeepSeek’s')
+  })
+
+  test('unpricedCostPairs shrinks to what no rule and no book prices', () => {
+    const usage = {
+      cognition: { 'swe-2-max': { peak: bucket(0, M, 0, 0) }, 'swe-mini': { peak: bucket(0, M, 0, 0) } },
+    }
+    assert.deepEqual(unpricedCostPairs(usage, BOOK, RULES), [
+      { provider: 'cognition', model: 'swe-mini', label: 'swe-mini' },
+    ])
+    assert.deepEqual(unpricedCostModels(usage, BOOK, RULES), ['swe-mini'])
+    assert.deepEqual(unpricedCostPairs(usage, BOOK), [
+      { provider: 'cognition', model: 'swe-2-max', label: 'swe-2-max' },
+      { provider: 'cognition', model: 'swe-mini', label: 'swe-mini' },
+    ])
   })
 })

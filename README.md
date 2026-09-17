@@ -77,8 +77,14 @@ pnpm start      # http://127.0.0.1:5170
 
 Transcript roots are discovered from the harness home directories. Environment variables
 below; the server also accepts `--port`, `--host`, `--static`, and `--no-open`. Runtime
-settings (content search on/off, search retention days) live in `settings.json` under the cache
-directory and are editable in the UI's settings dialog (the gear button in the sidebar).
+settings (content search on/off, search retention days, model price rules) live in `settings.json` under the cache
+directory and are editable in the UI's settings dialog (the gear button in the sidebar). Model
+price rules map a billed `provider/model` onto a listed entry or hand-entered USD/1M-token rates,
+optionally with a peak/off-peak schedule. A billed model id first resolves against the registry on
+its own — the provider's branch, then a book-wide scan that prefers the model's vendor list (e.g.
+`gpt-*` → `openai`, `deepseek-*` → `deepseek`) over reseller re-pricings — so rules are only needed
+when nothing official prices it; an unpriced model in a session's Context cost cell or Session Info
+card opens the rule editor directly.
 
 | Setting | Default | Notes |
 | --- | --- | --- |

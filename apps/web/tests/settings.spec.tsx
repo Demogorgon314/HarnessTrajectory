@@ -5,6 +5,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { resetModelPrices, setModelPricesLoader } from '@harness-trajectory/context/client'
 import { SettingsDialog } from '../src/SettingsDialog.tsx'
 import { settingsStore } from '../src/settings-store.ts'
 
@@ -55,10 +56,16 @@ async function answerCurrent(days: number, searchEnabled = true, contentSearch =
 beforeEach(() => {
   stubFetch()
   settingsStore.set({ current: null, saving: false, purged: null, error: null })
+  // The Model pricing section subscribes to the models.dev book; park its
+  // loader so it never reaches the stubbed global fetch.
+  resetModelPrices()
+  setModelPricesLoader(() => new Promise(() => {}))
 })
 
 afterEach(() => {
   cleanup()
+  setModelPricesLoader(null)
+  resetModelPrices()
   vi.unstubAllGlobals()
 })
 

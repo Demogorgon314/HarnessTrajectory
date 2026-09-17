@@ -32,3 +32,32 @@ export function modelsDevProviderOf(dshProviderId: string): string {
 export function isDeepSeekProvider(dshProviderId: string): boolean {
   return modelsDevProviderOf(dshProviderId) === 'deepseek'
 }
+
+/**
+ * A billed model id's vendor — the models.dev provider that publishes the
+ * OFFICIAL list price — for ids whose first dash-segment names a vendor the
+ * registry spells differently (`claude-…` → `anthropic`, `gpt-…` → `openai`).
+ * Prefixes the registry spells the same (`deepseek/deepseek-…`) never reach
+ * this table — the provider-prefix test catches them. The cost card's
+ * cross-provider scan prefers this provider's entry when several branches
+ * carry the model (the official list over a reseller's re-pricing); a vendor
+ * the book lacks simply never matches, so an entry here can only help.
+ */
+const MODEL_VENDOR_PROVIDERS: Record<string, string> = {
+  claude: 'anthropic',
+  gpt: 'openai', o1: 'openai', o3: 'openai', o4: 'openai', chatgpt: 'openai',
+  gemini: 'google', gemma: 'google',
+  grok: 'xai',
+  kimi: 'moonshotai', moonshot: 'moonshotai',
+  qwen: 'alibaba', qwq: 'alibaba',
+  glm: 'zhipuai', chatglm: 'zhipuai',
+  mistral: 'mistral', codestral: 'mistral', devstral: 'mistral',
+  magistral: 'mistral', pixtral: 'mistral', ministral: 'mistral', voxtral: 'mistral',
+  command: 'cohere',
+}
+
+/** The vendor's models.dev provider id for a billed model id, or null when unknown. */
+export function vendorProviderOf(model: string): string | null {
+  const prefix = model.toLowerCase().split('-', 1)[0] ?? ''
+  return MODEL_VENDOR_PROVIDERS[prefix] ?? null
+}

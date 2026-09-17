@@ -16,6 +16,12 @@ export type { CostPart } from './components/statsContext.tsx'
 
 export { mergeCostUsage } from './costMerge.ts'
 
+export { useModelPrices, resetModelPrices, setModelPricesLoader } from './modelPrices.ts'
+export { matchRuleKey, DEEPSEEK_PEAK } from '../shared/pricingRules.ts'
+export { vendorProviderOf } from '../shared/providers.ts'
+export { priceOf, formatPriceRate } from './cost.ts'
+export type { ModelPrices, PriceTriple } from './cost.ts'
+
 export { createContextTranslate, DICT_EN, DICT_ZH } from './i18n.ts'
 export type { ContextLocale, Translate } from './i18n.ts'
 

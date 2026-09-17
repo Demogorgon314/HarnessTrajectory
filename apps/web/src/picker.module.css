@@ -1,0 +1,193 @@
+/* The alias mode's models.dev chooser: a search/provider bar over a capped
+   scrollable list of priced entries. `.text` (the search input's chrome)
+   comes from settings.module.css. */
+
+.picker {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.pickerBar {
+  display: flex;
+  gap: 6px;
+}
+
+.pickerSearch {
+  flex: 1;
+  min-width: 0;
+}
+
+/* A custom menu, not a native <select>: a native popup whose <option>s are
+   replaced mid-open orphans into an undismissable overlay that swallows every
+   click. */
+.pickerProvider {
+  position: relative;
+  flex: none;
+  max-width: 170px;
+}
+
+.pickerProviderBtn {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  width: 100%;
+  max-width: 170px;
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  border: 0.5px solid var(--dsw-alias-border-l1);
+  background: var(--dsw-alias-bg-layer-1);
+  color: var(--dsw-alias-label-primary);
+  cursor: pointer;
+  text-align: left;
+}
+
+.pickerProviderName {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pickerMenu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 20;
+  /* block, not a column flex: the items' overflow:hidden (for ellipsis)
+     zeroes their automatic minimum size, so a column flex's main-axis
+     shrink compresses all 200 rows flat inside the max-height. */
+  display: block;
+  min-width: 140px;
+  max-width: 240px;
+  max-height: 220px;
+  overflow-y: auto;
+  border: 0.5px solid var(--dsw-alias-border-l1);
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-1);
+  box-shadow: 0 4px 16px rgb(0 0 0 / 18%);
+  padding: 4px;
+}
+
+.pickerMenuItem {
+  display: block;
+  width: 100%;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: 12px;
+  padding: 5px 8px;
+  border-radius: 5px;
+  text-align: left;
+  cursor: pointer;
+  color: var(--dsw-alias-label-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pickerMenuItem:hover {
+  background: var(--dsw-alias-state-hover, rgb(127 127 127 / 12%));
+}
+
+.pickerMenuItem[aria-selected='true'] {
+  color: var(--dsw-alias-state-business-primary);
+  font-weight: 600;
+}
+
+.pickerList {
+  display: flex;
+  flex-direction: column;
+  max-height: 320px;
+  overflow-y: auto;
+  border: 0.5px solid var(--dsw-alias-border-l3, var(--dsw-alias-border-l1));
+  border-radius: 8px;
+}
+
+.pickerRow {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 10px;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  color: var(--dsw-alias-label-primary);
+}
+
+.pickerRow + .pickerRow {
+  border-top: 0.5px solid var(--dsw-alias-border-l3, var(--dsw-alias-border-l1));
+}
+
+.pickerRow:hover {
+  background: var(--dsw-alias-state-hover, rgb(127 127 127 / 12%));
+}
+
+.pickerRow[data-picked] {
+  background: var(--dsw-alias-state-hover, rgb(127 127 127 / 12%));
+  box-shadow: inset 2px 0 0 var(--dsw-alias-state-business-primary);
+}
+
+/* The name cell is a flex row so an overlong model id truncates FIRST and
+   the provider tag always survives — the provider is the information. */
+.pickerName {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
+.pickerModel {
+  font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pickerProviderTag {
+  flex: none;
+  color: var(--dsw-alias-label-secondary, var(--dsw-alias-label-primary));
+  opacity: 0.8;
+  font-size: 11px;
+}
+
+.pickerSuggested {
+  flex: none;
+  font-size: 10px;
+  color: var(--dsw-alias-state-business-primary);
+  border: 0.5px solid currentColor;
+  border-radius: 4px;
+  padding: 0 4px;
+}
+
+.pickerInUse {
+  flex: none;
+  font-size: 10px;
+  color: var(--dsw-alias-label-secondary, var(--dsw-alias-label-primary));
+  border: 0.5px solid currentColor;
+  border-radius: 4px;
+  padding: 0 4px;
+}
+
+.pickerRates {
+  flex: none;
+  font-size: 11px;
+  color: var(--dsw-alias-label-secondary, var(--dsw-alias-label-primary));
+  font-variant-numeric: tabular-nums;
+}
+
+.pickerEmpty {
+  padding: 10px;
+  font-size: 12px;
+  color: var(--dsw-alias-label-secondary, var(--dsw-alias-label-primary));
+  opacity: 0.8;
+}

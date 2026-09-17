@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import type {
   HarnessKind, SessionChildSummary, SessionSummary, SubagentRun, SubagentStatus,
 } from '@harness-trajectory/core'
+import { makeCostPeriod } from '@harness-trajectory/context'
 import {
   Menu, TrajectoryView, Tooltip, icons, useSnapshotSelector, writeClipboard,
   type MenuEntry, type SnapshotStore, type TrajectoryInspectLine, type TrajectoryTranslate,
@@ -11,6 +12,7 @@ import { ContextPane } from './ContextPane.tsx'
 import { HarnessMark, harnessMeta } from './harnesses.tsx'
 import { relativeTime } from './SessionList.tsx'
 import { SessionRuntime } from './session-runtime.ts'
+import { settingsStore } from './settings-store.ts'
 import css from './app.module.css'
 
 export interface SessionPaneProps {
@@ -22,6 +24,8 @@ export interface SessionPaneProps {
   t: TrajectoryTranslate
   locale: 'en' | 'zh'
   durationStore: SnapshotStore<boolean>
+  /** The cost cell's "price this model" affordance — opens the settings dialog seeded for the pair. */
+  onPriceModel?: ((provider: string, model: string) => void) | undefined
 }
 
 /** The tab strip's labels, in both UI locales. */
@@ -253,12 +257,23 @@ function SubagentCatalog({ rows, sessionLive, noun, onOpen }: {
   )
 }
 
-export function SessionPane({ route, summary: listSummary, onNavigate, t, locale, durationStore }: SessionPaneProps) {
+export function SessionPane({ route, summary: listSummary, onNavigate, t, locale, durationStore, onPriceModel }: SessionPaneProps) {
   const kind = route.kind
   const id = route.id
   const file = route.file ?? null
   const tab: SessionTab = route.tab ?? 'trajectory'
-  const runtime = useMemo(() => new SessionRuntime(kind, id, file), [kind, id, file])
+  /*
+   * The persisted price rules drive the fold's peak/off-peak split. A new
+   * table is a new resolver identity, which is a new runtime: the stream
+   * replays and the whole session refolds under it — the cheapest correct
+   * re-bucketing there is.
+   */
+  const modelPricing = useSnapshotSelector(settingsStore, state => state.current?.modelPricing)
+  const costPeriod = useMemo(() => makeCostPeriod(modelPricing), [modelPricing])
+  const runtime = useMemo(
+    () => new SessionRuntime(kind, id, file, { costPeriod }),
+    [kind, id, file, costPeriod],
+  )
   useEffect(() => {
     runtime.start()
     return () => { runtime.close() }
@@ -414,6 +429,8 @@ export function SessionPane({ route, summary: listSummary, onNavigate, t, locale
               agent={route.agent ?? null}
               summary={summary}
               locale={locale}
+              pricingRules={modelPricing}
+              onPriceModel={onPriceModel}
               onOpenAgent={(fileId) => {
                 onNavigate(fileId === null
                   ? { kind, id, tab: 'context' }

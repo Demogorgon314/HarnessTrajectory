@@ -231,7 +231,7 @@ describe('StatsContext', () => {
     await m.unmount()
   })
 
-  test('a session the book prices none of dashes and keeps the outage note', async () => {
+  test('a session the book prices none of dashes and names the unpriced models', async () => {
     const none: SessionCostUsage = {
       'deepseek-official': { 'codex-auto-review': { peak: { uncached: 5_000_000, cacheRead: 0, cacheWrite: 0, output: 0 } } },
     }
@@ -244,8 +244,11 @@ describe('StatsContext', () => {
     await flush()
     assert.equal(costOf(m.container), '—')
     assert.ok(text(queryAll(m.container, '.lc-stat-tip')[2]!).includes('Model prices are unavailable'))
-    // Nothing priced is not a partial figure — no "excludes" line.
-    assert.equal(queryAll(m.container, '.lc-stat-note').length, 0)
+    // Nothing priced still names what it could not price — that is precisely
+    // where the "add a price rule" entry belongs.
+    const note = text(queryAll(m.container, '.lc-stat-note')[0]!)
+    assert.ok(note.includes('none of the 1 billed model'), note)
+    assert.ok(note.includes('codex-auto-review'), note)
     await m.unmount()
   })
 

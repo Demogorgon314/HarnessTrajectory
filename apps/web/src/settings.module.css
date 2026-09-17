@@ -16,9 +16,28 @@
   background: var(--dsw-alias-mask, rgb(0 0 0 / 38%));
 }
 
+/* Settings panel: nav rail + content column, deepseek-harness shape. One
+   viewport-derived height for every section — a content-sized panel would
+   resize under the pointer on each nav click; whatever does not fit scrolls
+   in `.options`. */
 .panel {
   position: relative;
-  width: 520px;
+  width: 920px;
+  max-width: calc(100vw - 48px);
+  height: min(720px, calc(100vh - 48px));
+  display: flex;
+  border-radius: 20px;
+  overflow: hidden;
+  border: 0.5px solid var(--dsw-alias-border-l1);
+  background: var(--dsw-alias-bg-layer-2);
+  box-shadow: 0 16px 48px rgb(0 0 0 / 24%);
+  animation: dialog-in 150ms var(--ds-ease-in-out);
+}
+
+/* The small standalone dialog ("price this model"): content-sized, capped. */
+.panelForm {
+  position: relative;
+  width: 680px;
   max-width: calc(100vw - 48px);
   max-height: calc(100vh - 48px);
   display: flex;
@@ -28,6 +47,89 @@
   background: var(--dsw-alias-bg-layer-2);
   box-shadow: 0 16px 48px rgb(0 0 0 / 24%);
   animation: dialog-in 150ms var(--ds-ease-in-out);
+}
+
+.nav {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  width: 176px;
+  padding: 18px 10px 0 14px;
+  box-sizing: border-box;
+  border-right: 0.5px solid var(--dsw-alias-border-l3, var(--dsw-alias-border-l1));
+}
+
+.navTitle {
+  padding: 0 8px;
+  font-size: 15px;
+  line-height: 22px;
+  font-weight: 600;
+  color: var(--dsw-alias-label-primary);
+}
+
+.navList {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.navCell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  color: var(--dsw-alias-label-primary);
+  text-align: left;
+}
+
+.navCell:hover {
+  background: var(--dsw-alias-state-hover, rgb(127 127 127 / 12%));
+}
+
+.navCell[data-active] {
+  background: var(--dsw-alias-state-hover, rgb(127 127 127 / 12%));
+  font-weight: 500;
+}
+
+.navIcon {
+  flex: none;
+  color: var(--dsw-alias-label-secondary, var(--dsw-alias-label-primary));
+}
+
+.navLabel {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.content {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.contentHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-bottom: 0.5px solid var(--dsw-alias-border-l3, var(--dsw-alias-border-l1));
+}
+
+.options {
+  flex: 1;
+  min-height: 0;
+  padding: 16px 18px 18px;
+  overflow-y: auto;
 }
 
 @keyframes dialog-in {
@@ -137,6 +239,23 @@
   outline-offset: 1px;
 }
 
+.text {
+  flex: none;
+  min-width: 0;
+  padding: 5px 8px;
+  border-radius: 8px;
+  border: 0.5px solid var(--dsw-alias-border-l1);
+  font: inherit;
+  font-size: 13px;
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-bg-layer-1);
+}
+
+.text:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary);
+  outline-offset: 1px;
+}
+
 .note {
   margin: 14px 0 0;
   font-size: 12px;
@@ -145,8 +264,40 @@
   opacity: 0.75;
 }
 
+/* The lead paragraph at the top of a dialog body — no extra top gap. */
+.note[data-lead] {
+  margin-top: 0;
+}
+
 .error {
-  margin: 14px 0 0;
+  margin: 0;
   font-size: 12px;
-  color: var(--dsw-alias-state-error, #d3453d);
+  color: var(--dsw-alias-state-error-primary, #d3453d);
+}
+
+/* Where the error sits as a loose block (settings rows, dialog body) it
+   still needs the gap the editor's action row provides inline. */
+.options > .error {
+  margin-top: 14px;
+}
+
+.body > .error {
+  margin-top: 10px;
+}
+
+/* Shared ghost button (the price editor's Cancel/preset and the rule list's
+   Keep use it; the primary companion lives in pricing.module.css). */
+.btnGhost {
+  padding: 6px 12px;
+  border: 0;
+  border-radius: 8px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  color: var(--dsw-alias-label-secondary, var(--dsw-alias-label-primary));
+  background: transparent;
+}
+
+.btnGhost:hover {
+  background: var(--dsw-alias-state-hover, rgb(127 127 127 / 12%));
 }
