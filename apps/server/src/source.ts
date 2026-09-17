@@ -17,16 +17,14 @@
  */
 
 import { EventEmitter } from 'node:events'
-import type {
-  HarnessKind, SessionChildSummary, SessionDetail, SessionFileRef,
-  SessionLiveEvent, SessionSummary,
+import {
+  LIVE_WINDOW_MS,
+  type HarnessKind, type SessionChildSummary, type SessionDetail, type SessionFileRef,
+  type SessionLiveEvent, type SessionSummary,
 } from '@harness-trajectory/core'
 import type { MetaScanner } from './meta.ts'
 import type { SearchIndexer } from './search/indexer.ts'
 import type { SearchFileKey } from './search/store.ts'
-
-/** A session counts as live when its transcript was written to this recently. */
-export const LIVE_WINDOW_MS = 2 * 60_000
 
 /** Chunk size of one `lines` live/replay event. */
 export const CHUNK_LINES = 400
@@ -35,6 +33,22 @@ export type Subscriber = (event: SessionLiveEvent) => void
 
 export function sessionKey(kind: HarnessKind, id: string): string {
   return `${kind} ${id}`
+}
+
+/**
+ * The listing's total order: newest activity first, `kind`/`id` as a stable
+ * tie-break. Cursor pagination in `app.ts` walks this exact order, so both
+ * sides must compare the same way.
+ */
+export function summaryOrderKey(session: Pick<SessionSummary, 'kind' | 'id'>): string {
+  return `${session.kind}/${session.id}`
+}
+
+export function compareSummaries(left: SessionSummary, right: SessionSummary): number {
+  const leftKey = summaryOrderKey(left)
+  const rightKey = summaryOrderKey(right)
+  return right.updatedAt - left.updatedAt
+    || (leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0)
 }
 
 /**
@@ -157,7 +171,7 @@ export class SessionBook<E extends SourceEntry> {
       if (session.main === null) continue
       summaries.push(this.summarize(session))
     }
-    return summaries.sort((left, right) => right.updatedAt - left.updatedAt)
+    return summaries.sort(compareSummaries)
   }
 
   get(kind: HarnessKind, id: string): SessionDetail | undefined {
@@ -313,7 +327,7 @@ export class CompositeSource extends EventEmitter implements SessionSource {
 
   list(): SessionSummary[] {
     return this.sources.flatMap(source => source.list())
-      .sort((left, right) => right.updatedAt - left.updatedAt)
+      .sort(compareSummaries)
   }
 
   get(kind: HarnessKind, id: string): SessionDetail | undefined {

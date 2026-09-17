@@ -15,6 +15,7 @@
     "@harness-trajectory/context": "workspace:*",
     "@harness-trajectory/core": "workspace:*",
     "@harness-trajectory/ui": "workspace:*",
+    "@tanstack/react-virtual": "^3.14.9",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },

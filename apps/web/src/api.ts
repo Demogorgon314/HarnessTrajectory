@@ -3,7 +3,7 @@
 import {
   SEARCH_INDEXING_IDLE, SEARCH_MIN_QUERY_LENGTH,
   type HarnessKind, type SearchIndexing, type SearchResponse, type ServerSettings, type SessionDetail,
-  type SessionLiveEvent, type SessionSummary, type SettingsResponse, type SettingsUpdateResponse,
+  type SessionListPage, type SessionLiveEvent, type SettingsResponse, type SettingsUpdateResponse,
 } from '@harness-trajectory/core'
 
 /** A non-2xx answer, carrying the status so callers can act on it. */
@@ -24,12 +24,44 @@ async function getJson<T>(url: string, signal?: AbortSignal | undefined): Promis
   return await response.json() as T
 }
 
-export function listSessions(options: { kind?: HarnessKind | undefined; query?: string | undefined } = {}): Promise<SessionSummary[]> {
+export interface ListSessionsOptions {
+  /** Narrow to these harnesses; empty/absent means all. */
+  kinds?: ReadonlySet<HarnessKind> | undefined
+  /** Title/cwd/id substring, matched server-side. */
+  query?: string | undefined
+  limit?: number | undefined
+  /** `nextCursor` of the previous page. */
+  cursor?: string | undefined
+  /**
+   * Last seen listing revision — send only while the same filters stand and
+   * nothing displayed can go stale silently. A matching revision answers 304
+   * and this resolves `null`.
+   */
+  rev?: number | undefined
+  signal?: AbortSignal | undefined
+}
+
+/**
+ * One page of the session listing. `null` means the `rev` sent is still
+ * current: nothing — rows, order, counts — moved since it was issued.
+ */
+export async function listSessions(options: ListSessionsOptions = {}): Promise<SessionListPage | null> {
   const params = new URLSearchParams()
-  if (options.kind !== undefined) params.set('kind', options.kind)
+  if (options.kinds !== undefined && options.kinds.size > 0) params.set('kind', [...options.kinds].join(','))
   if (options.query !== undefined && options.query !== '') params.set('q', options.query)
+  if (options.limit !== undefined) params.set('limit', String(options.limit))
+  if (options.cursor !== undefined) params.set('cursor', options.cursor)
+  if (options.rev !== undefined) params.set('rev', String(options.rev))
   const suffix = params.size === 0 ? '' : `?${params.toString()}`
-  return getJson(`/api/sessions${suffix}`)
+  const response = await fetch(`/api/sessions${suffix}`, {
+    headers: { accept: 'application/json' },
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+  })
+  if (response.status === 304) return null
+  if (!response.ok) {
+    throw new HttpError(response.status, `${response.status} ${response.statusText} for /api/sessions${suffix}`)
+  }
+  return await response.json() as SessionListPage
 }
 
 export interface SearchRequest {
