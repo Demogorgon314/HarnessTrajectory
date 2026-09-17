@@ -1,4 +1,5 @@
-import { appendFile, mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, mkdtemp, rm, stat, utimes, writeFile } from 'node:fs/promises'
+import { randomBytes } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -474,21 +475,47 @@ describe('SearchIndexer', () => {
     indexer.stop()
   })
 
-  it('reclaims runtime orphans at the startup sweep even when no file vanished', () => {
+  it.each(['reset', 'forget'] as const)('reclaims runtime %s orphans even when the sweep deletes no files', action => {
     const indexer = new SearchIndexer({ store, flushDelayMs: 60_000 })
     const key = { path: '/r/c/main.jsonl', kind: 'claude' as const, sessionId: 'm', fileId: 'm' }
     store.transaction(() => {
       store.insertDocs(key, [{ line: 0, role: 'human', text: 'orphan me later' }])
       store.setFileState(key, { size: 200, mtimeMs: 1_000, indexedBytes: 200, indexedLines: 1 })
     })
-    // A runtime reset deletes the docs but not the file row: the text is an
-    // orphan with no vanished file to trigger a GC.
-    indexer.reset(key.path)
+    // Reset keeps the file row; forget removes it before the sweep. Neither
+    // leaves a vanished file for the sweep to delete and trigger a GC.
+    indexer[action](key.path)
     indexer.flush()
     expect(store.textCount()).toBe(1)
-    indexer.finishBackfill([key.path])
+    indexer.finishBackfill(action === 'reset' ? [key.path] : [])
     expect(store.textCount()).toBe(0)
     indexer.stop()
+  })
+
+  it('returns orphaned text pages to disk after a reset without a vanished file', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'harness-search-gc-'))
+    const path = join(dir, 'search.sqlite')
+    const diskStore = new SearchStore({ path })
+    const indexer = new SearchIndexer({ store: diskStore })
+    const key = { path: '/r/c/main.jsonl', kind: 'claude' as const, sessionId: 'm', fileId: 'm' }
+    try {
+      diskStore.transaction(() => {
+        diskStore.insertDocs(key, Array.from({ length: 64 }, (_, line) => ({
+          line, role: 'human' as const, text: randomBytes(4_096).toString('hex'),
+        })))
+      })
+      diskStore.checkpoint()
+      const before = (await stat(path)).size
+      indexer.reset(key.path)
+      indexer.finishBackfill([key.path])
+      expect(diskStore.fileCount()).toBe(1)
+      expect(diskStore.textCount()).toBe(0)
+      expect((await stat(path)).size).toBeLessThan(before / 2)
+    } finally {
+      indexer.stop()
+      diskStore.close()
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 
   it('re-homes documents queued before a child was bound to its parent', () => {

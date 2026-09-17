@@ -391,17 +391,22 @@ export class SearchStore {
    * rows. An anti-join over the whole corpus (~0.5 s per 400k texts on the
    * reference corpus), so it runs only where a purge already accepts a
    * multi-second cost: the startup sweep and retention changes, right before
-   * {@link compact} hands the freed pages back to the OS.
+   * {@link compact} hands the freed pages back to the OS. Returns the number
+   * of texts reclaimed so callers can compact even without deleting files.
    */
-  gcTexts(): void {
-    this.db.prepare(`
-      delete from docs_fts where rowid in (
-        select id from texts where not exists (select 1 from docs where docs.text = texts.id)
-      )
-    `).run()
-    this.db.prepare(`
-      delete from texts where not exists (select 1 from docs where docs.text = texts.id)
-    `).run()
+  gcTexts(): number {
+    // Keep both indexes consistent if cleanup fails between the two deletes.
+    return this.transaction(() => {
+      this.db.prepare(`
+        delete from docs_fts where rowid in (
+          select id from texts where not exists (select 1 from docs where docs.text = texts.id)
+        )
+      `).run()
+      const result = this.db.prepare(`
+        delete from texts where not exists (select 1 from docs where docs.text = texts.id)
+      `).run()
+      return Number(result.changes)
+    })
   }
 
   /**

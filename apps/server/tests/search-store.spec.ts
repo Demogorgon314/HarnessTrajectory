@@ -419,4 +419,26 @@ describe('text dedup', () => {
     expect(response.groups[0]).toMatchObject({ sessionId: 'main-1', hitCount: n })
     expect(response.groups[0]?.hits.map(hit => hit.line)).toEqual([0, 1, 2, 3, 4])
   })
+
+  it('pages shared texts within the selected harness and preserves ranking and totals', () => {
+    const store = open()
+    const shared = 'shared needle needle'
+    add(store, key(), Array.from({ length: 1_000 }, (_, line) => ({
+      line, role: 'assistant' as const, text: shared,
+    })))
+    const codex = key({ path: '/r/codex/shared.jsonl', kind: 'codex', sessionId: 'thread-1', fileId: 'thread-1' })
+    add(store, codex, [
+      { line: 0, role: 'human', text: 'one needle' },
+      { line: 1, role: 'assistant', text: shared },
+      { line: 2, role: 'assistant', text: shared },
+    ])
+    const limited = search(store, { q: 'needle', kind: 'codex', limit: 1 })
+    expect(limited).toMatchObject({ totalHits: 1, truncated: true })
+    expect(limited.groups).toMatchObject([{
+      kind: 'codex', hitCount: 3, hits: [{ line: 1, score: 2 }],
+    }])
+    const exact = search(store, { q: 'needle', kind: 'codex', limit: 3 })
+    expect(exact).toMatchObject({ totalHits: 3, truncated: false })
+    expect(exact.groups[0]?.hits.map(hit => hit.line)).toEqual([1, 2, 0])
+  })
 })

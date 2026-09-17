@@ -234,10 +234,14 @@ const CANDIDATE_SQL_BY_KIND = `
  * remainder count. (`StatementSync.iterate` would avoid the chunking, but it
  * only exists on Node 23+ and the floor here is 22.13.)
  */
-const OCCURRENCE_SQL = `
-  select id, file, line, role, time_ms from docs
-  where text = ? and id > ? order by id limit 256
-`
+function occurrenceSql(byKind: boolean): string {
+  return `
+    select id, file, line, role, time_ms from docs
+    where text = ? and id > ?
+      ${byKind ? 'and file in (select id from files where kind = ?)' : ''}
+    order by id limit 256
+  `
+}
 
 /**
  * Occurrence counts per file, for everything past the displayed page: group
@@ -313,7 +317,7 @@ export function search(store: SearchStore, options: SearchOptions): SearchRespon
   const ranked = [...verified.entries()].sort((a, b) => b[1].occurrences - a[1].occurrences)
 
   const files = store.filesMap()
-  const occurrence = store.db.prepare(OCCURRENCE_SQL)
+  const occurrence = store.db.prepare(occurrenceSql(options.kind !== undefined))
   const countByFile = store.db.prepare(COUNT_BY_FILE_SQL)
   const page: { hit: SearchHit; textId: number }[] = []
   const totals = new Map<string, number>()
@@ -340,7 +344,11 @@ export function search(store: SearchStore, options: SearchOptions): SearchRespon
     }
     let afterId = -1
     for (;;) {
-      const chunk = occurrence.all(textId, afterId)
+      // Filter before paging: a shared text may have thousands of occurrences
+      // in other harnesses before the first occurrence we can display.
+      const chunk = options.kind === undefined
+        ? occurrence.all(textId, afterId)
+        : occurrence.all(textId, afterId, options.kind)
       for (const row of chunk) {
         afterId = asInt(row['id'])
         const file = files.get(asInt(row['file']))

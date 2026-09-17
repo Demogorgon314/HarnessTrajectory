@@ -292,8 +292,8 @@ export class SearchIndexer {
       // Runtime resets and forgets orphan texts without a file ever vanishing,
       // so this runs whether or not the sweep deleted anything: the startup
       // sweep is the one guaranteed chance to reclaim what piled up.
-      this.store.gcTexts()
-      if (gone.length > 0) this.store.compact()
+      const reclaimed = this.store.gcTexts()
+      if (gone.length > 0 || reclaimed > 0) this.store.compact()
     } catch {
       // Stale rows are harmless; the next startup tries again.
     }
