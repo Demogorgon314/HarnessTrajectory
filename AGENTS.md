@@ -87,13 +87,36 @@ Logo credits live in the web registry and README license section.
 - Server writes belong under the cache directory defined in `apps/server/src/cache.ts`:
   `search.sqlite`, `listing.sqlite`, and `settings.json`. Never write to harness roots.
 - Search uses `node:sqlite` FTS5 with trigram, `detail=none`, and contentless storage.
-  `store.ts` keeps deflate-compressed text in `docs.text` and a `docs.file → files.id`
-  foreign key; `extract.ts` caps tool outputs at 4 KB; `indexer.ts` batches writes.
-  `query.ts` ANDs trigrams, then inflates, verifies, snippets, and ranks in JS.
-  FTS phrase queries, `snippet()`, and `bm25` are not used.
+  `store.ts` deduplicates document text: `texts` holds each unique text once
+  (8-byte SHA-1-prefix key, deflate-compressed) and `docs` stores only occurrences
+  (`file, line, role, time_ms → texts.id`); the FTS rowid is the text id, so the
+  inverted index dedups too. `extract.ts` indexes tool *calls* (command, paths,
+  patterns, write/edit contents) but never tool *outputs* — stdout is ~73% of
+  the unique text on the reference corpus and duplicates what the trajectory
+  view's client-side search already covers. `indexer.ts` batches writes.
+  `query.ts` ANDs trigrams, excludes orphaned texts (and, for a kind-narrowed
+  search, texts with no occurrence in that harness) with an `EXISTS` before
+  the candidate `LIMIT`, verifies each unique text once in JS, and expands
+  occurrences best-first: the displayed page is filtered by kind in SQL and
+  collected in bounded chunks and, once full, per-session totals keep counting per file — expansion stays
+  bounded no matter how often a text repeats. Snippets are built only for
+  displayed hits. FTS phrase queries, `snippet()`, and `bm25` are not used.
+- Deletes remove only `docs` rows; texts orphaned when their last occurrence goes
+  away still match but expand to zero hits (and the candidate `EXISTS` keeps
+  them out of the budget). `store.gcTexts()` reclaims them (with their FTS
+  rows) at every `finishBackfill` — runtime resets and forgets orphan texts
+  without a file vanishing — and in `applyMaxAgeDays`, never inline in a flush.
+  Startup compacts after reclaiming texts even when no file row was deleted.
 - The search database is a cache: bump `SEARCH_SCHEMA_VERSION` instead of migrating.
-- `contentSearch` defaults off; `HARNESS_TRAJECTORY_SEARCH=1` forces it on. The setting
-  takes effect at startup; disabling it preserves any existing database on disk.
+- `contentSearch` defaults off; `HARNESS_TRAJECTORY_SEARCH=1` forces it on for one launch.
+  The toggle takes effect without a restart: enabling creates the service and runs a
+  background backfill (`SessionIndex.enableSearch` re-reads historical lines from disk,
+  `DevinSource.enableSearch` re-derives them from the store; both resume from the
+  `beginFile` watermarks), disabling detaches the indexer and preserves the database
+  on disk. Toggles serialize through one promise chain in `main.ts`.
+  `SessionIndex.enableSearch` anchors every file's watermark synchronously before
+  the indexer goes live; an append mid-pass then flows only through the consume
+  path and is never queued twice.
   `searchMaxAgeDays` defaults to 90; 0 means all. `indexer.shouldIndex` enforces retention
   at registration; the startup sweep and `applyMaxAgeDays` purge expired entries.
 - A search hit uses `(kind, sessionId, fileId, line)`. For JSONL, `line` is the zero-based

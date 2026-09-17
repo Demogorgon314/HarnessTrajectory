@@ -1173,7 +1173,9 @@ describe('SessionIndex Codex lineage and compression', () => {
       await index.start()
       search.flush()
       expect(index.get('codex', THREAD)?.children[0]).toMatchObject({ file: { agent: { description: 'own child prompt' } } })
-      const rows = store.db.prepare('select line, text from docs').all() as { line: number; text: Uint8Array }[]
+      const rows = store.db.prepare(
+        'select docs.line, texts.text from docs join texts on texts.id = docs.text',
+      ).all() as { line: number; text: Uint8Array }[]
       expect(rows.map(row => [row.line, unpackText(row.text)])).toEqual([[1, 'own child prompt']])
     } finally {
       index?.stop()
@@ -1220,8 +1222,8 @@ describe('SessionIndex Codex lineage and compression', () => {
     ;({ store, indexer } = await boot())
     expect(texts(await replayLines(index, THREAD))).toEqual(['inherited needle', 'head needle'])
     const rows = store.db.prepare(
-      `select docs.line as line, docs.text as text
-       from docs join files on docs.file = files.id
+      `select docs.line as line, texts.text as text
+       from docs join files on docs.file = files.id join texts on texts.id = docs.text
        where files.path = ? order by docs.line`,
     ).all(headPath) as { line: number, text: Uint8Array }[]
     // Lines count the logical stream — the two `session_meta` records take

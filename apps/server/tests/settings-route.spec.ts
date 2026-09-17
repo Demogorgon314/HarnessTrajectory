@@ -18,10 +18,10 @@ describe('/api/settings', () => {
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'harness-trajectory-settings-route-'))
     service = createSearchService({ path: ':memory:', flushDelayMs: 5 })
-    controller = new SettingsController(join(dir, 'settings.json'), service.indexer)
+    controller = new SettingsController(join(dir, 'settings.json'), () => service.indexer)
     index = new SessionIndex({ roots: [], watch: false })
     await index.start()
-    app = createApp({ index, search: service, settings: controller })
+    app = createApp({ index, search: () => service, settings: controller })
   })
 
   afterEach(async () => {
@@ -85,7 +85,7 @@ describe('/api/settings', () => {
   it('still answers when the server runs without search', async () => {
     const bare = createApp({
       index,
-      settings: new SettingsController(join(dir, 'other.json'), undefined),
+      settings: new SettingsController(join(dir, 'other.json'), () => undefined),
     })
     const body = await (await bare.request('/api/settings')).json() as SettingsResponse
     expect(body).toEqual({ ...SETTINGS_DEFAULTS, searchEnabled: false })

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { GROK_SIDECAR_METHOD } from '@harness-trajectory/core'
-import { MAX_DOC_CHARS, MAX_TOOL_OUTPUT_CHARS, extractSearchDocs, type SearchDocDraft } from '../src/search/extract.ts'
+import { MAX_DOC_CHARS, extractSearchDocs, type SearchDocDraft } from '../src/search/extract.ts'
 
 const T0 = Date.parse('2026-09-14T10:00:00.000Z')
 const iso = (offsetMs: number) => new Date(T0 + offsetMs).toISOString()
@@ -42,30 +42,25 @@ describe('extractSearchDocs — Claude Code', () => {
     ])
   })
 
-  it('indexes a tool result as a tool turn and drops the reminders inside it', () => {
-    expect(pairs(docs('claude', {
+  it('skips tool results entirely: outputs are not indexed', () => {
+    expect(docs('claude', {
       type: 'user', uuid: 'u-2', sessionId: 's1', timestamp: iso(2000),
       sourceToolAssistantUUID: 'a-1',
       message: {
         role: 'user',
         content: [{
           tool_use_id: 'toolu_1', type: 'tool_result', is_error: false,
-          content: [
-            { type: 'text', text: 'Test Files  2 passed (2)' },
-            // 2.1.x puts reminders inside the result, on hundreds of results.
-            { type: 'text', text: '<system-reminder>You used a single tool call this turn.</system-reminder>' },
-            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } },
-          ],
+          content: [{ type: 'text', text: 'Test Files  2 passed (2)' }],
         }],
       },
       toolUseResult: { stdout: 'Test Files  2 passed (2)', stderr: '', interrupted: false },
-    }))).toEqual(['tool: Test Files  2 passed (2)'])
+    })).toEqual([])
 
-    // The string form of a tool_result is just as common.
-    expect(pairs(docs('claude', {
+    // The string form of a tool_result is just as common — and just as skipped.
+    expect(docs('claude', {
       type: 'user', uuid: 'u-3', sessionId: 's1', timestamp: iso(2100),
       message: { role: 'user', content: [{ tool_use_id: 'toolu_2', type: 'tool_result', content: 'total 0\ndrwxr-xr-x' }] },
-    }))).toEqual(['tool: total 0\ndrwxr-xr-x'])
+    })).toEqual([])
   })
 
   it('skips injected, meta, compaction, and non-conversation records', () => {
@@ -147,7 +142,7 @@ describe('extractSearchDocs — Codex', () => {
     expect(docs('codex', item({ type: 'reasoning', summary: [], encrypted_content: 'gAAAAAB'.repeat(200) }))).toEqual([])
   })
 
-  it('indexes both tool-call spellings and both output spellings', () => {
+  it('indexes both tool-call spellings and skips both output spellings', () => {
     // `custom_tool_call.input` is raw JavaScript, not JSON.
     expect(pairs(docs('codex', item({
       type: 'custom_tool_call', id: 'ctc-1', status: 'completed', call_id: 'call_1', name: 'exec',
@@ -160,18 +155,18 @@ describe('extractSearchDocs — Codex', () => {
       arguments: JSON.stringify({ cmd: 'rg --files packages/core', cell_id: '53' }),
     })))).toEqual(['tool: js\ncmd: rg --files packages/core'])
 
-    expect(pairs(docs('codex', item({
+    expect(docs('codex', item({
       type: 'custom_tool_call_output', id: 'ctco-1', call_id: 'call_1',
       output: [
         { type: 'input_text', text: 'Script completed\nWall time 0.1 seconds' },
         { type: 'input_text', text: '/Users/me/project' },
       ],
-    })))).toEqual(['tool: Script completed\nWall time 0.1 seconds\n/Users/me/project'])
+    }))).toEqual([])
 
-    expect(pairs(docs('codex', item({
+    expect(docs('codex', item({
       type: 'function_call_output', call_id: 'call_2',
       output: JSON.stringify({ output: 'exit 0', metadata: { exit_code: 0 } }),
-    })))).toEqual(['tool: exit 0'])
+    }))).toEqual([])
   })
 
   it('indexes the durable web/image/tool-search calls as tools', () => {
@@ -189,11 +184,11 @@ describe('extractSearchDocs — Codex', () => {
       arguments: { query: 'file tools' },
     })))).toEqual(['tool: tool_search\nquery: file tools'])
 
-    // The discovered tool names are the searchable payload of the output.
+    // Discovery results follow the same exclusion policy as other tool outputs.
     expect(pairs(docs('codex', item({
       type: 'tool_search_output', call_id: 'call-ts', status: 'completed', execution: 'client',
       tools: [{ type: 'function', name: 'read_file' }, { type: 'function', name: 'write_file' }],
-    })))).toEqual(['tool: read_file\nwrite_file'])
+    })))).toEqual([])
   })
 
   it('indexes agent traffic, retained answers, and the thread goal as other', () => {
@@ -268,7 +263,7 @@ describe('extractSearchDocs — Kimi Code', () => {
     }
   })
 
-  it('indexes loop events: text, thinking, a tool call, and its result', () => {
+  it('indexes loop events: text, thinking, and a tool call — but not its result', () => {
     const loop = (event: Record<string, unknown>, offset: number) =>
       wire('context.append_loop_event', offset, { event })
 
@@ -286,10 +281,10 @@ describe('extractSearchDocs — Kimi Code', () => {
       args: { pattern: 'createMetaScanner', path: 'apps/server/src', output_mode: 'content' },
     }, 32)))).toEqual(['tool: Grep\npattern: createMetaScanner\npath: apps/server/src\noutput_mode: content'])
 
-    expect(pairs(docs('kimi', loop({
+    expect(docs('kimi', loop({
       type: 'tool.result', parentUuid: 't-1', toolCallId: 'tool_k1',
       result: { output: 'apps/server/src/meta.ts:45', note: 'truncated to 1 match' },
-    }, 33)))).toEqual(['tool: apps/server/src/meta.ts:45\ntruncated to 1 match'])
+    }, 33))).toEqual([])
   })
 
   it('indexes a delegated subagent prompt as a human document, stripped of its git prelude', () => {
@@ -309,8 +304,8 @@ describe('extractSearchDocs — Kimi Code', () => {
     }))).toEqual([])
   })
 
-  it('indexes the text of a media tool result and drops the image part', () => {
-    expect(pairs(docs('kimi', wire('context.append_loop_event', 30, {
+  it('skips a media tool result along with every other output', () => {
+    expect(docs('kimi', wire('context.append_loop_event', 30, {
       event: {
         type: 'tool.result', parentUuid: 't-1', toolCallId: 'tool_k1',
         result: {
@@ -320,7 +315,7 @@ describe('extractSearchDocs — Kimi Code', () => {
           ],
         },
       },
-    })))).toEqual(['tool: <image path="/tmp/shot.png">'])
+    }))).toEqual([])
   })
 
   it('skips bookkeeping records and the prompt mirror that would double-count', () => {
@@ -367,7 +362,7 @@ describe('extractSearchDocs — Grok Build', () => {
     }, 12))).toEqual([])
   })
 
-  it('indexes assistant chunks, thoughts, a tool call, and a completed result', () => {
+  it('indexes assistant chunks, thoughts, and a tool call — but not the result', () => {
     expect(pairs(docs('grok', envelope({
       sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: "I'll check the config first." },
     }, 20, { promptId: 'p-1', totalTokens: 2601 })))).toEqual(["assistant: I'll check the config first."])
@@ -383,18 +378,16 @@ describe('extractSearchDocs — Grok Build', () => {
       _meta: { 'x.ai/tool': { version: 1, name: 'read_file', kind: 'read', label: 'Read', read_only: true } },
     }, 22)))).toEqual(['tool: read_file\ntarget_file: /Users/me/.grok/config.toml'])
 
-    expect(pairs(docs('grok', envelope({
+    // A completed `tool_call_update` is stdout: not indexed, whatever its shape.
+    expect(docs('grok', envelope({
       sessionUpdate: 'tool_call_update', toolCallId: 'call-1', status: 'completed',
       content: [{ type: 'content', content: { type: 'text', text: 'GROK_HOME=unset' } }],
-      // `rawOutput.output` can be an array of raw byte integers: never indexed.
       rawOutput: { type: 'Bash', output: [71, 82, 79, 75], exit_code: 0 },
-    }, 23)))).toEqual(['tool: GROK_HOME=unset'])
-
-    // A diff block keeps the path and the new text.
-    expect(pairs(docs('grok', envelope({
+    }, 23))).toEqual([])
+    expect(docs('grok', envelope({
       sessionUpdate: 'tool_call_update', toolCallId: 'call-2', status: 'completed',
       content: [{ type: 'diff', path: '/work/README.md', oldText: 'old', newText: 'new line' }],
-    }, 24)))).toEqual(['tool: /work/README.md\nnew line'])
+    }, 24))).toEqual([])
   })
 
   it('skips progress updates, telemetry, and the server’s own sidecar line', () => {
@@ -424,7 +417,7 @@ describe('extractSearchDocs — Devin CLI', () => {
   const devinMsg = (msg: Record<string, unknown>): unknown =>
     ({ t: 'devin.msg', node: 1, parent: null, time: T0, msg })
 
-  it('indexes human prompts, assistant text/thinking/calls, and tool results', () => {
+  it('indexes human prompts, assistant text/thinking/calls, but not tool results', () => {
     expect(pairs(docs('devin', devinMsg({
       role: 'user', content: [{ type: 'text', text: 'Update the roadmap' }],
       metadata: { is_user_input: true },
@@ -441,10 +434,10 @@ describe('extractSearchDocs — Devin CLI', () => {
       'tool: read_file\npath: a.ts',
     ])
 
-    expect(pairs(docs('devin', devinMsg({
+    expect(docs('devin', devinMsg({
       role: 'tool', tool_call_id: 'c1',
       content: [{ type: 'text', text: 'contents of a.ts' }],
-    })))).toEqual(['tool: contents of a.ts'])
+    }))).toEqual([])
   })
 
   it('counts only is_user_input as human — injected user text indexes nowhere', () => {
@@ -464,14 +457,6 @@ describe('extractSearchDocs — Devin CLI', () => {
       expect(extractSearchDocs('devin', line)).toEqual([])
     }
   })
-
-  it('caps a devin tool output at 4 KB', () => {
-    const long = 'chunk of output text. '.repeat(4_000)
-    const [doc] = docs('devin', devinMsg({
-      role: 'tool', tool_call_id: 'c1', content: [{ type: 'text', text: long }],
-    }))
-    expect(doc?.text).toHaveLength(MAX_TOOL_OUTPUT_CHARS)
-  })
 })
 
 describe('extractSearchDocs — shared rules', () => {
@@ -485,18 +470,10 @@ describe('extractSearchDocs — shared rules', () => {
     expect(doc?.text).toBe(long.slice(0, MAX_DOC_CHARS))
   })
 
-  it('caps a tool output at 4 KB but a tool call at 16 KB', () => {
+  it('caps a tool call at 16 KB', () => {
     // Spaced prose: a solid base64-alphabet run would be scrubbed as a payload.
     const long = 'chunk of output text. '.repeat(4_000)
-    // The output side of a result gets the tighter cap.
-    const [output] = docs('claude', {
-      type: 'user', timestamp: iso(0),
-      message: { role: 'user', content: [{ tool_use_id: 't1', type: 'tool_result', content: long }] },
-    })
-    expect(output?.text).toHaveLength(MAX_TOOL_OUTPUT_CHARS)
-    expect(output?.text).toBe(long.slice(0, MAX_TOOL_OUTPUT_CHARS))
-    // The call side keeps the prose cap: a Write's whole `content` argument is
-    // the call, not an output.
+    // A Write's whole `content` argument is the call: it keeps the prose cap.
     const [call] = docs('claude', {
       type: 'assistant', timestamp: iso(1),
       message: {
@@ -507,40 +484,34 @@ describe('extractSearchDocs — shared rules', () => {
     expect(call?.text).toHaveLength(MAX_DOC_CHARS)
   })
 
-  it('caps tool outputs of the other harnesses too', () => {
-    const long = 'chunk of output text. '.repeat(4_000)
-    const [codex] = docs('codex', {
-      timestamp: iso(0), type: 'response_item',
-      payload: { type: 'function_call_output', call_id: 'c1', output: long },
-    })
-    expect(codex?.text).toHaveLength(MAX_TOOL_OUTPUT_CHARS)
-    const [kimi] = docs('kimi', {
-      type: 'context.append_loop_event', time: T0, agentId: 'a1',
-      event: { type: 'tool.result', toolCallId: 'c1', result: { output: long } },
-    })
-    expect(kimi?.text).toHaveLength(MAX_TOOL_OUTPUT_CHARS)
-  })
-
   it('strips embedded base64 payloads and keeps the surrounding prose', () => {
     const base64 = `${'QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVph'.repeat(20)}==`
-    expect(docs('claude', {
-      type: 'user', timestamp: iso(0),
-      message: { role: 'user', content: [{ tool_use_id: 't1', type: 'tool_result', content: base64 }] },
-    })).toEqual([])
-    const [mixed] = docs('claude', {
-      type: 'user', timestamp: iso(0),
+    // A Write call whose content is only a payload keeps no trace of it.
+    const [payloadOnly] = docs('claude', {
+      type: 'assistant', timestamp: iso(0),
       message: {
-        role: 'user',
-        content: [{ tool_use_id: 't1', type: 'tool_result', content: `tests passed\n${base64}\nexit 0` }],
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'toolu_1', name: 'Write', input: { file_path: '/f.png.ts', content: base64 } }],
+      },
+    })
+    expect(payloadOnly?.text).not.toContain('QUJDREVGR0hJ')
+    const [mixed] = docs('claude', {
+      type: 'assistant', timestamp: iso(1),
+      message: {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'toolu_2', name: 'Write', input: { file_path: '/f.ts', content: `tests passed\n${base64}\nexit 0` } }],
       },
     })
     expect(mixed?.text).toContain('tests passed')
     expect(mixed?.text).toContain('exit 0')
     expect(mixed?.text).not.toContain('QUJDREVGR0hJ')
-    expect(docs('kimi', {
-      type: 'context.append_loop_event', time: T0,
-      event: { type: 'tool.result', toolCallId: 'k1', result: { output: `data:image/png;base64,${base64}` } },
-    })).toEqual([])
+    // A data URL in prose is eaten by the prefix rule and the payload run.
+    const [prose] = docs('claude', {
+      type: 'user', timestamp: iso(2),
+      message: { role: 'user', content: `look at this image\ndata:image/png;base64,${base64}\nwhat is it?` },
+    })
+    expect(prose?.text).toContain('what is it?')
+    expect(prose?.text).not.toContain('QUJDREVGR0hJ')
   })
 
   it('never lets a control character reach the index, so the snippet markers stay unambiguous', () => {

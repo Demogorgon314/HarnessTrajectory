@@ -107,12 +107,13 @@ export class SearchIndexer {
       this.store.transaction(() => {
         for (const path of stale) this.store.deleteFile(path)
       })
+      // Reclaim the texts those files were the last reference of, then hand
+      // the freed pages back to the OS so narrowing the window shows on disk.
+      this.store.gcTexts()
     } catch {
       // A locked database keeps the stale rows; the next startup tries again.
       return 0
     }
-    // Deleting hundreds of thousands of rows leaves their pages inside the
-    // file; hand them back to the OS so narrowing the window shows on disk.
     this.store.compact()
     return stale.length
   }
@@ -282,16 +283,19 @@ export class SearchIndexer {
     this.flush()
     const live = new Set(livePaths)
     const gone = this.store.paths().filter(path => !live.has(path))
-    if (gone.length > 0) {
-      try {
+    try {
+      if (gone.length > 0) {
         this.store.transaction(() => {
           for (const path of gone) this.store.deleteFile(path)
         })
-        // A retention purge can drop most of the database; return the pages.
-        this.store.compact()
-      } catch {
-        // Stale rows are harmless; the next startup tries again.
       }
+      // Runtime resets and forgets orphan texts without a file ever vanishing,
+      // so this runs whether or not the sweep deleted anything: the startup
+      // sweep is the one guaranteed chance to reclaim what piled up.
+      const reclaimed = this.store.gcTexts()
+      if (gone.length > 0 || reclaimed > 0) this.store.compact()
+    } catch {
+      // Stale rows are harmless; the next startup tries again.
     }
     // The backfill is the one burst of heavy writing; fold its WAL back in now
     // so the cache directory settles at the database's real size.

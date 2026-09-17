@@ -2,17 +2,38 @@
  * Reading side of the search index: a trigram cover of the query, verified
  * and ranked in JavaScript.
  *
- * The FTS table is `detail=none` (see store.ts): it answers "which documents
- * contain this trigram" but stores no positions, so FTS5 phrase queries,
- * `snippet()` and `bm25` are unavailable on it. The read side therefore slices
- * the user's string into the same trigram set the tokenizer would extract and
- * ANDs the terms — every true substring match is covered, plus some documents
- * where the trigrams merely coexist — then verifies the substring against the
- * document text (inflated from `docs.text`, the only copy the index keeps),
- * counts occurrences for ranking, and cuts the snippet window itself.
- * Verification makes the result set identical to a phrase query; only
- * very common queries change shape, when the candidate cap cuts in and
- * `truncated` plus lower-bound group counts report it.
+ * The index deduplicates document text (see store.ts): FTS candidates are
+ * *unique texts*, each verified once, then expanded to every occurrence —
+ * the (kind, session, file, line) quadruples a hit addresses — through
+ * `docs_by_text` and the in-memory `files` snapshot. On the reference corpus
+ * a duplicate document appears in ~1.8 sessions on average, so one
+ * verification covers what used to take ~1.8 candidate slots.
+ *
+ * The FTS table is `detail=none`: it answers "which texts contain this
+ * trigram" but stores no positions, so FTS5 phrase queries, `snippet()` and
+ * `bm25` are unavailable on it. The read side therefore slices the user's
+ * string into the same trigram set the tokenizer would extract and ANDs the
+ * terms — every true substring match is covered, plus some texts where the
+ * trigrams merely coexist — then verifies the substring against the text
+ * (inflated from `texts.text`, the only copy the index keeps), counts
+ * occurrences for ranking, and cuts the snippet window itself. Verification
+ * makes the result set identical to a phrase query; only very common queries
+ * change shape, when the candidate cap cuts in and `truncated` plus
+ * lower-bound group counts report it.
+ *
+ * Query cost is linear in verified candidates (inflate + case fold +
+ * occurrence count, ~25 µs each), and the candidate cap is the knob that
+ * bounds it: 4096 texts ≈ 110 ms worst case on the reference corpus. The
+ * fold and the snippet are the two heaviest per-text steps, so the fold is
+ * computed once per text and reused for counting and snippets, and snippets
+ * are built only for the hits a page actually displays — never for the
+ * thousands of candidates that verify but do not rank in.
+ *
+ * Expansion is bounded too: texts are processed best-first, the displayed
+ * page is collected while scanning occurrences in chunks, and once the page
+ * is full the per-session totals keep counting per file instead of per row —
+ * a text pasted into 200k records costs one SQL aggregate, not 200k JS
+ * objects and an event-loop stall.
  *
  * Trigram cannot index fewer than three characters, so a shorter query returns
  * no groups and reports `minLength: 3`; the UI asks for one more character
@@ -37,14 +58,14 @@ const SNIPPET_CHARS = 64
 const ELLIPSIS = '…'
 
 /**
- * Most candidates one query reads back and verifies. With `detail=none` the
- * FTS match is a superset of the real hits, so verification reads the stored
- * text; this bounds that read at roughly 8192 × the average document size
- * (~12 MB on the reference corpus). A query that hits the cap reports
- * `truncated` and its group counts are lower bounds — the same honesty the UI
- * already shows when the page limit cuts a result set.
+ * Most unique texts one query reads back and verifies. With `detail=none`
+ * the FTS match is a superset of the real hits, so verification reads the
+ * stored text; this bounds that read at roughly 4096 × the average text size
+ * (~12 MB on the reference corpus, ~110 ms worst case). A query that hits
+ * the cap reports `truncated` and its group counts are lower bounds — the
+ * same honesty the UI already shows when the page limit cuts a result set.
  */
-export const SEARCH_CANDIDATE_LIMIT = 8_192
+export const SEARCH_CANDIDATE_LIMIT = 4_096
 
 /**
  * The most trigram terms sent to FTS5. A pasted stack trace would otherwise
@@ -63,6 +84,12 @@ export interface SearchSessionFacts {
 
 export interface SearchOptions {
   q: string
+  /**
+   * Restrict hits to one harness. Pushed into the candidate query as an
+   * `EXISTS`, so the candidate cap only counts texts that can produce a hit
+   * in this harness (a text may still span kinds: expansion counts only the
+   * matching occurrences).
+   */
   kind?: HarnessKind
   /** Maximum hits across all sessions; clamped to `SEARCH_MAX_LIMIT`. */
   limit?: number
@@ -132,13 +159,18 @@ function countOccurrences(folded: string, needle: string): number {
 
 /**
  * Cut a window around the first occurrence and mark every occurrence inside
- * it. `needle` may be folded or not; both sides are folded here, so ranges are
- * always valid UTF-16 indices into the returned snippet. A needle that is not
- * in the text — impossible after verification — yields the document head.
+ * it. Both sides are folded here, so ranges are always valid UTF-16 indices
+ * into the returned snippet. A needle that is not in the text — impossible
+ * after verification — yields the document head.
  */
 export function buildSnippet(text: string, needle: string): { snippet: string; matches: SearchMatchRange[] } {
-  const folded = foldCase(text)
-  const n = foldCase(needle)
+  return buildSnippetFromFolded(text, foldCase(text), foldCase(needle))
+}
+
+/** {@link buildSnippet} with the folds already done, shared with verification. */
+function buildSnippetFromFolded(
+  text: string, folded: string, n: string,
+): { snippet: string; matches: SearchMatchRange[] } {
   const first = n === '' ? -1 : folded.indexOf(n)
   if (first === -1) {
     const end = Math.min(text.length, SNIPPET_CHARS)
@@ -163,24 +195,67 @@ export function buildSnippet(text: string, needle: string): { snippet: string; m
   }
 }
 
-/** The candidate query: every document whose trigram set covers the query's. */
-function sql(byKind: boolean): string {
+/**
+ * The candidate query: every unique text whose trigram set covers the
+ * query's, in first-indexed order (the FTS rowid is the text id). The
+ * `EXISTS` keeps two kinds of rows from spending the candidate budget:
+ * texts whose last occurrence was deleted (orphans await `gcTexts`, until
+ * then they would match and shadow live hits) and — for a kind-narrowed
+ * search — texts with no occurrence in that harness. Filtering in SQL, not
+ * after `LIMIT`, is what makes the cap count only candidates that can
+ * produce a hit.
+ */
+const CANDIDATE_SQL = `
+  select t.id as text_id, t.text as blob
+  from docs_fts
+  join texts t on t.id = docs_fts.rowid
+  where docs_fts match ?
+    and exists (select 1 from docs d where d.text = docs_fts.rowid)
+  order by docs_fts.rowid
+  limit ?
+`
+
+const CANDIDATE_SQL_BY_KIND = `
+  select t.id as text_id, t.text as blob
+  from docs_fts
+  join texts t on t.id = docs_fts.rowid
+  where docs_fts match ?
+    and exists (
+      select 1 from docs d join files f on f.id = d.file
+      where d.text = docs_fts.rowid and f.kind = ?
+    )
+  order by docs_fts.rowid
+  limit ?
+`
+
+/**
+ * Occurrences of one text, paged so a text with hundreds of thousands of
+ * them never materializes at once. `id` drives both the page cursor and the
+ * remainder count. (`StatementSync.iterate` would avoid the chunking, but it
+ * only exists on Node 23+ and the floor here is 22.13.)
+ */
+function occurrenceSql(byKind: boolean): string {
   return `
-    select
-      f.kind        as kind,
-      f.session_id  as session_id,
-      f.file_id     as file_id,
-      d.line        as line,
-      d.role        as role,
-      d.time_ms     as time_ms,
-      d.text        as blob
-    from docs_fts
-    join docs d on d.id = docs_fts.rowid
-    join files f on f.id = d.file
-    where docs_fts match ?${byKind ? ' and f.kind = ?' : ''}
-    order by docs_fts.rowid
-    limit ?
+    select id, file, line, role, time_ms from docs
+    where text = ? and id > ?
+      ${byKind ? 'and file in (select id from files where kind = ?)' : ''}
+    order by id limit 256
   `
+}
+
+/**
+ * Occurrence counts per file, for everything past the displayed page: group
+ * totals are exact without reading a quarter million rows into JS.
+ */
+const COUNT_BY_FILE_SQL = `
+  select file, count(*) as n from docs where text = ? and id > ? group by file
+`
+
+/** One verified text: the inflate and the fold happen exactly once per text. */
+interface VerifiedText {
+  text: string
+  folded: string
+  occurrences: number
 }
 
 /** Run one search over the index. Never throws: a broken query returns no groups. */
@@ -202,11 +277,10 @@ export function search(store: SearchStore, options: SearchOptions): SearchRespon
 
   let rows: Record<string, unknown>[]
   try {
-    const match = toTrigramQuery(q)
     // One row over the cap tells the response the candidate set was cut short.
     rows = options.kind === undefined
-      ? store.db.prepare(sql(false)).all(match, candidateLimit + 1)
-      : store.db.prepare(sql(true)).all(match, options.kind, candidateLimit + 1)
+      ? store.db.prepare(CANDIDATE_SQL).all(toTrigramQuery(q), candidateLimit + 1)
+      : store.db.prepare(CANDIDATE_SQL_BY_KIND).all(toTrigramQuery(q), options.kind, candidateLimit + 1)
   } catch {
     // A malformed FTS expression or a database being rebuilt underneath us.
     return empty
@@ -215,8 +289,9 @@ export function search(store: SearchStore, options: SearchOptions): SearchRespon
   if (capped) rows.length = candidateLimit
 
   const needle = foldCase(q)
-  const hits: SearchHit[] = []
-  const totals = new Map<string, number>()
+
+  // Verify each candidate text once; keep the folded form for the snippets.
+  const verified = new Map<number, VerifiedText>()
   for (const row of rows) {
     const blob = row['blob']
     let text: string
@@ -226,37 +301,89 @@ export function search(store: SearchStore, options: SearchOptions): SearchRespon
       // A torn row (an interrupted write) is skipped, never fatal.
       continue
     }
-    const occurrences = countOccurrences(foldCase(text), needle)
-    // detail=none also matches documents where the trigrams coexist but the
+    const folded = foldCase(text)
+    const occurrences = countOccurrences(folded, needle)
+    // detail=none also matches texts where the trigrams coexist but the
     // substring does not; those drop out here.
     if (occurrences === 0) continue
-    const kind = asText(row['kind']) as HarnessKind
-    const sessionId = asText(row['session_id'])
-    const groupKey = `${kind} ${sessionId}`
-    totals.set(groupKey, (totals.get(groupKey) ?? 0) + 1)
-    const timeMs = row['time_ms'] === null || row['time_ms'] === undefined ? undefined : asInt(row['time_ms'])
-    const { snippet, matches } = buildSnippet(text, needle)
-    hits.push({
-      kind,
-      sessionId,
-      fileId: asText(row['file_id']),
-      line: asInt(row['line']),
-      role: asRole(row['role']),
-      ...(timeMs === undefined ? {} : { timeMs }),
-      snippet,
-      matches,
-      score: occurrences,
-    })
+    verified.set(asInt(row['text_id']), { text, folded, occurrences })
   }
 
-  // Occurrence count is the ranking bm25 used to provide; ties keep the
-  // deterministic rowid order the candidate scan returned (sort is stable).
-  hits.sort((a, b) => b.score - a.score)
+  // Rank: every hit of a text shares its occurrence count, so ordering the
+  // verified texts by that count (stably — ties keep candidate order, and
+  // occurrences stay in insertion order within a text) yields the exact
+  // sequence a materialize-then-sort pipeline would produce, without
+  // materializing it.
+  const ranked = [...verified.entries()].sort((a, b) => b[1].occurrences - a[1].occurrences)
 
-  const truncated = capped || hits.length > limit
-  const page = hits.slice(0, limit)
+  const files = store.filesMap()
+  const occurrence = store.db.prepare(occurrenceSql(options.kind !== undefined))
+  const countByFile = store.db.prepare(COUNT_BY_FILE_SQL)
+  const page: { hit: SearchHit; textId: number }[] = []
+  const totals = new Map<string, number>()
+  let pageFull = false
+
+  const keep = (file: { kind: HarnessKind }): boolean =>
+    options.kind === undefined || file.kind === options.kind
+  const countHit = (file: { kind: HarnessKind; sessionId: string }, n: number): void => {
+    const groupKey = `${file.kind} ${file.sessionId}`
+    totals.set(groupKey, (totals.get(groupKey) ?? 0) + n)
+  }
+  /** Totals for occurrences past `afterId`, counted per file — never per row. */
+  const countRemainder = (textId: number, afterId: number): void => {
+    for (const row of countByFile.all(textId, afterId)) {
+      const file = files.get(asInt(row['file']))
+      if (file !== undefined && keep(file)) countHit(file, asInt(row['n']))
+    }
+  }
+
+  for (const [textId, entry] of ranked) {
+    if (pageFull) {
+      countRemainder(textId, -1)
+      continue
+    }
+    let afterId = -1
+    for (;;) {
+      // Filter before paging: a shared text may have thousands of occurrences
+      // in other harnesses before the first occurrence we can display.
+      const chunk = options.kind === undefined
+        ? occurrence.all(textId, afterId)
+        : occurrence.all(textId, afterId, options.kind)
+      for (const row of chunk) {
+        afterId = asInt(row['id'])
+        const file = files.get(asInt(row['file']))
+        if (file === undefined || !keep(file)) continue
+        countHit(file, 1)
+        // The first hit past the page marks truncation and stops the scan;
+        // everything after it only feeds the per-session totals.
+        if (page.length >= limit) { pageFull = true; break }
+        const timeMs = row['time_ms'] === null || row['time_ms'] === undefined ? undefined : asInt(row['time_ms'])
+        page.push({
+          textId,
+          hit: {
+            kind: file.kind,
+            sessionId: file.sessionId,
+            fileId: file.fileId,
+            line: asInt(row['line']),
+            role: asRole(row['role']),
+            ...(timeMs === undefined ? {} : { timeMs }),
+            // Filled in for the displayed hits only, after grouping.
+            snippet: '',
+            matches: [],
+            score: entry.occurrences,
+          },
+        })
+      }
+      if (pageFull || chunk.length < 256) break
+    }
+    // The chunk row that filled the page was counted inline; the rest of the
+    // text (if any) is counted in bulk.
+    if (pageFull) countRemainder(textId, afterId)
+  }
+
+  const truncated = capped || pageFull
   const groups = new Map<string, SearchSessionGroup>()
-  for (const hit of page) {
+  for (const { hit, textId } of page) {
     const groupKey = `${hit.kind} ${hit.sessionId}`
     let group = groups.get(groupKey)
     if (group === undefined) {
@@ -273,7 +400,17 @@ export function search(store: SearchStore, options: SearchOptions): SearchRespon
       }
       groups.set(groupKey, group)
     }
-    if (group.hits.length < SEARCH_GROUP_HIT_LIMIT) group.hits.push(hit)
+    if (group.hits.length < SEARCH_GROUP_HIT_LIMIT) {
+      // The snippet is built only now, for the handful of hits that render;
+      // every other verified text paid inflate + fold + count and no more.
+      const entry = verified.get(textId)
+      if (entry !== undefined) {
+        const { snippet, matches } = buildSnippetFromFolded(entry.text, entry.folded, needle)
+        hit.snippet = snippet
+        hit.matches = matches
+      }
+      group.hits.push(hit)
+    }
   }
 
   return {

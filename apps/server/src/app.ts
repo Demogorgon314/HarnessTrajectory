@@ -35,8 +35,12 @@ export interface AppOptions {
   index: SessionSource
   /** Directory holding the built web UI; omitted or missing disables static serving. */
   staticDir?: string | undefined
-  /** Full-text index; omitted (search is off by default) disables `/api/search`. */
-  search?: SearchService | undefined
+  /**
+   * Full-text index; omitted (search is off by default) disables `/api/search`.
+   * A getter because the Content search toggle starts and stops the service
+   * at runtime — routes must see the current state, not the startup one.
+   */
+  search?: (() => SearchService | undefined) | undefined
   /** Server settings backing `/api/settings`; omitted disables those routes. */
   settings?: SettingsController | undefined
 }
@@ -56,12 +60,14 @@ function searchDisabled(query: string): SearchResponse {
 
 export function createApp({ index, staticDir, search: searchService, settings }: AppOptions): Hono {
   const app = new Hono()
+  const currentSearch = (): SearchService | undefined => searchService?.()
 
   app.get('/api/health', (c) => {
-    const indexing = searchService === undefined ? SEARCH_INDEXING_IDLE : searchService.indexer.stats()
+    const service = currentSearch()
+    const indexing = service === undefined ? SEARCH_INDEXING_IDLE : service.indexer.stats()
     return c.json({
       ok: true,
-      search: { enabled: searchService !== undefined, indexing },
+      search: { enabled: service !== undefined, indexing },
     })
   })
 
@@ -71,13 +77,13 @@ export function createApp({ index, staticDir, search: searchService, settings }:
    */
   if (settings !== undefined) {
     app.get('/api/settings', (c) => {
-      return c.json({ ...settings.read(), searchEnabled: searchService !== undefined })
+      return c.json({ ...settings.read(), searchEnabled: currentSearch() !== undefined })
     })
     app.put('/api/settings', async (c) => {
       const body = await c.req.json().catch(() => undefined)
       if (body === undefined) return c.json({ error: 'invalid JSON body' }, 400)
       const update = settings.update(body)
-      return c.json({ ...update.value, purged: update.purged, searchEnabled: searchService !== undefined })
+      return c.json({ ...update.value, purged: update.purged, searchEnabled: currentSearch() !== undefined })
     })
   }
 
@@ -102,19 +108,20 @@ export function createApp({ index, staticDir, search: searchService, settings }:
    */
   app.get('/api/search', (c) => {
     const query = (c.req.query('q') ?? '').trim()
-    if (searchService === undefined) return c.json(searchDisabled(query))
+    const service = currentSearch()
+    if (service === undefined) return c.json(searchDisabled(query))
     const kind = c.req.query('kind')
     const requested = Number(c.req.query('limit') ?? SEARCH_DEFAULT_LIMIT)
     const limit = Number.isFinite(requested)
       ? Math.max(1, Math.min(Math.floor(requested), SEARCH_MAX_LIMIT))
       : SEARCH_DEFAULT_LIMIT
-    return c.json(search(searchService.store, {
+    return c.json(search(service.store, {
       q: query,
       ...(kind !== undefined && isKind(kind) ? { kind } : {}),
       limit,
       // Title, cwd and last activity live in the session index, not in SQLite.
       describe: (hitKind, sessionId) => index.facts(hitKind, sessionId),
-      indexing: searchService.indexer.stats(),
+      indexing: service.indexer.stats(),
     }))
   })
 

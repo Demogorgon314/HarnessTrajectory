@@ -298,7 +298,8 @@ export class SessionIndex extends EventEmitter implements SessionSource {
   private readonly watchEnabled: boolean
   private readonly backfillConcurrency: number
   private readonly now: () => number
-  private readonly search: SearchIndexer | undefined
+  /** Mutable: the Content search toggle attaches and detaches this at runtime. */
+  private search: SearchIndexer | undefined
   private readonly listing: ListingCache | undefined
   private readonly deferBackfill: boolean
   /** Startup-sweep counters for the launch log. */
@@ -422,6 +423,102 @@ export class SessionIndex extends EventEmitter implements SessionSource {
   /** Files the last startup sweep re-read vs served whole from the listing cache. */
   sweepStats(): { read: number; cached: number } {
     return { read: this.sweepRead, cached: this.sweepCached }
+  }
+
+  /**
+   * Attach a search indexer mid-run and index everything already registered,
+   * in the background. Historical lines are re-read from disk — the consume
+   * path only ever forwards appends — through the same per-file watermarks
+   * the startup sweep uses, so re-enabling after a disable resumes instead
+   * of starting over. The caller owns `finishBackfill` (the composite closes
+   * it once every source has been enabled).
+   */
+  async enableSearch(search: SearchIndexer): Promise<void> {
+    if (this.search !== undefined) return
+    // Anchor every registered file synchronously, before the indexer goes
+    // live on the consume path: `beginFile` fixes each resume watermark and
+    // the plan freezes which lines (`from..upto`, within `bytes` on disk)
+    // this pass reads itself. Appends from here on get line indexes past
+    // `upto` and reach the indexer through the consume path only — an
+    // append that landed mid-pass would otherwise be queued twice.
+    const plan = new Map<FileEntry, { from: number; upto: number; bytes: number }>()
+    for (const entry of this.book.files.values()) {
+      entry.searchSkipped = !search.shouldIndex({ mtimeMs: entry.mtimeMs })
+      entry.searchFrom = entry.searchSkipped
+        ? 0
+        : search.beginFile(searchKeyOf(entry), { size: entry.size, mtimeMs: entry.mtimeMs })
+      if (!entry.searchSkipped && entry.searchFrom < entry.lines) {
+        plan.set(entry, { from: entry.searchFrom, upto: entry.lines, bytes: entry.offset })
+      }
+    }
+    this.search = search
+    const entries = [...this.book.files.values()]
+    search.setBackfillPlan(entries.length)
+    let cursor = 0
+    const workers = Array.from({ length: Math.min(this.backfillConcurrency, entries.length) }, async () => {
+      for (;;) {
+        // Toggled off mid-pass: the indexer is being closed; stop touching it.
+        if (this.stopped || this.search !== search) return
+        const entry = entries[cursor]
+        cursor += 1
+        if (entry === undefined) return
+        try {
+          await this.backfillSearchEntry(search, entry, plan.get(entry))
+        } catch {
+          // One unreadable transcript must not take the pass down with it.
+        } finally {
+          search.noteBackfillFile()
+        }
+      }
+    })
+    await Promise.all(workers)
+  }
+
+  /** Detach the indexer (Content search toggled off): appends stop indexing. */
+  disableSearch(): void {
+    this.search = undefined
+  }
+
+  /**
+   * Feed a registered file's historical lines to a freshly attached indexer.
+   * Only the plan's `[from, upto)` lines are queued: older ones are already
+   * in the index, newer ones arrived (or arrive) through the consume path.
+   */
+  private async backfillSearchEntry(
+    search: SearchIndexer,
+    entry: FileEntry,
+    plan: { from: number; upto: number; bytes: number } | undefined,
+  ): Promise<void> {
+    if (plan === undefined) return
+    const { from, upto, bytes: sizeLimit } = plan
+    const key = searchKeyOf(entry)
+    let offset = 0
+    let rest = ''
+    let lineIndex = 0
+    while (offset < sizeLimit) {
+      if (this.stopped || this.search !== search) return
+      // A truncation/rewrite mid-pass resets the entry and re-queues every
+      // line through the consume path; continuing here would double them.
+      if (entry.searchFrom !== from || entry.lines < upto) return
+      const end = Math.min(offset + INITIAL_CHUNK_BYTES, sizeLimit)
+      const result = await readLines(entry.path, offset, rest, end)
+      for (const line of result.lines) {
+        if (lineIndex >= from) search.queue(key, lineIndex, line)
+        lineIndex += 1
+      }
+      offset = result.offset
+      rest = result.rest
+      await yieldTurn()
+    }
+    // The consume path owns the watermark from the first appended line on; a
+    // file that changed mid-pass must not have its progress rolled back here.
+    if (entry.searchFrom !== from || entry.lines !== upto) return
+    search.noteProgress(key, {
+      size: entry.size,
+      mtimeMs: entry.mtimeMs,
+      indexedBytes: offset,
+      indexedLines: lineIndex,
+    })
   }
 
   /** Sessions with a main transcript, newest activity first. */

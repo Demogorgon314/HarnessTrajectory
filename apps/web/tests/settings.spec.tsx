@@ -113,29 +113,48 @@ describe('SettingsDialog', () => {
     expect(calls.find(call => call.method === 'PUT')).toBeUndefined()
   })
 
-  it('toggles content search on and notes the restart it waits for', async () => {
+  it('toggles content search on; the server starts indexing right away', async () => {
     render(<SettingsDialog open onClose={() => {}} />)
     await answerCurrent(90, false, false)
     expect(toggleInput().checked).toBe(false)
-    expect(screen.queryByText(/restarts/)).toBeNull()
+    expect(screen.queryByText(/could not be opened/)).toBeNull()
     fireEvent.click(toggleInput())
     const put = calls.find(call => call.method === 'PUT')
     expect(put?.body).toEqual({ contentSearch: true })
-    // The server still runs without the index: the toggle applies on the next start.
-    await act(async () => { put?.resolve({ contentSearch: true, searchMaxAgeDays: 90, searchEnabled: false, purged: 0 }) })
+    // The hot toggle flips synchronously: the answer already runs with search.
+    await act(async () => { put?.resolve({ contentSearch: true, searchMaxAgeDays: 90, searchEnabled: true, purged: 0 }) })
     expect(toggleInput().checked).toBe(true)
-    expect(screen.getByText(/Search starts after the server restarts/)).toBeTruthy()
+    expect(screen.queryByText(/could not be opened/)).toBeNull()
   })
 
-  it('toggles content search off and notes the index file is kept', async () => {
+  it('warns when the toggle is on but the index could not be opened', async () => {
+    render(<SettingsDialog open onClose={() => {}} />)
+    await answerCurrent(90, false, false)
+    fireEvent.click(toggleInput())
+    const put = calls.find(call => call.method === 'PUT')
+    // The index file is broken: the value persists but search stays off.
+    await act(async () => { put?.resolve({ contentSearch: true, searchMaxAgeDays: 90, searchEnabled: false, purged: 0 }) })
+    expect(toggleInput().checked).toBe(true)
+    expect(screen.getByText(/could not be opened/)).toBeTruthy()
+  })
+
+  it('notes when search is forced on for the launch while the setting stays off', async () => {
+    render(<SettingsDialog open onClose={() => {}} />)
+    await answerCurrent(90, true, false)
+    expect(toggleInput().checked).toBe(false)
+    expect(screen.getByText(/forced on for this launch/)).toBeTruthy()
+  })
+
+  it('toggles content search off; the server stops indexing right away', async () => {
     render(<SettingsDialog open onClose={() => {}} />)
     await answerCurrent(90, true, true)
     fireEvent.click(toggleInput())
     const put = calls.find(call => call.method === 'PUT')
     expect(put?.body).toEqual({ contentSearch: false })
-    await act(async () => { put?.resolve({ contentSearch: false, searchMaxAgeDays: 90, searchEnabled: true, purged: 0 }) })
+    await act(async () => { put?.resolve({ contentSearch: false, searchMaxAgeDays: 90, searchEnabled: false, purged: 0 }) })
     expect(toggleInput().checked).toBe(false)
-    expect(screen.getByText(/Search stops after the server restarts; the index file stays on disk/)).toBeTruthy()
+    expect(screen.queryByText(/could not be opened/)).toBeNull()
+    expect(screen.queryByText(/stays on disk/)).toBeNull()
   })
 
   it('closes on Escape, on the mask, and on the close button', async () => {

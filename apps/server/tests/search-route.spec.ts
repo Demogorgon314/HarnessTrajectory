@@ -82,7 +82,7 @@ describe('GET /api/search', () => {
   })
 
   it('answers with the search contract, joining session facts from the live index', async () => {
-    const app = createApp({ index, search: service })
+    const app = createApp({ index, search: () => service })
     const response = await app.request('/api/search?q=Port%20the')
     expect(response.status).toBe(200)
     const body = await response.json() as SearchResponse
@@ -110,7 +110,7 @@ describe('GET /api/search', () => {
   })
 
   it('honours the kind filter and the limit, and clamps a hostile one', async () => {
-    const app = createApp({ index, search: service })
+    const app = createApp({ index, search: () => service })
     const byKind = await (await app.request('/api/search?q=Port%20the&kind=codex')).json() as SearchResponse
     expect(byKind.groups.map(group => group.kind)).toEqual(['codex'])
     expect(byKind.groups[0]).toMatchObject({ sessionId: 'thread-1', title: 'Port the parser instead' })
@@ -124,7 +124,7 @@ describe('GET /api/search', () => {
   })
 
   it('reports the minimum length for a query the trigram index cannot answer', async () => {
-    const app = createApp({ index, search: service })
+    const app = createApp({ index, search: () => service })
     const body = await (await app.request('/api/search?q=po')).json() as SearchResponse
     expect(body).toMatchObject({ enabled: true, query: 'po', minLength: 3, groups: [], totalHits: 0 })
     expect(((await (await app.request('/api/search')).json()) as SearchResponse).query).toBe('')
@@ -147,7 +147,7 @@ describe('GET /api/search', () => {
   })
 
   it('reports backfill progress on /api/health', async () => {
-    const withSearch = createApp({ index, search: service })
+    const withSearch = createApp({ index, search: () => service })
     expect(await (await withSearch.request('/api/health')).json()).toEqual({
       ok: true,
       search: {

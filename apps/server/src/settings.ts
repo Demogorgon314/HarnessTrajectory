@@ -45,13 +45,16 @@ export interface SettingsUpdate {
 
 /**
  * The live face of `settings.json`: reads and writes the file and pushes
- * changes into the search indexer. Without an indexer (search is off) values
- * still persist; they apply the next time the server runs with search on.
+ * changes into the search indexer. The indexer is read through a getter
+ * because the Content search toggle creates and tears it down at runtime;
+ * `onChange` is what performs that dance (main.ts wires it). Without an
+ * indexer values still persist; they apply the next time search runs.
  */
 export class SettingsController {
   constructor(
     private readonly path: string,
-    private readonly indexer: SearchIndexer | undefined,
+    private readonly indexer: () => SearchIndexer | undefined,
+    private readonly onChange?: (value: ServerSettings) => void,
   ) {}
 
   read(): ServerSettings {
@@ -67,7 +70,10 @@ export class SettingsController {
     const current = readSettings(this.path)
     const value = clampSettings(typeof input === 'object' && input !== null ? { ...current, ...input } : current)
     writeSettings(value, this.path)
-    const purged = this.indexer?.applyMaxAgeDays(value.searchMaxAgeDays) ?? 0
+    // Retention applies to whatever indexer is live right now; the toggle
+    // itself is then announced so search can start or stop without a restart.
+    const purged = this.indexer()?.applyMaxAgeDays(value.searchMaxAgeDays) ?? 0
+    this.onChange?.(value)
     return { value, purged }
   }
 }

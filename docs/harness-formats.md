@@ -90,8 +90,8 @@ relays (never human prompts), `configuration_update` records reasoning-effort ch
 `thread_settings_applied` snapshots can switch the model, `thread_goal_updated` carries the
 objective, and `retained_context` holds host-only `verified_answer` Q&A, displayed as
 content-free notices whose text does not enter model context or token estimates. Search indexes the relays,
-goal, and discovered tool names; encrypted compaction replays and `event_msg` mirrors of
-response items stay unindexed.
+goal, and tool calls; tool outputs (including discovered tool names), encrypted compaction
+replays, and `event_msg` mirrors of response items stay unindexed.
 
 ### Dynamic tools
 
