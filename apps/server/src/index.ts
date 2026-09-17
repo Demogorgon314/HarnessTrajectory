@@ -50,7 +50,7 @@ function isOwnCodexRecord(entry: FileEntry, line: string): boolean {
 // The shared source plumbing lives in `source.ts`; these re-exports keep the
 // historical `index.ts` import surface (tests, app.ts) intact.
 export {
-  lineTime, lineTimes, mergeChronologically, scopeToFile, standaloneRef,
+  lineTime, lineTimes, mergeChronologically, scopeToFile, standaloneRef, summaryOrderKey,
   type LineChunk, type LineSource, type SessionSource, type Subscriber,
 } from './source.ts'
 
@@ -834,6 +834,11 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     await this.syncKimiTitle(entry)
     await this.syncGrokSummary(entry, true)
     this.saveListing(entry)
+    // Membership and listing facts moved even when no lines were consumed at
+    // all (a cache-restored file, an empty transcript, a child attaching):
+    // `feedLines` only emits when it saw lines, so the listing revision would
+    // otherwise never learn the session exists.
+    this.emit('change', entry.kind, entry.sessionId)
     return entry
   }
 
@@ -1082,7 +1087,9 @@ export class SessionIndex extends EventEmitter implements SessionSource {
   private async syncKimiTitle(entry: FileEntry): Promise<void> {
     if (entry.kind !== 'kimi' || entry.ref.role !== 'main' || entry.meta === null) return
     const title = await readKimiTitle(entry.path)
-    if (title !== undefined) entry.meta.state.aiTitle = title
+    if (title === undefined || title === entry.meta.state.aiTitle) return
+    entry.meta.state.aiTitle = title
+    this.emit('change', entry.kind, entry.sessionId)
   }
 
   /**
@@ -1125,6 +1132,7 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     const titleChanged = title !== entry.summaryTitle
     entry.summaryTitle = title
     if (titleChanged && title !== null && entry.meta !== null) entry.meta.state.aiTitle = title
+    if (titleChanged) this.emit('change', entry.kind, entry.sessionId)
     if (!this.book.hasSubscribers(entry.kind, entry.sessionId)) return
     const sidecar = await buildGrokSidecar(dir, entry.ref.id, summary)
     if (sidecar !== undefined && sidecar.key !== entry.sidecarKey) {

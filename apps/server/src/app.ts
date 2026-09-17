@@ -7,9 +7,9 @@ import { Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import {
   HARNESS_KINDS, SEARCH_DEFAULT_LIMIT, SEARCH_INDEXING_IDLE, SEARCH_MAX_LIMIT, SEARCH_MIN_QUERY_LENGTH,
-  type HarnessKind, type SearchResponse, type SessionLiveEvent,
+  type HarnessKind, type SearchResponse, type SessionListPage, type SessionLiveEvent, type SessionSummary,
 } from '@harness-trajectory/core'
-import { scopeToFile, type SessionSource } from './index.ts'
+import { scopeToFile, summaryOrderKey, type SessionSource } from './index.ts'
 import { search, type SearchService } from './search/index.ts'
 import type { SettingsController } from './settings.ts'
 
@@ -29,6 +29,43 @@ const MIME: Record<string, string> = {
 
 function isKind(value: string): value is HarnessKind {
   return (HARNESS_KINDS as readonly string[]).includes(value)
+}
+
+const LIST_DEFAULT_LIMIT = 100
+const LIST_MAX_LIMIT = 500
+
+/**
+ * A cursor is the last served row's position in the listing's total order
+ * (`compareSummaries`: `updatedAt` desc, `kind`/`id` asc): sessions inserted
+ * above it never shift what "the next page" means.
+ */
+interface ListCursor {
+  updatedAt: number
+  key: string
+}
+
+function listCursorOf(session: SessionSummary): string {
+  return `${session.updatedAt}:${session.kind}:${encodeURIComponent(session.id)}`
+}
+
+function parseListCursor(raw: string | undefined): ListCursor | null {
+  if (raw === undefined) return null
+  const first = raw.indexOf(':')
+  const second = first < 0 ? -1 : raw.indexOf(':', first + 1)
+  if (first <= 0 || second <= first) return null
+  const updatedAt = Number(raw.slice(0, first))
+  if (!Number.isFinite(updatedAt)) return null
+  try {
+    return { updatedAt, key: `${raw.slice(first + 1, second)}/${decodeURIComponent(raw.slice(second + 1))}` }
+  } catch {
+    return null
+  }
+}
+
+/** Whether `session` sorts strictly after the cursor row. */
+function afterListCursor(session: SessionSummary, cursor: ListCursor): boolean {
+  return session.updatedAt < cursor.updatedAt
+    || (session.updatedAt === cursor.updatedAt && summaryOrderKey(session) > cursor.key)
 }
 
 export interface AppOptions {
@@ -61,6 +98,12 @@ function searchDisabled(query: string): SearchResponse {
 export function createApp({ index, staticDir, search: searchService, settings }: AppOptions): Hono {
   const app = new Hono()
   const currentSearch = (): SearchService | undefined => searchService?.()
+  /**
+   * Bumped on every source `'change'`: `/api/sessions?rev=` answers 304 while
+   * the listing is untouched, so idle polls never serialize or transfer.
+   */
+  let listRevision = 0
+  index.on('change', () => { listRevision += 1 })
 
   app.get('/api/health', (c) => {
     const service = currentSearch()
@@ -87,18 +130,62 @@ export function createApp({ index, staticDir, search: searchService, settings }:
     })
   }
 
+  /**
+   * The sidebar's session listing, paged by `?cursor=` (from `nextCursor`) at
+   * `?limit=` rows, filterable by `?kind=a,b` and `?q=` (title/cwd/id
+   * substring). `?rev=` is the client's last seen revision: a match means
+   * nothing changed since — filters included — and answers 304 with no body.
+   * `counts` facets per kind under `q` so the harness filter stays complete
+   * while only a page of rows is loaded.
+   */
   app.get('/api/sessions', (c) => {
-    const kind = c.req.query('kind')
-    const query = (c.req.query('q') ?? '').trim().toLowerCase()
-    let sessions = index.list()
-    if (kind !== undefined && isKind(kind)) sessions = sessions.filter(session => session.kind === kind)
-    if (query !== '') {
-      sessions = sessions.filter(session =>
-        session.title.toLowerCase().includes(query)
-        || (session.cwd ?? '').toLowerCase().includes(query)
-        || session.id.toLowerCase().includes(query))
+    // `?rev=` short-circuits only a first-page request: a cursor page is a
+    // different slice of the same listing and must always get its body. The
+    // revision is global, so it cannot be bound to this request's kind/q —
+    // the client contract is to send `rev` only for the same filter it was
+    // issued under (a filter change must reset it).
+    const cursorParam = c.req.query('cursor')
+    const rev = c.req.query('rev')
+    if (cursorParam === undefined && rev !== undefined && Number(rev) === listRevision) {
+      return c.body(null, 304)
     }
-    return c.json(sessions)
+    const kindParam = c.req.query('kind')
+    const kinds = new Set((kindParam ?? '').split(',').filter(isKind))
+    const kindsFilter = kinds.size === 0 ? null : kinds
+    const query = (c.req.query('q') ?? '').trim().toLowerCase()
+    const requested = Number(c.req.query('limit') ?? LIST_DEFAULT_LIMIT)
+    const limit = Number.isFinite(requested)
+      ? Math.max(1, Math.min(Math.floor(requested), LIST_MAX_LIMIT))
+      : LIST_DEFAULT_LIMIT
+    const cursor = parseListCursor(cursorParam)
+
+    const queried = index.list().filter(session =>
+      query === ''
+      || session.title.toLowerCase().includes(query)
+      || (session.cwd ?? '').toLowerCase().includes(query)
+      || session.id.toLowerCase().includes(query))
+    const counts: SessionListPage['counts'] = {}
+    for (const session of queried) counts[session.kind] = (counts[session.kind] ?? 0) + 1
+    let filtered = kindsFilter === null ? queried : queried.filter(session => kindsFilter.has(session.kind))
+    // Project totals share the kind filter (they describe what the loaded
+    // groups contain), so they're counted before the cursor narrows the page.
+    // Null-prototype: a cwd like "constructor" must not read an inherited member.
+    const projectCounts: Record<string, number> = Object.create(null)
+    for (const session of filtered) {
+      const key = session.cwd ?? ''
+      projectCounts[key] = (projectCounts[key] ?? 0) + 1
+    }
+    if (cursor !== null) filtered = filtered.filter(session => afterListCursor(session, cursor))
+    const sessions = filtered.slice(0, limit)
+    const last = sessions[sessions.length - 1]
+    const page: SessionListPage = {
+      revision: listRevision,
+      sessions,
+      nextCursor: filtered.length > limit && last !== undefined ? listCursorOf(last) : null,
+      counts,
+      projectCounts,
+    }
+    return c.json(page)
   })
 
   /**

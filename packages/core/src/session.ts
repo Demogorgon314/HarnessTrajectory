@@ -6,6 +6,9 @@ export type HarnessKind = 'claude' | 'codex' | 'kimi' | 'grok' | 'devin'
 
 export const HARNESS_KINDS: readonly HarnessKind[] = ['claude', 'codex', 'kimi', 'grok', 'devin']
 
+/** A session counts as live when its transcript was written to this recently. */
+export const LIVE_WINDOW_MS = 2 * 60_000
+
 /** Facts about a subagent transcript recorded next to it (Claude Code `agent-<id>.meta.json`). */
 export interface AgentFileMeta {
   agentId: string
@@ -82,6 +85,27 @@ export interface SessionSummary {
 export interface SessionDetail extends SessionSummary {
   files: readonly SessionFileRef[]
   children: readonly SessionChildSummary[]
+}
+
+/**
+ * One page of `GET /api/sessions`. The listing is ordered by `updatedAt`
+ * (newest first, `kind`/`id` tie-break) and paged by an opaque cursor rather
+ * than an offset so live sessions inserting at the top never shift a page
+ * boundary. `revision` bumps on every listing change; a request carrying the
+ * current `?rev=` answers 304 instead of a body.
+ */
+export interface SessionListPage {
+  revision: number
+  sessions: SessionSummary[]
+  /** Pass back as `?cursor=` for the next page; null ends the listing. */
+  nextCursor: string | null
+  /** Sessions per kind under the `q` filter — the kind filter itself is NOT applied. */
+  counts: Partial<Record<HarnessKind, number>>
+  /**
+   * Sessions per project (`cwd`, `''` for none) under the kind AND `q`
+   * filters — group headers show the true total while only a page is loaded.
+   */
+  projectCounts: Record<string, number>
 }
 
 /** Lifecycle of one subagent run as the parent transcript reports it. */

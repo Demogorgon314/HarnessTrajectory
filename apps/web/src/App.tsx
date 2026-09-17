@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { HARNESS_KINDS, type HarnessKind, type SessionSummary } from '@harness-trajectory/core'
+import { HARNESS_KINDS, type HarnessKind } from '@harness-trajectory/core'
 import {
   createTrajectoryDurationStore, createTrajectoryTranslate, icons, Tooltip, useSnapshotSelector,
   type TrajectoryLocale,
 } from '@harness-trajectory/ui'
-import { listSessions } from './api.ts'
+import { useSessionListing } from './use-session-listing.ts'
 import { DragHandle } from './DragHandle.tsx'
 import { HarnessFilter } from './HarnessFilter.tsx'
 import { SessionList } from './SessionList.tsx'
@@ -20,7 +20,8 @@ import css from './app.module.css'
 
 const { IconPanelLeftOutline16, IconSettingsOutline16 } = icons
 
-const LIST_REFRESH_MS = 5_000
+/** Keystrokes settle this long before the list is re-filtered server-side. */
+const LIST_QUERY_DEBOUNCE_MS = 200
 /** Wide content stays mounted this long after a collapse so it can fade out. */
 const COLLAPSE_SETTLE_MS = 150
 const THEME_CYCLE: readonly ThemePreference[] = ['system', 'light', 'dark']
@@ -166,10 +167,10 @@ function useFrameWidth(ref: React.RefObject<HTMLDivElement | null>): number {
 
 export function App() {
   const [route, navigate] = useHashRoute()
-  const [sessions, setSessions] = useState<SessionSummary[]>([])
-  const [listError, setListError] = useState<string | null>(null)
   const [kinds, setKinds] = useState<ReadonlySet<HarnessKind>>(EMPTY_KINDS)
   const [query, setQuery] = useState('')
+  /** `query` as the listing sees it — debounced so typing never refetches. */
+  const [listQuery, setListQuery] = useState('')
   const [locale, setLocale] = useState<TrajectoryLocale>(defaultLocale)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const t = useMemo(() => createTrajectoryTranslate(locale), [locale])
@@ -216,41 +217,14 @@ export function App() {
   if (!collapsed) lastWideWidth.current = sidebar.width
 
   // -- session list ----------------------------------------------------------
-  const refresh = useCallback(async () => {
-    try {
-      setSessions(await listSessions())
-      setListError(null)
-    } catch (error) {
-      setListError(error instanceof Error ? error.message : String(error))
-    }
-  }, [])
-
   useEffect(() => {
-    void refresh()
-    const timer = setInterval(() => { void refresh() }, LIST_REFRESH_MS)
-    const onFocus = () => { void refresh() }
-    window.addEventListener('focus', onFocus)
-    return () => {
-      clearInterval(timer)
-      window.removeEventListener('focus', onFocus)
-    }
-  }, [refresh])
+    const timer = setTimeout(() => { setListQuery(query.trim()) }, LIST_QUERY_DEBOUNCE_MS)
+    return () => { clearTimeout(timer) }
+  }, [query])
 
-  const counts = useMemo(() => {
-    const map = new Map<HarnessKind, number>()
-    for (const session of sessions) map.set(session.kind, (map.get(session.kind) ?? 0) + 1)
-    return map
-  }, [sessions])
-
-  const filtered = useMemo(() => {
-    const needle = query.trim().toLowerCase()
-    return sessions.filter(session =>
-      (kinds.size === 0 || kinds.has(session.kind))
-      && (needle === ''
-        || session.title.toLowerCase().includes(needle)
-        || (session.cwd ?? '').toLowerCase().includes(needle)
-        || session.id.toLowerCase().includes(needle)))
-  }, [sessions, kinds, query])
+  const {
+    sessions, listReady, listError, hasMore, loadingMore, counts, projectCounts, loadMore,
+  } = useSessionListing(kinds, listQuery)
 
   const selectedSummary = useMemo(
     () => (route === null ? null : sessions.find(s => s.kind === route.kind && s.id === route.id) ?? null),
@@ -348,11 +322,16 @@ export function App() {
             <IndexProgress />
             {listError !== null && <div className={css.listError}>{listError}</div>}
             <SessionList
-              sessions={filtered}
+              sessions={sessions}
               selected={route}
               onSelect={navigate}
               folded={folded}
               onToggleGroup={toggleGroupFold}
+              ready={listReady}
+              hasMore={hasMore}
+              loadingMore={loadingMore}
+              onLoadMore={loadMore}
+              projectCounts={projectCounts}
             />
             {/* The slow half of the same query: hits from the server's index. */}
             <SessionSearch query={query} kinds={kinds} selected={route} onSelect={navigate} />
