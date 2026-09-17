@@ -450,7 +450,7 @@ describe('kimi synthesizer', () => {
     expect(block?.isError).toBe(true)
     expect(block?.content).toEqual([{ type: 'text', text: 'boom' }, { type: 'text', text: 'exit code 1' }])
     // A tool result's source rides INSIDE data.message (the fold's pairing key).
-    expect((dataOf(result)['message'] as Rec)['source']).toEqual({ callId: 'c1' })
+    expect((dataOf(result)['message'] as Rec)['source']).toEqual({ callId: 'c1', name: 'Bash' })
   })
 
   it('binds a child from task.started and closes it on task.terminated', () => {

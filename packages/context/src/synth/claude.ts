@@ -26,6 +26,8 @@ import {
 import type { ContentBlock, MessageSource, StreamRecord, TimelineEvent } from '../fold/event.ts'
 import type { FileOpRecord } from '../shared/types.ts'
 import type { AgentSpawn, EventSynthesizer, SynthMeta } from './types.ts'
+import { restoreSurface } from './surfaceRestore.ts'
+import { appendSurface, checkpointSurface, surfaceValues, type SurfaceCheckpoint } from './surfaceCheckpoint.ts'
 import { disjointInput, setRequestInput } from './requestInput.ts'
 
 /**
@@ -261,6 +263,12 @@ class ClaudeSynthesizer implements EventSynthesizer {
   private readonly children = new Map<string, AgentSpawn>()
 
   private live: LiveNode[] = []
+  private readonly surfaceEvents = new Map<number, TimelineEvent>()
+  private surfaceCheckpoint: SurfaceCheckpoint<LiveNode> | null = null
+  private readonly branchSurfaces = new Map<string, SurfaceCheckpoint<LiveNode> | null>()
+  /** Assistant blocks and their parallel results form one recoverable DAG group. */
+  private readonly assistantSiblings = new Map<string, Set<string>>()
+  private readonly requestMembers = new Map<string, Set<string>>()
   private pendingCompaction: PendingCompaction | undefined
 
   private headerSeen = false
@@ -338,12 +346,27 @@ class ClaudeSynthesizer implements EventSynthesizer {
         return
       case 'attachment':
         this.closeGroup(out)
+        this.restoreParent(record, time, out)
         this.onAttachment(record, time, out)
+        this.rememberBoundary(record)
         return
       case 'system':
         this.closeGroup(out)
+        // compact_boundary deliberately has parentUuid:null and supplies its
+        // own preserved-message selection. It is not a new empty branch.
+        if (record.subtype !== 'compact_boundary') this.restoreParent(record, time, out)
         this.onSystem(record, time, out)
+        this.rememberBoundary(record)
         return
+      case 'progress': {
+        // Old transcripts chained through progress records. They add no
+        // surface, but their UUID still bridges the recorded parent chain.
+        const parent = asString(record.parentUuid)
+        const uuid = asString(record.uuid)
+        const saved = parent === undefined ? undefined : this.branchSurfaces.get(parent)
+        if (uuid !== undefined && saved !== undefined) this.branchSurfaces.set(uuid, saved)
+        return
+      }
       case 'cost-state': {
         // The session-cost rollup is written after the answer settles, so it
         // closes the open group like any other non-assistant record — which
@@ -391,6 +414,7 @@ class ClaudeSynthesizer implements EventSynthesizer {
     if (data !== undefined) event.data = data
     if (surfaceOp !== undefined) event.surfaceOp = surfaceOp
     out.push(event)
+    if (type === 'user/message' || type === 'assistant/message' || type === 'tool/result') this.surfaceEvents.set(event.seq, event)
     return event
   }
 
@@ -416,6 +440,7 @@ class ClaudeSynthesizer implements EventSynthesizer {
     const requestId = asString(record.requestId) ?? asString(message?.id) ?? asString(record.uuid)
     if (requestId === undefined) return
     if (this.open !== undefined && this.open.requestId !== requestId) this.closeGroup(out)
+    if (!this.seenRequestIds.has(requestId)) this.restoreParent(record, time, out)
 
     let group = this.open
     if (group === undefined) {
@@ -502,14 +527,58 @@ class ClaudeSynthesizer implements EventSynthesizer {
   private closeGroup(out: TimelineEvent[]): void {
     const group = this.open
     if (group === undefined) return
+    const events = this.groupEvents(true)
+    out.push(...events)
+    this.seq += events.length
     this.open = undefined
+    for (const event of events) {
+      if (event.type === 'assistant/message' && group.blocks.length > 0) {
+        this.surfaceEvents.set(event.seq, event)
+        this.live.push({ seq: event.seq, uuids: [...group.uuids] })
+        this.surfaceCheckpoint = appendSurface(this.surfaceCheckpoint, { seq: event.seq, uuids: [...group.uuids] })
+      }
+      if (event.type === 'request/header') {
+        this.headerSeen = true
+        this.lastHeaderModel = group.model
+      }
+      if (event.type === 'request/context') this.lastWindow = this.windowOf()
+      if (event.type === 'step/end') this.stepOpen = false
+    }
+    const members = this.requestMembers.get(group.requestId) ?? new Set<string>()
+    for (const uuid of group.uuids) members.add(uuid)
+    this.requestMembers.set(group.requestId, members)
+    for (const uuid of members) {
+      this.branchSurfaces.set(uuid, this.surfaceCheckpoint)
+      this.assistantSiblings.set(uuid, members)
+    }
+  }
 
-    // A model switch has no durable event in this transcript: the header the
-    // fold compares against is synthesized here, from the response's own model.
-    this.emitModelHeader(group.model, group.stepStart, out)
+  preview(): readonly TimelineEvent[] {
+    return this.groupEvents(false)
+  }
+
+  private groupEvents(atBoundary: boolean): readonly TimelineEvent[] {
+    const group = this.open
+    if (group === undefined) return []
+    const out: TimelineEvent[] = []
+    const emit = (type: string, time: number, data?: Record<string, unknown>): TimelineEvent => {
+      const event: TimelineEvent = { type, time, seq: this.seq + out.length, ...(data === undefined ? {} : { data }) }
+      out.push(event)
+      return event
+    }
+    if (group.model !== undefined && (this.lastHeaderModel === undefined || !sameModel(this.lastHeaderModel, group.model))) {
+      emit('request/header', group.stepStart, {
+        header: {
+          tools: this.lastTools,
+          config: { provider: PROVIDER, model: group.model },
+          ...(this.lastSystem === undefined ? {} : { system: this.lastSystem }),
+        },
+        reason: 'change',
+      })
+    }
 
     const data: Record<string, unknown> = {
-      message: { content: group.blocks },
+      message: { content: [...group.blocks] },
       turn: group.turn,
       step: group.step,
     }
@@ -519,26 +588,29 @@ class ClaudeSynthesizer implements EventSynthesizer {
     const stream = this.streamOf(group)
     if (stream.length > 0) data.stream = stream
 
-    const event = this.emit(out, 'assistant/message', group.lastTime, data)
-    if (group.blocks.length > 0) this.live.push({ seq: event.seq, uuids: [...group.uuids] })
+    if (group.continuation) data.replay = true
+    const event = emit('assistant/message', group.lastTime, data)
 
     if (!group.continuation) {
       const input = group.aggregateUsage === true ? { source: 'unknown' as const } : disjointInput(group.usage, group.model)
       const window = this.windowOf()
       setRequestInput(event, { ...input, ...(window === undefined ? {} : { window: { tokens: window, source: 'inferred', kind: 'model' } }) })
     }
-    this.emitContext(group.lastTime, out)
+    const window = this.windowOf()
+    if (window !== undefined && window !== this.lastWindow) {
+      emit('request/context', group.lastTime, { contextWindow: window, provider: PROVIDER, model: this.model })
+    }
 
     for (const call of group.toolCalls) {
-      this.emit(out, 'tool/call', call.time, { callId: call.callId, name: call.name, arguments: call.args })
+      emit('tool/call', call.time, { callId: call.callId, name: call.name, arguments: call.args })
       const planMode = PLAN_MODE_TOOLS[call.name]
-      if (planMode !== undefined) this.emit(out, 'plan/mode', call.time, { active: planMode })
+      if (planMode !== undefined) emit('plan/mode', call.time, { active: planMode })
     }
 
-    if (this.pendingCalls.size === 0 && this.stepOpen) {
-      this.emit(out, 'step/end', group.lastTime)
-      this.stepOpen = false
+    if (this.pendingCalls.size === 0 && this.stepOpen && (atBoundary || group.settled)) {
+      emit('step/end', group.lastTime)
     }
+    return out
   }
 
   /**
@@ -612,6 +684,8 @@ class ClaudeSynthesizer implements EventSynthesizer {
       return
     }
 
+    this.restoreParent(record, time, out)
+
     const text = textOf(content)
     if (record.isMeta === true) {
       this.inject(record, content, time, { kind: 'meta', form: 'context' }, out)
@@ -654,7 +728,7 @@ class ClaudeSynthesizer implements EventSynthesizer {
     const data: Record<string, unknown> = {
       message: {
         content: [{ type: 'tool-result', toolCallId: callId, isError, content } satisfies ContentBlock],
-        source: { callId },
+        source: { callId, ...(call === undefined ? {} : { name: call.name }) },
       },
       error: isError,
     }
@@ -776,12 +850,6 @@ class ClaudeSynthesizer implements EventSynthesizer {
     this.headerSeen = true
   }
 
-  private emitModelHeader(model: string | undefined, time: number, out: TimelineEvent[]): void {
-    if (model === undefined) return
-    if (this.lastHeaderModel !== undefined && sameModel(model, this.lastHeaderModel)) return
-    this.emitHeader(time, 'change', model, out)
-  }
-
   // ---------------------------------------------------------------------------
   // system
   // ---------------------------------------------------------------------------
@@ -822,6 +890,7 @@ class ClaudeSynthesizer implements EventSynthesizer {
       else shadowed.push(node.seq)
     }
     this.live = kept
+    this.surfaceCheckpoint = checkpointSurface(kept)
 
     const preTokens = asNumber(meta?.preTokens)
     const postTokens = asNumber(meta?.postTokens)
@@ -948,6 +1017,50 @@ class ClaudeSynthesizer implements EventSynthesizer {
   private trackNode(seq: number, record: Record<string, unknown>): void {
     const uuid = asString(record.uuid)
     this.live.push({ seq, uuids: uuid === undefined ? [] : [uuid] })
+    this.surfaceCheckpoint = appendSurface(this.surfaceCheckpoint, { seq, uuids: uuid === undefined ? [] : [uuid] })
+    if (uuid !== undefined) this.branchSurfaces.set(uuid, this.surfaceCheckpoint)
+    // Parallel results point at different blocks of one assistant request.
+    // The upstream chain recovery retains every sibling's result; restoring
+    // any member of that group must preserve those results too.
+    const parent = asString(record.parentUuid)
+    const siblings = parent === undefined ? undefined : this.assistantSiblings.get(parent)
+    const message = isRecord(record.message) ? record.message : undefined
+    const results = asArray(message?.content)?.some(item => isRecord(item) && item.type === 'tool_result')
+    if (siblings !== undefined && results === true) {
+      if (uuid !== undefined) {
+        siblings.add(uuid)
+        this.assistantSiblings.set(uuid, siblings)
+      }
+      for (const sibling of siblings) this.branchSurfaces.set(sibling, this.surfaceCheckpoint)
+    }
+  }
+
+  private restoreParent(record: Record<string, unknown>, time: number, out: TimelineEvent[]): void {
+    // An absent parent is an older format, not proof of a new root. Explicit
+    // null is a root branch. Unknown parents may belong to a truncated prefix.
+    const parent = asString(record.parentUuid)
+    const saved = record.parentUuid === null ? null : parent === undefined ? undefined : this.branchSurfaces.get(parent)
+    if (saved === undefined || saved === this.surfaceCheckpoint) return
+    const source = surfaceValues(saved).flatMap(node => {
+      const event = this.surfaceEvents.get(node.seq)
+      return event === undefined ? [] : [{ node, event }]
+    })
+    const events = restoreSurface(this.live.map(node => node.seq), source.map(entry => entry.event), time, this.seq, 'branch')
+    out.push(...events)
+    this.seq += events.length
+    const copies = events.filter(event => event.type !== 'compaction/prune')
+    this.live = copies.map((event, index) => {
+      this.surfaceEvents.set(event.seq, event)
+      return { seq: event.seq, uuids: source[index]?.node.uuids ?? [] }
+    })
+    this.surfaceCheckpoint = checkpointSurface(this.live)
+    this.pendingCalls.clear()
+    this.stepOpen = false
+  }
+
+  private rememberBoundary(record: Record<string, unknown>): void {
+    const uuid = asString(record.uuid)
+    if (uuid !== undefined) this.branchSurfaces.set(uuid, this.surfaceCheckpoint)
   }
 
   private labelOf(): string | undefined {

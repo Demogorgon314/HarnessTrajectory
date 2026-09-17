@@ -78,7 +78,7 @@ import {
   asNumber,
   asString,
   grokContextWindow,
-  grokMessageClass,
+  grokMessageClass, GrokPromptChunks,
   isGrokTaskTool,
   isRecord,
   parseGrokLine,
@@ -87,6 +87,8 @@ import {
 import type { ContentBlock, MessageSource, StreamRecord, TimelineEvent } from '../fold/event.ts'
 import type { FileOpInput } from '../fold/fold.ts'
 import type { AgentSpawn, EventSynthesizer, SynthMeta } from './types.ts'
+import { restoreSurface } from './surfaceRestore.ts'
+import { appendSurface, checkpointSurface, surfaceValues, type SurfaceCheckpoint } from './surfaceCheckpoint.ts'
 import { disjointInput, setRequestInput } from './requestInput.ts'
 import type { RequestInput } from '../shared/requestInput.ts'
 
@@ -274,6 +276,10 @@ class GrokSynthesizer implements EventSynthesizer {
   private compactTokensBefore: number | undefined
   /** A compaction folded and nothing has joined the surface since (checkpoint de-dup). */
   private compactionFresh = false
+  private readonly promptChunks = new GrokPromptChunks()
+  private promptContinuation = false
+  private surfaceCheckpoint: SurfaceCheckpoint<TimelineEvent> | null = null
+  private readonly promptSurfaces = new Map<number, SurfaceCheckpoint<TimelineEvent> | null>()
 
   push(line: string): readonly TimelineEvent[] {
     const out: TimelineEvent[] = []
@@ -291,6 +297,7 @@ class GrokSynthesizer implements EventSynthesizer {
       const update = record.update
       const tag = record.sessionUpdate
       if (update === null || tag === null) return out
+      this.promptContinuation = this.promptChunks.continues(tag, update)
       if (record.streamStartMs !== null) {
         this.streamStartMs = record.streamStartMs
         this.notePromptSize(record.streamStartMs, record.meta)
@@ -358,6 +365,7 @@ class GrokSynthesizer implements EventSynthesizer {
         // usage (nothing terminated it, so nothing billed it) and start clean.
         this.flushStep(out, time)
         this.flushTurn(out, undefined, time)
+        this.onRewind(update, time, out)
         break
       case 'model_changed':
         this.setModel(asString(update['model_id']), time, out)
@@ -445,6 +453,7 @@ class GrokSynthesizer implements EventSynthesizer {
   ): TimelineEvent {
     const event = this.emit(out, type, time, data, surfaceOp)
     this.liveSeqs.push(event.seq)
+    this.surfaceCheckpoint = appendSurface(this.surfaceCheckpoint, event)
     return event
   }
 
@@ -600,18 +609,24 @@ class GrokSynthesizer implements EventSynthesizer {
     // Settle the previous model call FIRST: `setModel` can emit a header and a
     // context change, and a switch announced on this prompt must not jump ahead
     // of the events of the step it interrupted.
-    this.flushStep(out, time)
-    if (!cls.interjection) {
+    if (!this.promptContinuation) this.flushStep(out, time)
+    if (!cls.interjection && !this.promptContinuation) {
       // A new prompt ends the previous turn whatever it did: an unterminated
       // turn books no usage (no `turn_completed` billed it).
       this.flushTurn(out, undefined, time)
     }
     this.setModel(asString(meta?.['modelId']), time, out)
-    if (!cls.interjection) {
+    if (!cls.interjection && !this.promptContinuation) {
       // Turns are numbered by ARRIVAL, not by `promptIndex`: a rewind replays
       // lower indices into the same append-only file (GROK-FORMAT §C.3).
       this.turn += 1
       this.step = 0
+    }
+    if (!this.promptContinuation) {
+      const index = asNumber(meta?.['promptIndex'])
+      if (index !== undefined && (!cls.interjection || !this.promptSurfaces.has(index))) {
+        this.promptSurfaces.set(index, this.surfaceCheckpoint)
+      }
     }
     if (this.promptLabel === undefined && text !== undefined && text.trim() !== '') {
       this.promptLabel = titleFrom(text, LABEL_MAX)
@@ -631,8 +646,30 @@ class GrokSynthesizer implements EventSynthesizer {
     const human = this.emitSurface(out, 'user/message', time, {
       content: blocks,
       source: { kind: 'user' } satisfies MessageSource,
+      ...(this.promptContinuation ? { replay: true } : {}),
     })
     this.humanSeqs.push(human.seq)
+    this.compactionFresh = false
+  }
+
+  private onRewind(update: Record<string, unknown>, time: number, out: TimelineEvent[]): void {
+    const target = asNumber(update['target_prompt_index'])
+    if (target === undefined || !Number.isSafeInteger(target) || target < 0) return
+    const saved = this.promptSurfaces.get(target)
+    if (saved === undefined) return
+    const at = Math.max(time, this.lastEmit)
+    const events = restoreSurface(this.liveSeqs, surfaceValues(saved), at, this.seq + 1, 'rewind')
+    this.lastEmit = at
+    out.push(...events)
+    this.seq += events.length
+    const restored = events.filter(event => event.type !== 'compaction/prune')
+    this.liveSeqs = restored.map(event => event.seq)
+    this.humanSeqs = restored.filter(event => isRecord(event.data?.source) && event.data.source['kind'] === 'user').map(event => event.seq)
+    this.surfaceCheckpoint = checkpointSurface(restored)
+    for (const index of this.promptSurfaces.keys()) if (index >= target) this.promptSurfaces.delete(index)
+    this.calls.clear()
+    this.streamStartMs = undefined
+    this.compactArmed = false
     this.compactionFresh = false
   }
 
@@ -976,7 +1013,7 @@ class GrokSynthesizer implements EventSynthesizer {
     this.emitSurface(out, 'tool/result', time, {
       message: {
         content: [{ type: 'tool-result', toolCallId: callId, isError, content: resultBlocks(update) }],
-        source: { callId },
+        source: { callId, ...(info === undefined ? {} : { name: info.name }) },
       },
       ...(isError ? { error: true } : {}),
       ...(ops.length === 0 ? {} : { fileOps: ops }),
@@ -1119,6 +1156,7 @@ class GrokSynthesizer implements EventSynthesizer {
       ...(tokensBefore === undefined ? {} : { shadowedTokenCount: tokensBefore }),
     })
     this.liveSeqs = []
+    this.surfaceCheckpoint = null
     this.humanSeqs = []
     const op = shadowed.length === 0
       ? undefined

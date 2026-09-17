@@ -53,6 +53,8 @@ import {
 import type { ContentBlock, MessageSource, StreamRecord, TimelineEvent } from '../fold/event.ts'
 import type { FileOpInput } from '../fold/fold.ts'
 import type { AgentSpawn, EventSynthesizer, SynthMeta } from './types.ts'
+import { restoreSurface } from './surfaceRestore.ts'
+import { appendSurface, checkpointSurface, surfaceValues, type SurfaceCheckpoint } from './surfaceCheckpoint.ts'
 import { disjointInput, setRequestInput } from './requestInput.ts'
 
 /** Label length cap, matching the Claude/Codex synthesizers' session titles. */
@@ -153,6 +155,10 @@ class KimiSynthesizer implements EventSynthesizer {
   private liveSeqs: number[] = []
   /** Seqs of the live HUMAN `user/message` nodes, for the compaction kept tail. */
   private humanSeqs: number[] = []
+  private readonly surfaceEvents = new Map<number, TimelineEvent>()
+  private surfaceCheckpoint: SurfaceCheckpoint<TimelineEvent> | null = null
+  private readonly undoAnchors: (SurfaceCheckpoint<TimelineEvent> | null)[] = []
+  private readonly ownedInjections = new Map<string, Set<number>>()
   /** Set by `context.apply_compaction` so the mirrored `compaction_summary` message is not doubled. */
   private pendingCompactionSummary = false
 
@@ -204,6 +210,8 @@ class KimiSynthesizer implements EventSynthesizer {
         case 'context.clear':
           this.flushStep(out, time, undefined)
           this.prune(out, time, [...this.liveSeqs], 'context-clear')
+          this.undoAnchors.length = 0
+          this.ownedInjections.clear()
           break
         case 'context.undo': this.onUndo(record, time, out); break
         case 'plan_mode.enter':
@@ -277,6 +285,8 @@ class KimiSynthesizer implements EventSynthesizer {
     surfaceOp?: unknown,
   ): number {
     const seq = this.emit(out, type, time, data, surfaceOp)
+    this.surfaceEvents.set(seq, { type, seq, time, data })
+    this.surfaceCheckpoint = appendSurface(this.surfaceCheckpoint, { type, seq, time, data })
     this.liveSeqs.push(seq)
     return seq
   }
@@ -441,6 +451,17 @@ class KimiSynthesizer implements EventSynthesizer {
       return
     }
     const content = contentBlocksOf(asArray(message['content']) ?? [])
+    const origin = isRecord(message['origin']) ? message['origin'] : undefined
+    const anchor = origin === undefined || origin['kind'] === 'user'
+      || ((origin['kind'] === 'skill_activation' || origin['kind'] === 'plugin_command') && origin['trigger'] === 'user-slash')
+    if (anchor) {
+      this.flushStep(out, time, undefined)
+      const id = asString(message['id'])
+      const owned = id === undefined ? undefined : this.ownedInjections.get(id)
+      let before = this.surfaceCheckpoint
+      while (before !== null && owned?.has(before.value.seq)) before = before.previous
+      this.undoAnchors.push(before)
+    }
     if (cls.kind === 'human') {
       // DEVIATION (design said "any user message closes an open group"): only a
       // HUMAN message settles the buffered step. Kimi marks its step boundaries
@@ -464,7 +485,13 @@ class KimiSynthesizer implements EventSynthesizer {
       this.humanSeqs.push(seq)
       return
     }
-    this.emitSurface(out, 'user/message', time, { content, source: sourceOfClass(cls) })
+    const seq = this.emitSurface(out, 'user/message', time, { content, source: sourceOfClass(cls) })
+    const owner = origin?.['kind'] === 'injection' ? asString(origin['ownerPromptId']) : undefined
+    if (owner !== undefined) {
+      const owned = this.ownedInjections.get(owner) ?? new Set<number>()
+      owned.add(seq)
+      this.ownedInjections.set(owner, owned)
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -666,7 +693,7 @@ class KimiSynthesizer implements EventSynthesizer {
     this.emitSurface(out, 'tool/result', time, {
       message: {
         content: [{ type: 'tool-result', toolCallId: callId, isError, content }],
-        source: { callId },
+        source: { callId, ...(call === undefined ? {} : { name: call.name }) },
       },
       ...(isError ? { error: true } : {}),
       ...(ops.length === 0 ? {} : { fileOps: ops }),
@@ -764,6 +791,10 @@ class KimiSynthesizer implements EventSynthesizer {
    */
   private onCompaction(record: Record<string, unknown>, time: number, out: TimelineEvent[]): void {
     this.flushStep(out, time, undefined)
+    // Kimi's undo precheck stops at a compaction summary; unlike Grok rewind,
+    // it cannot restore an older prompt across that boundary.
+    this.undoAnchors.length = 0
+    this.ownedInjections.clear()
     const kept = this.keptTailSeqs(record)
     const shadowed = this.liveSeqs.filter(seq => !kept.has(seq))
     const tokensBefore = asNumber(record['tokensBefore'])
@@ -772,6 +803,10 @@ class KimiSynthesizer implements EventSynthesizer {
       ...(tokensBefore === undefined ? {} : { shadowedTokenCount: tokensBefore }),
     })
     this.liveSeqs = this.liveSeqs.filter(seq => kept.has(seq))
+    this.surfaceCheckpoint = checkpointSurface(this.liveSeqs.flatMap(seq => {
+      const event = this.surfaceEvents.get(seq)
+      return event === undefined ? [] : [event]
+    }))
     this.humanSeqs = this.humanSeqs.filter(seq => kept.has(seq))
     // The shadow claim the fold just armed is consumed by the NEXT surface
     // event: the summary must carry the replace op or the shadowed nodes stay
@@ -802,16 +837,20 @@ class KimiSynthesizer implements EventSynthesizer {
   /** `context.undo` retracts the last `count` context messages. */
   private onUndo(record: Record<string, unknown>, time: number, out: TimelineEvent[]): void {
     this.flushStep(out, time, undefined)
-    const count = Math.max(1, Math.floor(asNumber(record['count']) ?? 1))
-    // Best effort: the record counts MESSAGES, which the surface does not index
-    // by. The undone span is taken from the count-th most recent human message
-    // onward (a retraction always unwinds whole prompts); with no human message
-    // on the surface it falls back to the last `count` surface nodes.
-    const start = this.humanSeqs[this.humanSeqs.length - count]
-    const shadowed = start === undefined
-      ? this.liveSeqs.slice(-count)
-      : this.liveSeqs.filter(seq => seq >= start)
-    this.prune(out, time, shadowed, 'context-undo')
+    const count = asNumber(record['count']) ?? 1
+    if (!Number.isSafeInteger(count) || count <= 0 || count > this.undoAnchors.length) return
+    const index = this.undoAnchors.length - count
+    const saved = surfaceValues(this.undoAnchors[index] ?? null)
+    this.undoAnchors.length = index
+    const events = restoreSurface(this.liveSeqs, saved, time, this.seq + 1, 'context-undo')
+    out.push(...events)
+    this.seq += events.length
+    const restored = events.filter(event => event.type !== 'compaction/prune')
+    this.surfaceCheckpoint = checkpointSurface(restored)
+    this.liveSeqs = restored.map(event => event.seq)
+    this.humanSeqs = restored.filter(event => isRecord(event.data?.source) && event.data.source['kind'] === 'user').map(event => event.seq)
+    for (const event of restored) this.surfaceEvents.set(event.seq, event)
+    this.turnOpen = false
   }
 
   /**
@@ -833,6 +872,10 @@ class KimiSynthesizer implements EventSynthesizer {
     this.emit(out, 'compaction/prune', time, { shadowedSeqs: [...shadowed] })
     const gone = new Set(shadowed)
     this.liveSeqs = this.liveSeqs.filter(seq => !gone.has(seq))
+    this.surfaceCheckpoint = checkpointSurface(this.liveSeqs.flatMap(seq => {
+      const event = this.surfaceEvents.get(seq)
+      return event === undefined ? [] : [event]
+    }))
     this.humanSeqs = this.humanSeqs.filter(seq => !gone.has(seq))
     this.emitSurface(out, 'user/message', time, {
       content: [],

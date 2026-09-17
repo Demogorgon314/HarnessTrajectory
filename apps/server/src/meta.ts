@@ -5,7 +5,7 @@
  */
 
 import {
-  agentMentions, asArray, asNumber, asString, classifyInjectedUser, devinMessageClass, grokMessageClass,
+  agentMentions, asArray, asNumber, asString, classifyInjectedUser, devinMessageClass, grokMessageClass, GrokPromptChunks,
   codexHumanPromptText, isRecord, kimiMessageClass, kimiTitleText, parseDevinLine, parseGrokLine,
   parseJsonLine, parseTime, titleFrom, type AgentFileMeta, type HarnessKind,
 } from '@harness-trajectory/core'
@@ -75,7 +75,7 @@ export interface MetaScanner {
  * Bump when any scanner's logic changes: cached listing states from an older
  * version are discarded and the transcripts they covered are re-read.
  */
-export const META_SCANNER_VERSION = 3
+export const META_SCANNER_VERSION = 4
 
 /**
  * Serialized scanner payload for the listing cache: the public `state` plus
@@ -514,6 +514,7 @@ function grokChunkText(update: Record<string, unknown>): string {
  */
 function grokMetaScanner(summary: Record<string, unknown> | null): MetaScanner {
   const state = emptyMeta()
+  const chunks = new GrokPromptChunks()
   if (summary !== null) {
     const title = asString(summary['session_summary'])?.trim()
     if (title !== undefined && title !== '') state.aiTitle = title
@@ -531,6 +532,7 @@ function grokMetaScanner(summary: Record<string, unknown> | null): MetaScanner {
       noteTime(state, record.time)
       const update = record.update
       if (update === null) return
+      const continuation = chunks.continues(record.sessionUpdate ?? '', update)
       // The model of the turn rides on the user chunk; it is the only in-band
       // source when `summary.json` has not been written yet.
       if (record.sessionUpdate === 'user_message_chunk') {
@@ -545,10 +547,12 @@ function grokMetaScanner(summary: Record<string, unknown> | null): MetaScanner {
       // The prompt counts even when it carries no text (an image-only prompt),
       // exactly as the adapter and the context synthesizer count it; the text
       // only serves as the title fallback.
-      state.promptCount += 1
+      if (!continuation) state.promptCount += 1
       const text = grokChunkText(update)
       if (state.title === null && text.trim() !== '') state.title = titleFrom(text)
     },
+    save() { return { promptChunkIndex: chunks.save() } },
+    load(saved) { if (isRecord(saved)) chunks.load(saved['promptChunkIndex']) },
   }
 }
 

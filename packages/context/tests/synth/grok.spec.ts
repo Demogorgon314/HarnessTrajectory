@@ -881,7 +881,6 @@ describe('grok synthesizer', () => {
       prompt(1, 'hi', 0),
       xai(2, { sessionUpdate: 'hook_execution', event_name: 'user_prompt_submit', tool_name: 'bash', runs: [] }),
       xai(2, { sessionUpdate: 'retry_state', type: 'retrying', error_type: 'context_length', message: 'too long' }),
-      xai(2, { sessionUpdate: 'rewind_marker', target_prompt_index: 0, created_at: '2026-01-01T12:00:02.000Z' }),
       xai(2, { sessionUpdate: 'session_recap', summary: 'so far', auto: true }),
       xai(2, { sessionUpdate: 'task_backgrounded', tool_call_id: 'x', task_id: 't', command: 'sleep 1', cwd: '/work', output_file: '/tmp/o' }),
       acp(2, { sessionUpdate: 'plan', entries: [{ content: 'do it', priority: 'medium', status: 'pending' }] }),

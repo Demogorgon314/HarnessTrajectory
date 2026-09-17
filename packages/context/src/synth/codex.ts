@@ -864,10 +864,17 @@ class CodexSynthesizer implements EventSynthesizer {
     itemsOverride?: readonly unknown[],
   ): void {
     const callId = asString(payload['call_id'])
-    if (callId === undefined) return
     // The output settles the model response if no `token_usage_record` did.
     this.closeGroup(out, time, undefined)
     const content = toolOutputContent(payload['output'], itemsOverride)
+    if (callId === undefined) {
+      this.emitSurface(out, 'user/message', time, {
+        content,
+        source: { kind: 'inject', form: 'context', name: asString(payload['name']) ?? 'standalone-tool-output' },
+      })
+      this.lastInputTime = time
+      return
+    }
     // Codex records no error flag on `function_call_output` itself; the paired
     // `item_completed.item.status === 'failed'` is the usual signal, while
     // `tool_search_output` carries a terminal `status` of its own.

@@ -688,6 +688,11 @@ function applySurface(
     const toolEntry = srcEntry ?? blockEntry
     if (toolEntry !== undefined) {
       node.tool = toolEntry.name
+    } else if (data?.replay === true && typeof source?.name === 'string') {
+      // Restored results retain display identity without re-arming a call.
+      node.tool = source.name
+    }
+    if (toolEntry !== undefined && data?.replay !== true) {
       const timing = ensureTiming(st)
       const dur = durOf(toolEntry.start, ev.time)
       timing.toolsMs += dur
@@ -697,7 +702,7 @@ function applySurface(
     // Consume-once: the entry is never looked up again after its result
     // folds in (see TimelineState.callNames). Rebuild without the used ids —
     // consume-once holds the map at pending-call size, so the copy is trivial.
-    if (typeof srcId === 'string' || typeof blockId === 'string') {
+    if (data?.replay !== true && (typeof srcId === 'string' || typeof blockId === 'string')) {
       const kept: TimelineState['callNames'] = {}
       for (const k in st.callNames) {
         const entry = st.callNames[k]
@@ -1278,21 +1283,21 @@ export function applyTimeline(
         // An answered question prompt is a human input too (whole-session
         // tally): the result only carries its tool name when it pairs with
         // the armed call, so an unpaired/foreign one counts nothing.
-        if (node.tool === ASK_USER_TOOL) s.humanInputs = (s.humanInputs ?? 0) + 1
+        if (data?.replay !== true && node.tool === ASK_USER_TOOL) s.humanInputs = (s.humanInputs ?? 0) + 1
         const errored = Boolean(data?.error) || firstBlock?.isError === true
         // PORT ADDITION: a synthesizer that knows its harness's file tools
         // states the ops itself; they win over the argument derivation, and
         // they book even for an unpaired result (a Claude tool/call event may
         // have aged out of the fold's window while its result still carries
         // `toolUseResult`).
-        if (Array.isArray(data?.fileOps)) {
+        if (data?.replay !== true && Array.isArray(data?.fileOps)) {
           pushFileOps(s, fileOpsOfInput(data.fileOps, {
             seq: event.seq,
             time: event.time,
             tool: pendingEntry?.name ?? '',
             err: errored,
           }))
-        } else if (pendingEntry !== undefined) {
+        } else if (data?.replay !== true && pendingEntry !== undefined) {
           // The fallback derivation (shared/fileOps.ts): the armed call's
           // arguments + the result's presentation meta. Unpaired results book
           // nothing (parity with the surface node's missing tool label).
@@ -1305,7 +1310,7 @@ export function applyTimeline(
             err: errored,
           }))
         }
-        if (buffered !== undefined && buffered.length > 0) {
+        if (data?.replay !== true && buffered !== undefined && buffered.length > 0) {
           // The run_code root settles: its nested ops land with `parent` = this
           // result's row, plus the program description off its call arguments.
           const program = parseCallArgs(pendingEntry?.argsRaw)?.description

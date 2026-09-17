@@ -164,7 +164,7 @@ describe('claude adapter', () => {
     expect(node?.provenance).toEqual({ provider: 'anthropic', model: 'claude-test-1' })
     expect(node?.requestConfig).toEqual({ provider: 'anthropic', model: 'claude-test-1', reasoningEffort: 'high' })
     expect(node?.time).toBe(T0 + 2_500)
-    expect(node?.timing).toEqual({ stepStartTime: T0, firstTokenTime: T0 + 700, completedTime: T0 + 2_500 })
+    expect(node?.timing).toEqual({ stepStartTime: T0, firstTokenTime: null, completedTime: T0 + 2_500 })
     const [request] = parser.snapshot().requests
     expect(request).toMatchObject({
       purpose: 'assistant',

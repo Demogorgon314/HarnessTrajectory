@@ -15,7 +15,7 @@ export {
   type KimiAgentMention, type KimiMessageClass,
 } from './kimi.ts'
 export {
-  createGrokParser, grokMessageClass, grokContextWindow, isGrokTaskTool, parseGrokLine,
+  createGrokParser, grokMessageClass, grokContextWindow, isGrokTaskTool, parseGrokLine, GrokPromptChunks,
   GROK_CONTEXT_WINDOWS, GROK_DEFAULT_CONTEXT_WINDOW, GROK_SIDECAR_METHOD,
   type GrokMessageClass, type GrokRecord, type GrokSidecar,
 } from './grok.ts'

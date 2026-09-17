@@ -14,6 +14,21 @@ function pairs(drafts: readonly SearchDocDraft[]): string[] {
   return drafts.map(draft => `${draft.role}: ${draft.text}`)
 }
 
+it('indexes durable Codex speech without indexing promoted item mirrors or standalone tool outputs', () => {
+  for (const role of ['user', 'assistant']) {
+    expect(docs('codex', {
+      type: 'realtime_item', timestamp: iso(0),
+      payload: { id: role, realtime_session_id: 'voice', type: 'transcript_segment', role, text: 'spoken text' },
+    })).toEqual([{ role: role === 'user' ? 'human' : 'assistant', text: 'spoken text', timeMs: T0 }])
+  }
+  expect(docs('codex', {
+    type: 'realtime_item', payload: { type: 'bem_item_promoted', item_id: 'existing', presentation: { type: 'whole_item' } },
+  })).toEqual([])
+  expect(docs('codex', {
+    type: 'response_item', payload: { type: 'function_call_output', id: 'external', name: 'external', output: 'tool output' },
+  })).toEqual([])
+})
+
 describe('extractSearchDocs — Claude Code', () => {
   it('indexes a human prompt, assistant text, thinking, and a tool call', () => {
     expect(docs('claude', {

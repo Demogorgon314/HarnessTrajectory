@@ -94,6 +94,7 @@ function msgText(msg: Record<string, unknown>): string {
 }
 
 interface PendingSpawn {
+  background: boolean
   callId: string
   title: string | null
   task: string | null
@@ -122,7 +123,9 @@ class DevinSynthesizer implements EventSynthesizer {
   private prefixRun: 'off' | 'live' | 'replay' | 'kept' = 'off'
   /** inject extension key → live seq, so a re-injection replaces the stale block. */
   private readonly injectSeqs = new Map<string, number>()
-  private readonly openCalls = new Set<string>()
+  private readonly openCalls = new Map<string, string>()
+  private readonly provisionalResults = new Map<string, { seq: number; name: string }>()
+  private readonly completedAgents = new Map<string, number>()
   private readonly spawns: PendingSpawn[] = []
   /** Seqs of every live surface node, for the compaction shadow claim. */
   private liveSeqs: number[] = []
@@ -152,6 +155,7 @@ class DevinSynthesizer implements EventSynthesizer {
           this.onSession(record)
           return out
         case 'tool':
+          this.onToolState(record, time, out)
           return out
         case 'msg':
           this.onMsg(record, time, out)
@@ -217,7 +221,14 @@ class DevinSynthesizer implements EventSynthesizer {
   private onSession(record: Extract<DevinRecord, { tag: 'session' }>): void {
     if (record.title !== null && record.title !== '') this.label = titleFrom(record.title, LABEL_MAX)
     this.model ??= record.model ?? undefined
-    for (const agent of record.agents) this.agentFiles.set(agent.id, agent.fileId)
+    for (const agent of record.agents) {
+      this.agentFiles.set(agent.id, agent.fileId)
+      const child = this.children.get(agent.id)
+      if (child !== undefined && agent.id !== agent.fileId) {
+        this.children.delete(agent.id)
+        this.children.set(agent.fileId, { ...child, key: agent.fileId })
+      }
+    }
   }
 
   private onMsg(record: Extract<DevinRecord, { tag: 'msg' }>, time: number, out: TimelineEvent[]): void {
@@ -234,6 +245,13 @@ class DevinSynthesizer implements EventSynthesizer {
     const kept = record.kept
     if (role === 'system') {
       const ext = msgExt(msg)
+      const agentId = asString(ext?.['subagent/agent_id'])
+      if (!replay && agentId !== undefined && asNumber(ext?.['subagent/chain_node_id']) !== undefined) {
+        this.completedAgents.set(agentId, stamp)
+        const key = this.agentFiles.get(agentId) ?? agentId
+        const child = this.children.get(key)
+        if (child !== undefined) this.children.set(key, { ...child, completedAt: stamp })
+      }
       const injectKey = ext === undefined ? undefined : injectKeyOf(ext)
       if (ext?.['devin-rs/summary'] === undefined && injectKey === undefined) {
         this.onSystem(msg, stamp, out, replay, kept)
@@ -454,7 +472,7 @@ class DevinSynthesizer implements EventSynthesizer {
     // Keep billing compatibility, but never promote that assumption to a measurement.
     setRequestInput(out.at(-1), { source: 'unknown', ...(this.model === undefined ? {} : { model: this.model }) })
     for (const call of calls) {
-      this.openCalls.add(call.id)
+      this.openCalls.set(call.id, call.name)
       this.emit(out, 'tool/call', time, { callId: call.id, name: call.name, arguments: call.argsRaw })
       if (call.name === SPAWN_TOOL) {
         const args: unknown = (() => {
@@ -465,6 +483,7 @@ class DevinSynthesizer implements EventSynthesizer {
           }
         })()
         this.spawns.push({
+          background: isRecord(args) && args['is_background'] === true,
           callId: call.id,
           title: isRecord(args) ? asString(args['title']) ?? null : null,
           task: isRecord(args) ? asString(args['task']) ?? null : null,
@@ -490,6 +509,13 @@ class DevinSynthesizer implements EventSynthesizer {
     const timing = isRecord(ext?.['chisel/tool_call_timing']) ? ext['chisel/tool_call_timing'] : undefined
     const isError = resultMeta?.['success'] === false
     const text = msgText(msg)
+    const provisional = this.provisionalResults.get(callId)
+    const name = provisional?.name ?? this.openCalls.get(callId)
+    this.provisionalResults.delete(callId)
+    if (provisional !== undefined) {
+      this.liveSeqs = this.liveSeqs.filter(seq => seq !== provisional.seq)
+      this.keptSeqs = this.keptSeqs.filter(seq => seq !== provisional.seq)
+    }
     if (!replay) this.openCalls.delete(callId)
     this.emitSurface(out, 'tool/result', time, {
       message: {
@@ -497,7 +523,7 @@ class DevinSynthesizer implements EventSynthesizer {
           type: 'tool-result', toolCallId: callId, isError,
           content: text === '' ? [] : [{ type: 'text', text }],
         }],
-        source: { callId },
+        source: { callId, ...(name === undefined ? {} : { name }) },
       },
       ...(isError ? { error: true } : {}),
       meta: {
@@ -505,7 +531,7 @@ class DevinSynthesizer implements EventSynthesizer {
           ? {}
           : { durationMs: asNumber(timing?.['duration_ms']) }),
       },
-    }, undefined, replay, kept)
+    }, provisional === undefined ? undefined : { op: 'replace', startSeq: provisional.seq, endSeq: provisional.seq }, replay || provisional !== undefined, kept)
     if (replay) return
 
     // A run_subagent result names its chain: register the child under the file
@@ -516,6 +542,7 @@ class DevinSynthesizer implements EventSynthesizer {
     const spawn = this.spawns.find(candidate => candidate.callId === callId)
     const key = this.agentFiles.get(agentId) ?? agentId
     const model = asString(ext?.['subagent/model'])
+    const completedAt = this.completedAgents.get(agentId)
     this.children.set(key, {
       key,
       label: titleFrom(spawn?.title ?? spawn?.task ?? agentId, LABEL_MAX),
@@ -525,8 +552,28 @@ class DevinSynthesizer implements EventSynthesizer {
       ...(model === undefined ? {} : { model }),
       callId,
       ...(spawn === undefined ? {} : { startedAt: spawn.time }),
-      completedAt: time,
+      ...(completedAt !== undefined
+        ? { completedAt }
+        : isError || spawn?.background !== true ? { completedAt: time } : {}),
     })
+  }
+
+  /** ACP can settle execution even when the model-visible result is missing. */
+  private onToolState(record: Extract<DevinRecord, { tag: 'tool' }>, time: number, out: TimelineEvent[]): void {
+    const status = asString(record.update?.['status'])
+    const name = this.openCalls.get(record.id)
+    if ((status !== 'completed' && status !== 'failed') || name === undefined) return
+    this.openCalls.delete(record.id)
+    const seq = this.emitSurface(out, 'tool/result', time, {
+      message: {
+        content: [{ type: 'tool-result', toolCallId: record.id, isError: status === 'failed', content: [] }],
+        source: { callId: record.id, name },
+      },
+      ...(status === 'failed' ? { error: true } : {}),
+    })
+    // UI state is not model content. A late real result replaces this empty
+    // placeholder without booking execution or derived file operations twice.
+    this.provisionalResults.set(record.id, { seq, name })
   }
 
   /**

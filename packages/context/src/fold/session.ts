@@ -53,6 +53,8 @@ export interface ContextSessionOptions {
 }
 
 interface FileFold {
+  /** Cached read projection; never used as the base for another push. */
+  projected?: FileFold
   requestInput: RequestInputSummary
   file: SessionFileRef
   synth: EventSynthesizer
@@ -172,6 +174,13 @@ export class ContextSession {
     } catch {
       return
     }
+    delete fold.projected
+    this.applyEvents(fold, events)
+    // Metadata and provisional content can change without committed events.
+    this.rev++
+  }
+
+  private applyEvents(fold: FileFold, events: readonly InputEvent[]): void {
     for (const event of events) {
       const timeline = applyTimeline(fold.timeline, event, this.bounds, this.costPeriod)
       if (event.requestInput !== undefined && event.data?.replay !== true) {
@@ -202,10 +211,29 @@ export class ContextSession {
         fold.rev++
       }
     }
-    // The synthesizer's own meta (model, label, running, children, cost) can
-    // move without any event folding, so a delivered line always bumps the
-    // session revision even when the fold stayed put.
-    this.rev++
+  }
+
+  private visibleFold(fileId: string): FileFold | undefined {
+    const fold = this.folds.get(fileId)
+    if (fold === undefined || fold.synth.preview === undefined) return fold
+    if (fold.projected !== undefined) return fold.projected
+    let events: readonly InputEvent[]
+    try {
+      events = fold.synth.preview()
+    } catch {
+      return fold
+    }
+    if (events.length === 0) return fold
+    const projected: FileFold = {
+      ...fold,
+      // Tail content overlays the committed maps; streaming a block need not
+      // copy the entire transcript's retained content.
+      content: new Map(),
+      headerContent: new Map(),
+    }
+    this.applyEvents(projected, events)
+    fold.projected = projected
+    return projected
   }
 
   /**
@@ -214,7 +242,7 @@ export class ContextSession {
    * comes back until that file's fold state changes.
    */
   timelineOf(fileId: string): ContextTimeline | null {
-    const fold = this.folds.get(fileId)
+    const fold = this.visibleFold(fileId)
     if (fold === undefined) return null
     const cached = fold.timelineView
     if (cached !== undefined && cached.rev === fold.rev) return cached.value
@@ -226,7 +254,7 @@ export class ContextSession {
 
   /** The header-epoch metadata of one file, memoized like {@link timelineOf}. */
   headersOf(fileId: string): ContextHeaders | null {
-    const fold = this.folds.get(fileId)
+    const fold = this.visibleFold(fileId)
     if (fold === undefined) return null
     const cached = fold.headersView
     if (cached !== undefined && cached.rev === fold.rev) return cached.value
@@ -237,12 +265,12 @@ export class ContextSession {
 
   /** The retained content blocks of one folded node, or null when none were kept. */
   contentOf(fileId: string, seq: number): ContentBlock[] | null {
-    return this.folds.get(fileId)?.content.get(seq) ?? null
+    return this.visibleFold(fileId)?.content.get(seq) ?? this.folds.get(fileId)?.content.get(seq) ?? null
   }
 
   /** The retained system text + tool schemas of one header epoch, or null. */
   headerContentOf(fileId: string, seq: number): HeaderEpochContent | null {
-    return this.folds.get(fileId)?.headerContent.get(seq) ?? null
+    return this.visibleFold(fileId)?.headerContent.get(seq) ?? this.folds.get(fileId)?.headerContent.get(seq) ?? null
   }
 
   /** The synthesizer's live metadata for one file (model, label, children, …). */

@@ -382,6 +382,15 @@ class CodexParser implements SessionParser {
       case 'response_item':
         this.handleResponseItem(payload, time)
         return
+      case 'realtime_item':
+        // Speech is presentation-only. Promoted BEM items already appear as
+        // response_items; they must not create another request or prompt.
+        if (payload['type'] === 'transcript_segment' && typeof payload['text'] === 'string') {
+          const lastInputTime = this.lastInputTime
+          this.pushContext([{ type: 'text', text: payload['text'] }], `realtime-${asString(payload['role']) ?? 'unknown'}`, 'notice', time)
+          this.lastInputTime = lastInputTime
+        }
+        return
       case 'token_usage_record': {
         const usage = mapUsage(payload['usage'])
         if (this.open !== null) {
@@ -771,13 +780,17 @@ class CodexParser implements SessionParser {
     itemsOverride?: readonly unknown[],
   ): void {
     const callId = asString(payload['call_id'])
-    if (callId === undefined) return
     const output = payload['output']
     const content: ContentBlock[] = itemsOverride !== undefined
       ? [{ type: 'text', text: stringifyRaw(itemsOverride) ?? '' }]
       : typeof output === 'string'
         ? [{ type: 'text', text: output }]
         : this.contentBlocks(asArray(output) ?? [])
+    if (callId === undefined) {
+      this.pushContext(content, asString(payload['name']) ?? 'standalone-tool-output', 'notice', time)
+      this.lastInputTime = time
+      return
+    }
     const text = textOf(content)
     const seq = this.assembler.seq.next()
     const { node, topLevel } = this.assembler.tools.complete(callId, {

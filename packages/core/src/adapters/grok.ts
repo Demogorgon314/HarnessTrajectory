@@ -243,8 +243,27 @@ export function isGrokTaskTool(name: string): boolean {
   return TASK_TOOL_NAMES.has(name)
 }
 
-/** One model call in progress: blocks accumulate until a tool call or the turn closes it. */
+/** Contiguous chunks share one prompt; indices may be reused after rewind. */
+export class GrokPromptChunks {
+  private index: number | null = null
+
+  continues(tag: string, update: Record<string, unknown>): boolean {
+    const meta = isRecord(update['_meta']) ? update['_meta'] : undefined
+    const index = tag === 'user_message_chunk' && grokMessageClass(update)?.kind === 'human'
+      ? asNumber(meta?.['promptIndex']) ?? null : null
+    const continuation = index !== null && index === this.index
+    this.index = index
+    return continuation
+  }
+
+  save(): number | null { return this.index }
+  load(value: unknown): void { this.index = asNumber(value) ?? null }
+}
+
+/** One model call, grouped by its stream when the transcript records one. */
 interface OpenStep {
+  stream: number | null
+  published?: boolean
   turn: number
   step: number
   seq: number
@@ -427,6 +446,8 @@ class GrokParser implements SessionParser {
   private open: OpenStep | null = null
   /** `streamStartMs` of the last stamped record; refines the next step's start time. */
   private streamStartMs: number | null = null
+  private readonly promptChunks = new GrokPromptChunks()
+  private promptContinuation = false
   private readonly turnSeqs = new Map<number, number[]>()
   /** `promptId` → display turn, so `turn_completed.prompt_id` closes the right turn. */
   private readonly promptTurns = new Map<string, number>()
@@ -470,6 +491,7 @@ class GrokParser implements SessionParser {
     const update = record.update
     const tag = record.sessionUpdate
     if (update === null || tag === null) return
+    this.promptContinuation = this.promptChunks.continues(tag, update)
     if (record.streamStartMs !== null) this.streamStartMs = record.streamStartMs
     this.notePromptId(record.promptId)
     this.handleUpdate(tag, update, record, time)
@@ -708,8 +730,8 @@ class GrokParser implements SessionParser {
       this.pushContext(blocks, time, classified.name, classified.name === 'hostTurn' ? 'relay' : 'notice')
       return
     }
-    this.closeStep('complete')
-    if (!classified.interjection) {
+    if (!this.promptContinuation) this.closeStep('complete')
+    if (!classified.interjection && !this.promptContinuation) {
       // Turns are numbered by arrival, not by `promptIndex`: a rewind replays
       // lower indices into the same append-only file (§C.3 `rewind_marker`).
       this.turn += 1
@@ -717,7 +739,7 @@ class GrokParser implements SessionParser {
       this.currentPromptId = record.promptId
       if (record.promptId !== null) this.promptTurns.set(record.promptId, this.turn)
     }
-    this.promptCount += 1
+    if (!this.promptContinuation) this.promptCount += 1
     if (this.firstPromptTitle === null && text !== undefined && text.trim() !== '') {
       this.firstPromptTitle = titleFrom(text)
     }
@@ -803,13 +825,17 @@ class GrokParser implements SessionParser {
 
   private ensureStep(time: number): OpenStep {
     const existing = this.open
-    if (existing !== null) return existing
+    if (existing !== null) {
+      if (existing.stream === null || this.streamStartMs === null || existing.stream === this.streamStartMs) return existing
+      this.closeStep('complete')
+    }
     if (this.turn === 0) this.turn = 1
     this.step += 1
     // `streamStartMs` marks when this model call's stream opened, which precedes
     // the first debounced chunk.
     const stream = this.streamStartMs
     const open: OpenStep = {
+      stream,
       turn: this.turn,
       step: this.step,
       seq: this.assembler.seq.next(),
@@ -833,15 +859,19 @@ class GrokParser implements SessionParser {
     const open = this.open
     if (open === null) return
     this.open = null
+    this.publishStep(open, status, error, code, usage)
+  }
+
+  private publishStep(open: OpenStep, status: 'complete' | 'error', error?: string, code?: string, usage?: TokenUsage): void {
     const provenance = this.model === null ? undefined : { provider: GROK_PROVIDER, model: this.model }
     const requestConfig = this.model === null ? undefined : this.requestConfig()
-    this.assembler.pushNode({
+    const node: AssistantMessageNode = {
       kind: 'assistant',
       seq: open.seq,
       time: open.lastTime,
       turn: open.turn,
       step: open.step,
-      blocks: open.blocks,
+      blocks: [...open.blocks],
       ...(usage === undefined ? {} : { usage }),
       ...(provenance === undefined ? {} : { provenance }),
       ...(requestConfig === undefined ? {} : { requestConfig }),
@@ -851,7 +881,10 @@ class GrokParser implements SessionParser {
         completedTime: open.lastTime,
       },
       ...(status === 'error' ? { interrupted: true as const } : {}),
-    })
+    }
+    if (open.published) this.assembler.replaceNode(open.seq, node)
+    else this.assembler.pushNode(node)
+    open.published = true
     this.locate(open.seq, open.turn)
     const request: AssistantRequestView = {
       purpose: 'assistant',
@@ -883,8 +916,10 @@ class GrokParser implements SessionParser {
       return
     }
     this.startCall(callId, update, record, time)
-    // A tool call ends the model's step; the next chunk opens the next one.
-    this.closeStep('complete')
+    // Old transcripts without stream identity use a tool call as the boundary.
+    // Stamped parallel calls remain in the same model response.
+    if (record.streamStartMs === null) this.closeStep('complete')
+    else if (this.open !== null) this.publishStep(this.open, 'complete')
   }
 
   private startCall(

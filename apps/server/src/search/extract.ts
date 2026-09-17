@@ -282,6 +282,14 @@ function codexDocs(line: string): SearchDocDraft[] {
   const payload = record['payload']
   if (!isRecord(payload)) return builder.docs
 
+  if (recordType === 'realtime_item') {
+    if (payload['type'] === 'transcript_segment') {
+      const role = payload['role'] === 'user' ? 'human' : payload['role'] === 'assistant' ? 'assistant' : 'other'
+      builder.add(role, asString(payload['text']) ?? '')
+    }
+    return builder.docs
+  }
+
   // Agent traffic and retained answers are top-level records, not response
   // items; `thread_goal_updated` is the one durable `event_msg` with unique
   // user-authored text (the rest mirror response items — indexing them would

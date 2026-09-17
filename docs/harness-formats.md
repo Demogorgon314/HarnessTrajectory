@@ -12,6 +12,19 @@ Request input is input + cache read + cache creation (output excluded); multi-it
 aggregate usage is not a single input measurement. A main session's cost includes its
 subagents. Subagent files bind through `.meta.json`.
 
+Assistant block timestamps mark block completion, so Trajectory leaves first-token
+time unknown. Group by request identity even when an early block carries a stop
+reason or a tool result separates sibling blocks. Trajectory updates the existing
+request; Context projects its buffered tail without committing a read/EOF boundary.
+
+Context follows `parentUuid` at branch boundaries, including regeneration from an
+earlier user message. UUID checkpoints share immutable surface prefixes. Sibling
+assistant blocks and their parallel tool results share a recoverable checkpoint,
+matching the upstream orphan recovery; a tool result's parent is not itself a rewind.
+Compaction uses its explicit preserved-message selection rather than interpreting
+the boundary's `parentUuid: null` as a new empty conversation. Restoring a branch
+changes model-visible context and retains historical billing.
+
 ## Codex
 
 Rollouts live under `~/.codex/sessions/<yyyy>/<mm>/<dd>/` (archived ones under
@@ -102,6 +115,15 @@ content-free notices whose text does not enter model context or token estimates.
 goal, and tool calls; tool outputs (including discovered tool names), encrypted compaction
 replays, and `event_msg` mirrors of response items stay unindexed.
 
+`function_call_output.call_id` is optional. An unpaired standalone output is
+model-visible injected context, never a fabricated call or a human prompt. It
+remains excluded from search under the tool-output policy.
+
+Top-level `realtime_item/transcript_segment` records are presentation-only speech:
+Trajectory displays them and search indexes their role/text. They do not alter
+Context, human prompt counts, request timing or billing. `bem_item_promoted` only
+references an existing response item and must not duplicate its display or index.
+
 ### Dynamic tools
 
 `session_meta.dynamic_tools` is a heterogeneous list: canonical `{"type":"function", …}` and
@@ -133,6 +155,12 @@ context with a summary message (the `contextSummary` field — the shorter `summ
 working summary the trajectory shows) plus a SELECTION OF USER MESSAGES
 (`keptUserMessageCount`, `keptHeadUserMessageCount` when the middle was elided), never whole
 turns; a trend that keeps whole turns alive never drops.
+
+Undo anchors differ from human-input classification: absent/user origins and
+`skill_activation`/`plugin_command` with `trigger: user-slash` establish anchors.
+Undo also removes immediately preceding injections with the anchor's
+`ownerPromptId`. Invalid or unavailable counts do nothing. Compaction and clear
+invalidate undo checkpoints; Kimi undo cannot cross a compaction summary.
 
 ### Subagent binding
 
@@ -167,6 +195,19 @@ the catalog fallback never supplies a measured historical occupancy ratio. Child
 are top-level session dirs bound through the parent's `subagents/<id>/meta.json`, never by tool
 call id. Title, cwd, system prompt, and tool schemas live outside the JSONL and reach the
 parsers through the server's sidecar line.
+
+One prompt can persist multiple consecutive content chunks with the same
+`_meta.promptIndex`. Core, Context and metadata share `GrokPromptChunks`; chunks
+retain all content but count once. A non-chunk boundary ends the run, so rewinding
+and reusing an index starts a new prompt. Metadata persists the current run index
+alongside its byte-resume cursor.
+
+`streamStartMs` identifies a model response, including parallel tool calls. Core
+publishes and updates that response as tools arrive; missing stream identities use
+the legacy tool-call boundary. `rewind_marker.target_prompt_index` restores the
+surface saved before that prompt, including across compaction. Replayed surface
+copies do not rebill requests or re-execute tools. Checkpoints belong to the active
+branch; those at and beyond the rewind target are discarded.
 
 ## Devin
 
@@ -219,6 +260,12 @@ result (or ACP `completed` state) does not mean the agent finished. The run stay
 `subagent/agent_id` and `subagent/chain_node_id`. That notification completes the run;
 foreground results and failed spawn results settle immediately. Run duration starts
 at the spawn call, not its result receipt.
+
+Context applies the same background lifecycle, preserves a completion notification
+that arrives before its launch receipt, and rekeys children when a late sidecar
+resolves their file id. Terminal ACP tool state can settle a missing result with an
+empty placeholder; ACP UI text is not model output. A later real result replaces
+that placeholder without booking tool execution a second time.
 
 ### Store rewrites and compaction
 
@@ -287,6 +334,22 @@ in place on change — never re-created, or promptCount and the mid-dedup set wo
 `stop()` is idempotent and `start()` re-runs cleanly on the same instance.
 
 ## Request-input statistics (shared)
+
+### Incremental parser extension points
+
+`EventSynthesizer.push` emits committed events. A synthesizer that must buffer a
+response across arbitrary read boundaries can also expose pure `preview()` events.
+`ContextSession` projects that replaceable tail over its committed fold and content
+maps, memoizes the view, and discards only the projection before the next push.
+Do not flush an open request merely because a chunk or file read ended.
+
+`surfaceCheckpoint.ts` provides shared-prefix checkpoints; capturing a boundary is
+O(1). `surfaceRestore.ts` uses the existing prune/replace/replay vocabulary to restore
+model-visible content while preserving historical requests, input counts and tool
+timing. Harnesses own boundary identity and undo policy. Keep those protocol rules
+in their synthesizers rather than adding harness branches to the fold or session.
+
+### Measurements
 
 Context follows dsh-context's fold vocabulary and billing buckets; Trajectory follows
 deepseek-harness. Port-owned `InputEvent.requestInput` metadata is consumed by ContextSession,

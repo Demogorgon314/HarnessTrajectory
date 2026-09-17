@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { GROK_SIDECAR_METHOD, type SessionLiveEvent } from '@harness-trajectory/core'
 import { SessionIndex, classifyPath, lineTime, lineTimes, mergeChronologically, scopeToFile } from '../src/index.ts'
 import { zstdSupported } from '../src/tail.ts'
-import { createMetaScanner, emptyMeta, listingScannerFor, mergeChildAgent } from '../src/meta.ts'
+import { createMetaScanner, emptyMeta, listingScannerFor, mergeChildAgent, serializeMeta, hydrateMeta } from '../src/meta.ts'
 import { defaultRoots } from '../src/roots.ts'
 import { ListingCache } from '../src/listing-cache.ts'
 import { SearchIndexer } from '../src/search/indexer.ts'
@@ -19,6 +19,24 @@ function jsonl(records: readonly unknown[]): string {
 
 const T0 = Date.parse('2026-09-14T10:00:00.000Z')
 const iso = (offsetMs: number) => new Date(T0 + offsetMs).toISOString()
+
+it('resumes Grok in the middle of a multi-block prompt and counts reused indices after rewind', () => {
+  const first = createMetaScanner('grok')
+  first.push(JSON.stringify(grokPrompt('first block', 0, 0)))
+  const saved = serializeMeta(first)
+  expect(saved).not.toBeNull()
+  const resumed = createMetaScanner('grok')
+  expect(hydrateMeta(resumed, saved ?? '')).toBe(true)
+  resumed.push(JSON.stringify(grok({
+    sessionUpdate: 'user_message_chunk',
+    content: { type: 'image', data: 'fake', mimeType: 'image/png' },
+    _meta: { promptIndex: 0 },
+  }, 1)))
+  expect(resumed.state.promptCount).toBe(1)
+  resumed.push(JSON.stringify(grok({ sessionUpdate: 'rewind_marker', target_prompt_index: 0 }, 2)))
+  resumed.push(JSON.stringify(grokPrompt('replacement', 0, 3)))
+  expect(resumed.state.promptCount).toBe(2)
+})
 
 function claudeUser(text: string, sessionId: string, offset: number, extra: Record<string, unknown> = {}) {
   return {

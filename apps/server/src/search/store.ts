@@ -54,7 +54,7 @@ import type { HarnessKind, SearchRole } from '@harness-trajectory/core'
  * lands in it — changes; a mismatch drops and rebuilds. v7 combines Codex
  * logical-history indexing with deduplicated text and excludes tool outputs.
  */
-export const SEARCH_SCHEMA_VERSION = 7
+export const SEARCH_SCHEMA_VERSION = 8
 
 /** Identity of one indexed transcript, as the SSE route addresses it. */
 export interface SearchFileKey {

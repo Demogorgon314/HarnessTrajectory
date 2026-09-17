@@ -34,6 +34,8 @@ const SIDECHAIN_PREFIX = ' sidechain:'
 
 /** One API response being accumulated from its per-block lines. */
 interface OpenRequest {
+  /** A stop marker made this response visible; later sibling blocks update it. */
+  published?: boolean
   requestId: string
   messageId: string | undefined
   seq: number
@@ -69,6 +71,7 @@ interface FileState {
   sawPrompt: boolean
   nesting: Nesting | undefined
   open: OpenRequest | undefined
+  readonly requestsById: Map<string, OpenRequest>
   lastInputTime: number | null
   lastTime: number | null
   toolCalls: number
@@ -392,7 +395,9 @@ class ClaudeParser implements SessionParser {
     if (state.open !== undefined && state.open.requestId !== requestId) this.finalize(state)
     const model = asString(message?.model)
     if (this.model === null && model !== undefined) this.model = model
-    let open = state.open
+    // A tool result may be persisted between sibling blocks of one request.
+    // Reuse that request's identity, sequence and step across the boundary.
+    let open = state.open ?? state.requestsById.get(requestId)
     if (open === undefined) {
       const nesting = state.nesting
       const turn = nesting?.turn ?? this.turn
@@ -419,7 +424,9 @@ class ClaudeParser implements SessionParser {
         error: undefined,
       }
       state.open = open
+      state.requestsById.set(requestId, open)
     }
+    state.open = open
     open.lastTime = time
     if (model !== undefined) open.model = model
     const effort = asString(record.effort) ?? asString(record.perTurnEffort)
@@ -489,7 +496,7 @@ class ClaudeParser implements SessionParser {
     this.assembler.touch()
     const stop = asString(message?.stop_reason)
     if ((stop !== undefined && TURN_END_STOP_REASONS.has(stop)) || (stop === 'tool_use' && sawToolUse)) {
-      this.finalize(state)
+      this.finalize(state, true)
     }
   }
 
@@ -673,10 +680,10 @@ class ClaudeParser implements SessionParser {
   // Request finalization
   // -------------------------------------------------------------------------
 
-  private finalize(state: FileState): void {
+  private finalize(state: FileState, retain = false): void {
     const open = state.open
     if (open === undefined) return
-    state.open = undefined
+    if (!retain) state.open = undefined
     if (state.child) {
       // Nested transcripts contribute only their tool calls; the parent's
       // tool_result carries the subagent's report.
@@ -699,23 +706,26 @@ class ClaudeParser implements SessionParser {
     }
     const provenance = open.model === undefined ? undefined : { provider: 'anthropic', model: open.model }
     const requestConfig = this.requestConfig(open)
-    this.assembler.pushNode({
+    const node = {
       kind: 'assistant',
       seq: open.seq,
       ...(open.messageId === undefined ? {} : { messageId: open.messageId }),
       time: open.lastTime,
       turn: open.turn,
       step: open.step,
-      blocks: open.blocks,
+      blocks: [...open.blocks],
       ...(open.usage === undefined ? {} : { usage: open.usage }),
       ...(provenance === undefined ? {} : { provenance }),
       ...(requestConfig === undefined ? {} : { requestConfig }),
       timing: {
         stepStartTime: open.stepStartTime,
-        firstTokenTime: open.firstTime,
+        firstTokenTime: null,
         completedTime: open.lastTime,
       },
-    })
+    } as const
+    if (open.published) this.assembler.replaceNode(open.seq, node)
+    else this.assembler.pushNode(node)
+    open.published = true
     this.assembler.upsertRequest(this.requestView(open, 'complete'))
   }
 
@@ -752,6 +762,7 @@ class ClaudeParser implements SessionParser {
   // -------------------------------------------------------------------------
 
   private locate(seq: number, turn: number): void {
+    if (this.assembler.locations.has(seq)) return
     if (turn <= 0) {
       this.assembler.locations.set(seq, { kind: 'session' })
       return
@@ -800,6 +811,7 @@ class ClaudeParser implements SessionParser {
         sawPrompt: false,
         nesting: undefined,
         open: undefined,
+        requestsById: new Map(),
         lastInputTime: null,
         lastTime: null,
         toolCalls: 0,

@@ -49,6 +49,13 @@ export interface EventSynthesizer {
   readonly kind: HarnessKind
   /** Feed one raw JSONL line; returns the fold events it produced, in order. */
   push(line: string): readonly InputEvent[]
+  /**
+   * Optional, replaceable tail of a response still being grouped. Reading it
+   * must not mutate the synthesizer. The session projects it over committed
+   * events, then discards that projection before the next push. This makes EOF
+   * visible without treating an arbitrary read boundary as a protocol boundary.
+   */
+  preview?(): readonly InputEvent[]
   meta(): SynthMeta
 }
 

@@ -5,6 +5,7 @@
 import { describe, expect, test } from 'vitest'
 import type { SessionFileRef, SessionSummary } from '@harness-trajectory/core'
 import type { AgentSpawn, ContextTimeline, SynthMeta } from '@harness-trajectory/context'
+import { ContextSession } from '@harness-trajectory/context'
 import { agentNodeInputsOf, type AgentFoldReader } from '../src/ContextPane.tsx'
 
 const MAIN = 'sess-1'
@@ -61,6 +62,22 @@ function summary(over: Partial<SessionSummary> = {}): SessionSummary {
 }
 
 const CTX = { kind: 'claude' as const, sessionId: MAIN }
+
+test('a Devin background receipt keeps the network child running until its completion notification', () => {
+  const context = new ContextSession('devin')
+  const main = file(MAIN, 'main')
+  const child = file('agent-child', 'child', MAIN)
+  const push = (msg: Record<string, unknown>, ref = main, time = 1000) => context.push(JSON.stringify({ t: 'devin.msg', time, msg }), ref)
+  context.push(JSON.stringify({ t: 'devin.session', agents: [{ id: 'child', fileId: child.id }] }), main)
+  push({ role: 'assistant', tool_calls: [{ id: 'spawn', name: 'run_subagent', arguments: '{"task":"inspect","is_background":true}' }] })
+  push({ role: 'tool', tool_call_id: 'spawn', content: 'launched', metadata: { extensions: { 'subagent/agent_id': 'child' } } }, main, 2000)
+  push({ role: 'assistant', tool_calls: [{ id: 'work', name: 'shell', arguments: '{}' }] }, child)
+  const rows = () => agentNodeInputsOf([main, child], context, null, { kind: 'devin', sessionId: MAIN })
+  expect(rows()[1]?.running).toBe(true)
+  push({ role: 'system', content: 'done', metadata: { extensions: { 'subagent/agent_id': 'child', 'subagent/chain_node_id': 42 } } }, main, 4000)
+  expect(rows()[1]?.running).toBe(false)
+  expect(rows()[1]?.durationMs).toBe(3000)
+})
 
 describe('agentNodeInputsOf — naming', () => {
   test('the main node takes the server title over the synthesizer label', () => {
