@@ -107,8 +107,15 @@ Logo credits live in the web registry and README license section.
   rows) at every `finishBackfill` — runtime resets and forgets orphan texts
   without a file vanishing — and in `applyMaxAgeDays`, never inline in a flush.
 - The search database is a cache: bump `SEARCH_SCHEMA_VERSION` instead of migrating.
-- `contentSearch` defaults off; `HARNESS_TRAJECTORY_SEARCH=1` forces it on. The setting
-  takes effect at startup; disabling it preserves any existing database on disk.
+- `contentSearch` defaults off; `HARNESS_TRAJECTORY_SEARCH=1` forces it on for one launch.
+  The toggle takes effect without a restart: enabling creates the service and runs a
+  background backfill (`SessionIndex.enableSearch` re-reads historical lines from disk,
+  `DevinSource.enableSearch` re-derives them from the store; both resume from the
+  `beginFile` watermarks), disabling detaches the indexer and preserves the database
+  on disk. Toggles serialize through one promise chain in `main.ts`.
+  `SessionIndex.enableSearch` anchors every file's watermark synchronously before
+  the indexer goes live; an append mid-pass then flows only through the consume
+  path and is never queued twice.
   `searchMaxAgeDays` defaults to 90; 0 means all. `indexer.shouldIndex` enforces retention
   at registration; the startup sweep and `applyMaxAgeDays` purge expired entries.
 - A search hit uses `(kind, sessionId, fileId, line)`. For JSONL, `line` is the zero-based

@@ -304,7 +304,8 @@ function jsonString(value: string | null): unknown {
 
 export class DevinSource extends EventEmitter implements SessionSource {
   private readonly dbPath: string
-  private readonly search: SearchIndexer | undefined
+  /** Mutable: the Content search toggle attaches and detaches this at runtime. */
+  private search: SearchIndexer | undefined
   private readonly watchEnabled: boolean
   private readonly now: () => number
   private readonly book = new SessionBook<DevinEntry>(() => this.now())
@@ -553,6 +554,53 @@ export class DevinSource extends EventEmitter implements SessionSource {
   /** Streams this source feeds to the search index (its half of `finishBackfill`). */
   livePaths(): string[] {
     return [...this.book.files.values()].flatMap(entry => (entry.searchSkipped ? [] : [entry.path]))
+  }
+
+  /**
+   * Attach a search indexer mid-run: every live session is re-anchored with
+   * `beginFile` and its emitted lines are re-derived from the store and fed
+   * to the index (replays produce no side effects, which is exactly what
+   * makes them safe to re-read for search). Appends index from here on.
+   * Synchronous on purpose: no poll tick can interleave. The caller owns
+   * `finishBackfill`.
+   */
+  enableSearch(search: SearchIndexer): void {
+    if (this.search !== undefined) return
+    this.search = search
+    for (const state of this.states.values()) {
+      if (!state.live) continue
+      const entries = [...state.book.files.values()].filter(entry => entry.sessionId === state.row.id)
+      for (const entry of entries) {
+        entry.searchSkipped = !search.shouldIndex({ mtimeMs: state.row.last_activity_at * 1000 })
+        entry.searchFrom = entry.searchSkipped
+          ? 0
+          : search.beginFile(searchKeyOf(entry), { size: state.maxRowId, mtimeMs: entry.mtimeMs })
+      }
+      const replay = this.replaySession(state)
+      for (const [path, lines] of replay) {
+        const entry = state.book.files.get(path)
+        if (entry === undefined || entry.searchSkipped) continue
+        // The replay must re-derive the emitted stream exactly; a mismatch
+        // leaves this stream to the next startup's registration path rather
+        // than indexing lines under shifted numbers.
+        if (lines.length !== entry.lines) continue
+        for (let index = entry.searchFrom; index < lines.length; index += 1) {
+          const line = lines[index]
+          if (line !== undefined) search.queue(searchKeyOf(entry), index, line)
+        }
+        search.noteProgress(searchKeyOf(entry), {
+          size: state.maxRowId,
+          mtimeMs: entry.mtimeMs,
+          indexedBytes: entry.size,
+          indexedLines: entry.lines,
+        })
+      }
+    }
+  }
+
+  /** Detach the indexer (Content search toggled off): new rows stop indexing. */
+  disableSearch(): void {
+    this.search = undefined
   }
 
   kinds(): readonly HarnessKind[] {

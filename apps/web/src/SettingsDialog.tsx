@@ -92,8 +92,8 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
           {toggle !== live && (
             <p className={css.note}>
               {toggle
-                ? 'Saved. Search starts after the server restarts; the index builds in the background.'
-                : 'Saved. Search stops after the server restarts; the index file stays on disk.'}
+                ? 'Saved, but the search index could not be opened — see the server log. The setting stays on; the next launch retries.'
+                : 'Search is forced on for this launch (HARNESS_TRAJECTORY_SEARCH=1); the persisted setting stays off.'}
             </p>
           )}
           <div className={css.row}>

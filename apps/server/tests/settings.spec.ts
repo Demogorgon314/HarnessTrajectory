@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { SETTINGS_DEFAULTS } from '@harness-trajectory/core'
+import { SETTINGS_DEFAULTS, type ServerSettings } from '@harness-trajectory/core'
 import { SettingsController, readSettings, settingsPath, writeSettings } from '../src/settings.ts'
 import type { SearchIndexer } from '../src/search/indexer.ts'
 
@@ -77,7 +77,7 @@ describe('SettingsController', () => {
     const dir = await tempDir()
     const path = join(dir, 'settings.json')
     const { indexer, applied } = fakeIndexer()
-    const controller = new SettingsController(path, indexer)
+    const controller = new SettingsController(path, () => indexer)
 
     const update = controller.update({ searchMaxAgeDays: 30 })
     expect(update).toEqual({ value: { contentSearch: false, searchMaxAgeDays: 30 }, purged: 7 })
@@ -89,7 +89,7 @@ describe('SettingsController', () => {
   it('merges a partial update over the stored value instead of resetting the other field', async () => {
     const dir = await tempDir()
     const path = join(dir, 'settings.json')
-    const controller = new SettingsController(path, undefined)
+    const controller = new SettingsController(path, () => undefined)
 
     controller.update({ searchMaxAgeDays: 30 })
     const update = controller.update({ contentSearch: true })
@@ -103,7 +103,7 @@ describe('SettingsController', () => {
     const dir = await tempDir()
     const path = join(dir, 'settings.json')
     const { indexer, applied } = fakeIndexer()
-    const controller = new SettingsController(path, indexer)
+    const controller = new SettingsController(path, () => indexer)
 
     const update = controller.update({ searchMaxAgeDays: 999_999 })
     expect(update.value).toEqual(SETTINGS_DEFAULTS)
@@ -114,9 +114,25 @@ describe('SettingsController', () => {
   it('still persists when there is no indexer (search off); nothing purges', async () => {
     const dir = await tempDir()
     const path = join(dir, 'settings.json')
-    const controller = new SettingsController(path, undefined)
+    const controller = new SettingsController(path, () => undefined)
     const update = controller.update({ searchMaxAgeDays: 14 })
     expect(update).toEqual({ value: { contentSearch: false, searchMaxAgeDays: 14 }, purged: 0 })
     expect(readSettings(path)).toEqual({ contentSearch: false, searchMaxAgeDays: 14 })
+  })
+
+  it('announces every persisted value through onChange, after retention applied', async () => {
+    const dir = await tempDir()
+    const path = join(dir, 'settings.json')
+    const { indexer, applied } = fakeIndexer()
+    const seen: ServerSettings[] = []
+    const controller = new SettingsController(path, () => indexer, value => { seen.push(value) })
+
+    controller.update({ contentSearch: true })
+    controller.update({ searchMaxAgeDays: 30 })
+    expect(seen).toEqual([
+      { contentSearch: true, searchMaxAgeDays: SETTINGS_DEFAULTS.searchMaxAgeDays },
+      { contentSearch: true, searchMaxAgeDays: 30 },
+    ])
+    expect(applied).toEqual([SETTINGS_DEFAULTS.searchMaxAgeDays, 30])
   })
 })

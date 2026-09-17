@@ -14,6 +14,7 @@ import type { SessionLiveEvent } from '@harness-trajectory/core'
 import { DevinDb } from '../src/devin/db.ts'
 import { DevinSource } from '../src/devin/source.ts'
 import { SearchIndexer } from '../src/search/indexer.ts'
+import { search } from '../src/search/query.ts'
 import { SearchStore } from '../src/search/store.ts'
 import { extractSearchDocs } from '../src/search/extract.ts'
 
@@ -519,6 +520,44 @@ describe('DevinSource', () => {
     await source.refresh()
     indexer.flush()
     expect(store.fileState(path)?.indexedLines).toBe(1)
+  })
+
+  it('indexes existing sessions when search is enabled mid-run, without doubling appends', async () => {
+    const store = new SearchStore({ path: ':memory:' })
+    const indexer = new SearchIndexer({ store, flushDelayMs: 1, extract: extractSearchDocs, maxAgeDays: 0 })
+    const db = fixture()
+    createStore(db)
+    insertSession(db, 'alpha')
+    insertNode(db, 'alpha', 1, null, userMsg('u1', 'findable line'))
+    insertNode(db, 'alpha', 2, 1, assistantMsg('a1', 'working on it'))
+    db.close()
+    source = new DevinSource({ dbPath, watch: false })
+    await source.start()
+    indexer.flush()
+    expect(store.docCount()).toBe(0)
+
+    source.enableSearch(indexer)
+    indexer.finishBackfill(source.livePaths())
+    const path = 'devin://sessions/alpha'
+    expect(store.fileState(path)?.indexedLines).toBe(2)
+    expect(search(store, { q: 'findable line' }).totalHits).toBe(1)
+
+    // Rows appended after enabling index exactly once.
+    const write = new DevinDb(dbPath, { readOnly: false })
+    insertNode(write, 'alpha', 3, 2, assistantMsg('a2', 'later thought'))
+    write.db.prepare(`UPDATE sessions SET last_activity_at = 1700000500 WHERE id = 'alpha'`).run()
+    write.close()
+    await source.refresh()
+    indexer.flush()
+    expect(store.fileState(path)?.indexedLines).toBe(3)
+    expect(search(store, { q: 'later thought' }).totalHits).toBe(1)
+
+    // Toggling off stops indexing; toggling back on resumes at the watermark.
+    source.disableSearch()
+    const docs = store.docCount()
+    source.enableSearch(indexer)
+    indexer.flush()
+    expect(store.docCount()).toBe(docs)
   })
 
   it('replays the exact stream live emitted — derived from the store, not retained', async () => {

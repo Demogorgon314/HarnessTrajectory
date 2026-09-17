@@ -5,6 +5,7 @@ import { existsSync, statSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { serve } from '@hono/node-server'
+import type { ServerSettings } from '@harness-trajectory/core'
 import { createApp } from './app.ts'
 import { listingDbPath, searchDbPath, searchEnabled } from './cache.ts'
 import { DevinSource } from './devin/source.ts'
@@ -78,7 +79,57 @@ are editable in the UI.`)
       console.error('[harness-trajectory] search index unavailable:', error)
     }
   }
-  const settings = new SettingsController(settingsFile, search?.indexer)
+  // The Content search toggle takes effect immediately: enabling creates the
+  // service and backfills in the background; disabling stops indexing and
+  // leaves the file on disk. The state flips synchronously so the settings
+  // response reports it; the expensive backfill chains here so a fast
+  // on→off→on sequence cannot interleave two passes.
+  let searchChain: Promise<void> = Promise.resolve()
+  const applySearchToggle = (value: ServerSettings): void => {
+    if (value.contentSearch && search === undefined) {
+      let service: SearchService
+      try {
+        service = createSearchService({ path: dbPath, maxAgeDays: value.searchMaxAgeDays })
+      } catch (error) {
+        // Degrade the way startup does: the persisted value stays on, the
+        // response reports searchEnabled: false, and the next launch retries.
+        console.error('[harness-trajectory] search index unavailable:', error)
+        return
+      }
+      search = service
+      console.log('[harness-trajectory] content search enabled; indexing in the background')
+      searchChain = searchChain.then(async () => {
+        if (search !== service) return
+        const enableStarted = Date.now()
+        try {
+          await index.enableSearch(service.indexer)
+          // Toggled off while the filesystem pass was running: the service is
+          // closed — attaching it to devin or finishing its backfill now would
+          // touch a dead store and stick devin with a closed indexer.
+          if (search !== service) return
+          devin.enableSearch(service.indexer)
+          service.indexer.finishBackfill(source.livePaths())
+          let bytes = 0
+          try {
+            bytes = statSync(dbPath).size
+          } catch {
+            // In-memory or not yet flushed to disk.
+          }
+          console.log(`[harness-trajectory] search index: ${service.store.fileCount()} files, `
+            + `${service.store.docCount()} docs, ${Date.now() - enableStarted}ms, ${(bytes / 1e6).toFixed(1)} MB`)
+        } catch (error) {
+          console.error('[harness-trajectory] search backfill failed:', error)
+        }
+      })
+    } else if (!value.contentSearch && search !== undefined) {
+      index.disableSearch()
+      devin.disableSearch()
+      search.close()
+      search = undefined
+      console.log('[harness-trajectory] content search disabled; the index file stays on disk')
+    }
+  }
+  const settings = new SettingsController(settingsFile, () => search?.indexer, applySearchToggle)
   // The listing cache makes restarts cheap: unchanged transcripts are not
   // re-read at all, grown ones resume at the persisted byte offset.
   let listing: ListingCache | undefined
@@ -108,7 +159,7 @@ are editable in the UI.`)
     console.error('[harness-trajectory] watcher error:', error)
   })
   const staticDir = findStaticDir()
-  const app = createApp({ index: source, staticDir, search, settings })
+  const app = createApp({ index: source, staticDir, search: () => search, settings })
   const open = shouldOpenBrowser()
   serve({ fetch: app.fetch, port, hostname }, (info) => {
     const url = browserUrl(info.address, info.port)

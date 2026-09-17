@@ -51,8 +51,8 @@ npx @demogorgon314/harness-trajectory@latest --no-open
 ```
 
 Full-text search is off by default. Turn on **Content search** in the UI's
-settings dialog (the gear button in the sidebar) — it applies on the next
-start — or force it on for a launch:
+settings dialog (the gear button in the sidebar) — indexing starts in the
+background right away, no restart needed — or force it on for a launch:
 
 ```sh
 HARNESS_TRAJECTORY_SEARCH=1 npx @demogorgon314/harness-trajectory@latest

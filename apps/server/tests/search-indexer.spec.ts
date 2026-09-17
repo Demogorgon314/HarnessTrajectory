@@ -251,6 +251,118 @@ describe('SearchIndexer with SessionIndex', () => {
   })
 })
 
+describe('SessionIndex search hot-enable', () => {
+  let dir: string
+  let store: SearchStore
+  let indexer: SearchIndexer
+  let index: SessionIndex | null = null
+  let extractCalls = 0
+
+  const roots = (): HarnessRoot[] => [{ kind: 'claude', dir: join(dir, 'claude') }]
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'harness-trajectory-hotenable-'))
+    await mkdir(join(dir, 'claude', '-slug'), { recursive: true })
+    store = new SearchStore({ path: ':memory:' })
+    extractCalls = 0
+    indexer = new SearchIndexer({
+      store,
+      flushDelayMs: 5,
+      extract: (kind, line) => {
+        extractCalls += 1
+        return extractSearchDocs(kind, line)
+      },
+    })
+  })
+
+  afterEach(async () => {
+    index?.stop()
+    index = null
+    store.close()
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('indexes already-registered transcripts when search is enabled mid-run', async () => {
+    const path = join(dir, 'claude', '-slug', 'main-1.jsonl')
+    await writeFile(path, jsonl([
+      claudeUser('Port the trajectory viewer', 'main-1', 0),
+      claudeAssistant('Starting with the server.', 'main-1', 1000),
+    ]))
+    const live = new SessionIndex({ roots: roots(), watch: false, now: () => T0 + 60_000 })
+    index = live
+    await live.start()
+    expect(store.docCount()).toBe(0)
+
+    await live.enableSearch(indexer)
+    indexer.finishBackfill(live.livePaths())
+    expect(indexer.stats().ready).toBe(true)
+    expect(search(store, { q: 'trajectory viewer' }).groups[0]?.hits[0])
+      .toMatchObject({ fileId: 'main-1', line: 0, role: 'human' })
+    expect(store.docCount()).toBe(2)
+
+    // Appends from here on index exactly once — the backfill must not double them.
+    await appendFile(path, jsonl([claudeUser('One more prompt', 'main-1', 5000)]))
+    await live.refreshPath(path)
+    indexer.flush()
+    expect(store.docCount()).toBe(3)
+    expect(search(store, { q: 'One more prompt' }).totalHits).toBe(1)
+    expect(store.fileState(path)?.indexedLines).toBe(3)
+  })
+
+  it('resumes from the watermark when re-enabled, without re-extracting a line', async () => {
+    const path = join(dir, 'claude', '-slug', 'main-1.jsonl')
+    await writeFile(path, jsonl([
+      claudeUser('A prompt already indexed', 'main-1', 0),
+      claudeAssistant('And its answer', 'main-1', 100),
+    ]))
+    const live = new SessionIndex({ roots: roots(), watch: false, now: () => T0 + 60_000, search: indexer })
+    index = live
+    await live.start()
+    expect(store.docCount()).toBe(2)
+
+    // Toggle off, then back on: the pass sees full coverage and reads nothing.
+    live.disableSearch()
+    const extracted = extractCalls
+    await live.enableSearch(indexer)
+    indexer.finishBackfill(live.livePaths())
+    expect(extractCalls).toBe(extracted)
+    expect(store.docCount()).toBe(2)
+    expect(search(store, { q: 'already indexed' }).totalHits).toBe(1)
+  })
+
+  it('indexes an append that lands mid-pass exactly once', async () => {
+    // Enough files that the pass spans several event-loop turns even at
+    // concurrency 1; the append below lands while earlier files are read.
+    for (let i = 0; i < 20; i += 1) {
+      await writeFile(join(dir, 'claude', '-slug', `main-${i}.jsonl`), jsonl([
+        claudeUser(`Prompt number ${i}`, `main-${i}`, 0),
+      ]))
+    }
+    // No timed flush may land a watermark before the pass reaches the
+    // appended file: the only commits are the explicit ones below.
+    const slowStore = new SearchStore({ path: ':memory:' })
+    const slowIndexer = new SearchIndexer({ store: slowStore, flushDelayMs: 60_000 })
+    const live = new SessionIndex({ roots: roots(), watch: false, now: () => T0 + 60_000, backfillConcurrency: 1 })
+    index = live
+    await live.start()
+
+    const paths = live.livePaths()
+    const last = paths[paths.length - 1]
+    if (last === undefined) throw new Error('expected registered transcripts')
+    const pending = live.enableSearch(slowIndexer)
+    // The consume path and the backfill's re-read overlap on this file; the
+    // line must still land in the index exactly once.
+    await appendFile(last, jsonl([claudeUser('Late arriving prompt', 'main-late', 1000)]))
+    await live.refreshPath(last)
+    await pending
+    slowIndexer.finishBackfill(live.livePaths())
+    expect(search(slowStore, { q: 'Late arriving prompt' }).totalHits).toBe(1)
+    expect(slowStore.docCount()).toBe(21)
+    expect(slowStore.fileState(last)?.indexedLines).toBe(2)
+    slowStore.close()
+  })
+})
+
 describe('SearchIndexer', () => {
   let store: SearchStore
 
