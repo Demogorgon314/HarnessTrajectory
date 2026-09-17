@@ -131,7 +131,7 @@ describe('kimi synthesizer → fold', () => {
     const view = fold(SESSION)
     expect(view.model).toBe('k3')
     expect(view.provider).toBe('kimi-for-coding')
-    expect(view.contextWindow).toBe(1_048_576)
+    expect(view.contextWindow).toBeUndefined()
   })
 
   it('counts only human messages as human inputs', () => {
@@ -236,7 +236,7 @@ describe('kimi synthesizer → fold', () => {
     expect(models).toHaveLength(1)
     expect([models[0]?.from, models[0]?.to]).toEqual(['k3', 'k3-256k'])
     expect(view.current.system).toBeGreaterThan(0)
-    expect(view.contextWindow).toBe(262_144)
+    expect(view.contextWindow).toBeUndefined()
   })
 
   it('keeps an interrupted step out of the priced requests but on the surface', () => {

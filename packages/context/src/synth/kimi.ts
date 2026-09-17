@@ -53,6 +53,7 @@ import {
 import type { ContentBlock, MessageSource, StreamRecord, TimelineEvent } from '../fold/event.ts'
 import type { FileOpInput } from '../fold/fold.ts'
 import type { AgentSpawn, EventSynthesizer, SynthMeta } from './types.ts'
+import { disjointInput, setRequestInput } from './requestInput.ts'
 
 /** Label length cap, matching the Claude/Codex synthesizers' session titles. */
 const LABEL_MAX = 80
@@ -121,7 +122,7 @@ class KimiSynthesizer implements EventSynthesizer {
   /** Whether `model` came from an `llm.request` (authoritative) or the alias tail (provisional). */
   private modelFromRequest = false
   private provider = PROVIDER_PUBLIC
-  private contextWindow: number | undefined
+  private auxiliaryRequest = false
   private label: string | undefined
   /** `runtime.set_binding.agentId` — this file's own agent id. */
   private agentId: string | undefined
@@ -233,7 +234,6 @@ class KimiSynthesizer implements EventSynthesizer {
     return {
       ...(this.model === undefined ? {} : { model: this.model }),
       provider: this.provider,
-      ...(this.contextWindow === undefined ? {} : { contextWindow: this.contextWindow }),
       ...(this.label === undefined ? {} : { label: this.label }),
       // Liveness is the prompt lifecycle, not the step buffer: a turn is
       // running from `turn.prompt`/`turn.steer` (or a step opening) until
@@ -382,10 +382,17 @@ class KimiSynthesizer implements EventSynthesizer {
 
   /**
    * `llm.request` names the model actually dispatched (`k3`), the alias (the
-   * pricing provider) and `maxTokens` — which is the model's context window,
-   * the only place Kimi records it.
+   * pricing provider). `maxTokens` is a completion cap in current builds;
+   * older recordings do not identify its semantics, so it supplies no window.
    */
   private onRequest(record: Record<string, unknown>, time: number, out: TimelineEvent[]): void {
+    this.auxiliaryRequest = asString(record['kind']) === 'compaction'
+    if (this.auxiliaryRequest) {
+      this.flushStep(out, time, undefined)
+      this.pendingUsage = undefined
+      this.responseEnd = undefined
+      return
+    }
     this.applyAlias(asString(record['modelAlias']))
     const model = asString(record['model'])
     if (model !== undefined && model !== '') {
@@ -399,15 +406,6 @@ class KimiSynthesizer implements EventSynthesizer {
         this.emitHeader(out, time, 'change')
       }
     }
-    const window = asNumber(record['maxTokens'])
-    if (window !== undefined && window > 0 && window !== this.contextWindow) {
-      this.contextWindow = window
-      this.emit(out, 'request/context', time, {
-        contextWindow: window,
-        ...(this.model === undefined ? {} : { model: this.model }),
-        provider: this.provider,
-      })
-    }
   }
 
   /**
@@ -417,6 +415,7 @@ class KimiSynthesizer implements EventSynthesizer {
    * completion time is computed from.
    */
   private onUsageRecord(record: Record<string, unknown>, time: number): void {
+    if (this.auxiliaryRequest || asString(record['kind']) === 'compaction') return
     const usage = usageOf(record['usage'])
     if (usage === undefined) return
     this.pendingUsage = usage
@@ -631,6 +630,7 @@ class KimiSynthesizer implements EventSynthesizer {
       step: open.step,
       ...(stream.length === 0 ? {} : { stream }),
     })
+    setRequestInput(out.at(-1), disjointInput(usage, this.model))
     let calls = 0
     for (const block of open.blocks) {
       if (block.type !== 'tool-call' || block.callId === undefined) continue
@@ -932,7 +932,7 @@ function usageOf(value: unknown): Record<string, number> | undefined {
     return undefined
   }
   return {
-    inputTokens: Math.max(0, input ?? 0),
+    ...(input === undefined ? {} : { inputTokens: input }),
     ...(cacheRead === undefined ? {} : { cacheReadTokens: cacheRead }),
     ...(cacheWrite === undefined ? {} : { cacheWriteTokens: cacheWrite }),
     outputTokens: output ?? 0,

@@ -35,6 +35,8 @@ import { applyTimeline, buildTimelineView, createTimelineState } from './fold.ts
 import type { HeadersState, ToolSourceResolver } from './headers.ts'
 import { applyHeaders, buildHeadersView, createHeadersState } from './headers.ts'
 import { toolSourceOf } from './toolSources.ts'
+import type { InputEvent } from '../synth/requestInput.ts'
+import { addRequestInput, type RequestInputSummary } from '../shared/requestInput.ts'
 
 export interface ContextSessionOptions {
   /** Retention bounds for every file's fold (defaults: config.ts DEFAULT_BOUNDS). */
@@ -51,6 +53,7 @@ export interface ContextSessionOptions {
 }
 
 interface FileFold {
+  requestInput: RequestInputSummary
   file: SessionFileRef
   synth: EventSynthesizer
   timeline: TimelineState
@@ -163,7 +166,7 @@ export class ContextSession {
    */
   push(line: string, file: SessionFileRef): void {
     const fold = this.foldFor(file)
-    let events: readonly TimelineEvent[]
+    let events: readonly InputEvent[]
     try {
       events = fold.synth.push(line)
     } catch {
@@ -171,6 +174,14 @@ export class ContextSession {
     }
     for (const event of events) {
       const timeline = applyTimeline(fold.timeline, event, this.bounds, this.costPeriod)
+      if (event.requestInput !== undefined && event.data?.replay !== true) {
+        const input = event.requestInput
+        const request = timeline.requests.at(-1)
+        const estimated = input.source === 'estimated' && input.tokens === undefined && request?.seq === event.seq
+          ? { ...input, tokens: request.total } : input
+        fold.requestInput = addRequestInput(fold.requestInput, estimated, event.seq, event.time)
+        fold.rev++
+      }
       if (timeline !== fold.timeline) {
         fold.timeline = timeline
         fold.rev++
@@ -208,6 +219,7 @@ export class ContextSession {
     const cached = fold.timelineView
     if (cached !== undefined && cached.rev === fold.rev) return cached.value
     const value = buildTimelineView(fold.timeline, this.bounds)
+    value.requestInput = fold.requestInput
     fold.timelineView = { rev: fold.rev, value }
     return value
   }
@@ -256,6 +268,7 @@ export class ContextSession {
       return existing
     }
     const fold: FileFold = {
+      requestInput: { calls: 0, reported: 0, estimated: 0, withWindow: 0 },
       file,
       synth: this.factory(file),
       timeline: createTimelineState(),

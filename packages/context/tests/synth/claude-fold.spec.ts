@@ -187,7 +187,7 @@ describe('claude synthesizer → fold', () => {
   it('reports the route the synthesizer inferred', () => {
     expect(view.model).toBe('claude-opus-4')
     expect(view.provider).toBe('anthropic')
-    expect(view.contextWindow).toBe(200_000)
+    expect(view.contextWindow).toBeUndefined()
   })
 
   it('books one completed tool call and its timing', () => {

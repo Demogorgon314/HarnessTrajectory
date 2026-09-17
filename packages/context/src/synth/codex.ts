@@ -23,6 +23,8 @@ import { asArray, asNumber, asString, codexUserItems, isRecord, parseJsonLine, p
 import type { ContentBlock, MessageSource, StreamRecord, TimelineEvent } from '../fold/event.ts'
 import type { FileOpInput } from '../fold/fold.ts'
 import type { AgentSpawn, EventSynthesizer, SynthMeta } from './types.ts'
+import { measuredInput, setRequestInput } from './requestInput.ts'
+import type { RequestInput } from '../shared/requestInput.ts'
 
 /** Label length cap, matching the Claude synthesizer's session title. */
 const LABEL_MAX = 80
@@ -46,6 +48,7 @@ const OUTPUT_TYPES = new Set(['function_call_output', 'custom_tool_call_output',
 
 /** One model response being accumulated (Codex logs its blocks as separate lines). */
 interface OpenGroup {
+  input: RequestInput
   blocks: ContentBlock[]
   /** Completion instant of each block, parallel to `blocks`. */
   blockTimes: number[]
@@ -96,6 +99,8 @@ class CodexSynthesizer implements EventSynthesizer {
   private model: string | undefined
   private provider = DEFAULT_PROVIDER
   private contextWindow: number | undefined
+  /** task_started can report the next route's window before turn_context names its model. */
+  private windowAwaitingModel = false
   private label: string | undefined
   /** Label for a thread with no human prompt of its own (a subagent thread). */
   private fallbackLabel: string | undefined
@@ -385,9 +390,16 @@ class CodexSynthesizer implements EventSynthesizer {
     if (this.headerPending) {
       this.model = model
       this.flushHeader(out, time)
+      this.windowAwaitingModel = false
       return
     }
-    if (this.model === model) return
+    if (this.model === model) {
+      this.windowAwaitingModel = false
+      return
+    }
+    this.closeGroup(out, time, undefined)
+    if (!this.windowAwaitingModel) this.contextWindow = undefined
+    this.windowAwaitingModel = false
     this.model = model
     this.emit(out, 'request/header', time, {
       header: {
@@ -397,6 +409,9 @@ class CodexSynthesizer implements EventSynthesizer {
       },
       reason: 'change',
     })
+    if (this.contextWindow !== undefined) {
+      this.emit(out, 'request/context', time, { model, contextWindow: this.contextWindow, provider: this.provider })
+    }
   }
 
   private onTurnContext(payload: Record<string, unknown>, time: number, out: TimelineEvent[]): void {
@@ -431,6 +446,7 @@ class CodexSynthesizer implements EventSynthesizer {
         this.lastInputTime = started
         this.openStep(out, started)
         this.applyContextWindow(out, asNumber(payload['model_context_window']), started)
+        this.windowAwaitingModel = (asNumber(payload['model_context_window']) ?? 0) > 0
         return
       }
       case 'task_complete':
@@ -451,6 +467,8 @@ class CodexSynthesizer implements EventSynthesizer {
           const usage = usageOf(info['last_token_usage'])
           if (usage !== undefined && this.group !== null) {
             this.group.fallbackUsage = usage
+            const raw = info['last_token_usage']
+            this.group.input = { ...this.group.input, ...measuredInput(isRecord(raw) ? raw['input_tokens'] : undefined, this.model) }
             this.lastContextTokens = contextTokensOf(info['last_token_usage']) ?? this.lastContextTokens
           }
         }
@@ -520,6 +538,7 @@ class CodexSynthesizer implements EventSynthesizer {
   private applyContextWindow(out: TimelineEvent[], window: number | undefined, time: number): void {
     if (window === undefined || window <= 0 || window === this.contextWindow) return
     this.contextWindow = window
+    if (this.group !== null) this.group.input.window = { tokens: window, source: 'recorded', kind: 'usable' }
     this.emit(out, 'request/context', time, {
       contextWindow: window,
       ...(this.model === undefined ? {} : { model: this.model }),
@@ -986,12 +1005,18 @@ class CodexSynthesizer implements EventSynthesizer {
     // The header must be folded before the first request it describes.
     if (this.headerPending) this.flushHeader(out, time)
     const group: OpenGroup = {
+      input: {
+        source: 'estimated',
+        ...(this.model === undefined ? {} : { model: this.model }),
+        ...(this.contextWindow === undefined ? {} : { window: { tokens: this.contextWindow, source: 'recorded', kind: 'usable' } }),
+      },
       blocks: [],
       blockTimes: [],
       stepStart: this.stepStartTime === 0 ? time : this.stepStartTime,
       lastTime: time,
     }
     this.group = group
+    this.windowAwaitingModel = false
     return group
   }
 
@@ -1020,6 +1045,7 @@ class CodexSynthesizer implements EventSynthesizer {
       step: this.step,
       ...(stream.length === 0 ? {} : { stream }),
     })
+    setRequestInput(out.at(-1), group.input)
     let calls = 0
     for (const block of group.blocks) {
       if (block.type !== 'tool-call' || block.callId === undefined) continue
@@ -1043,6 +1069,8 @@ class CodexSynthesizer implements EventSynthesizer {
   private onTokenUsage(payload: Record<string, unknown>, time: number, out: TimelineEvent[]): void {
     this.lastContextTokens = contextTokensOf(payload['usage']) ?? this.lastContextTokens
     if (this.group !== null) {
+      const raw = payload['usage']
+      this.group.input = { ...this.group.input, ...measuredInput(isRecord(raw) ? raw['input_tokens'] : undefined, this.group.input.model) }
       this.closeGroup(out, time, usageOf(payload['usage']))
       return
     }

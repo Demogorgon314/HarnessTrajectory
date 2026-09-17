@@ -273,7 +273,7 @@ describe('kimi adapter', () => {
     const request = parser.snapshot().requests.find(item => item.startSeq === first?.seq)
     expect(request?.usage).toEqual(first?.usage)
     expect(request?.provenance).toEqual({ provider: 'kimi-for-coding', model: 'k3' })
-    // Kimi's `maxTokens` is the context window, not a generation cap.
+    // Preserve the wire's request limit; do not reinterpret it as a context window.
     expect(request?.requestConfig).toEqual({
       provider: 'kimi-for-coding', model: 'k3', reasoningEffort: 'high', maxTokens: 1_048_576,
     })

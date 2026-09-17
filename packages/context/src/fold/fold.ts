@@ -1022,7 +1022,10 @@ export function applyTimeline(
         // (request/context is only route/capacity metadata, appended AFTER
         // request/header per request). Optional fields are set conditionally
         // so a still-unknown value never materializes an `undefined` property.
-        if (header.config && typeof header.config.model === 'string') s.model = header.config.model
+        if (header.config && typeof header.config.model === 'string') {
+          if (s.model !== undefined && s.model !== header.config.model) delete s.contextWindow
+          s.model = header.config.model
+        }
         if (header.config && typeof header.config.provider === 'string') s.provider = header.config.provider
         // A model switch has no dedicated event: it is a request header that
         // differs from the previous one, logged with reason 'change'
@@ -1069,7 +1072,8 @@ export function applyTimeline(
         const s = ensure()
         // Route/capacity metadata: request/context is logged only when the route or capacity changes (after request/header), so it updates
         // the current route display — never firing a model-switch event on its own.
-        if (data && typeof data.contextWindow === 'number') s.contextWindow = data.contextWindow
+        if (data && typeof data.model === 'string' && s.model !== data.model) delete s.contextWindow
+        if (data && typeof data.contextWindow === 'number' && Number.isFinite(data.contextWindow) && data.contextWindow > 0) s.contextWindow = data.contextWindow
         if (data && typeof data.model === 'string') s.model = data.model
         if (data && typeof data.provider === 'string') s.provider = data.provider
         break
@@ -1392,8 +1396,8 @@ export function applyTimeline(
           // tokens between the two write rates, never invent billed tokens.
           const cacheWrite1h = Math.min(tokenCountOf(usage.cacheWrite1hTokens) ?? 0, cacheWrite ?? 0)
           // Any readable bucket is a billing sample (an output-only sample
-          // bills prompt 0). A fully unreadable object is treated as absent, so
-          // a fabricated 0 never reaches the client's derived-occupancy anchor.
+          // bills prompt 0). Request input measurements live separately in
+          // ContextSession; they never treat missing input as a measured zero.
           if (input !== null || cacheRead !== null || cacheWrite !== null || output !== null) {
             record.prompt = (input ?? 0) + (cacheRead ?? 0) + (cacheWrite ?? 0)
             // Cache-hit share of the billed prompt: keep the cache-served half

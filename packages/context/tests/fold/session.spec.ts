@@ -9,6 +9,7 @@ import type { SessionFileRef } from '@harness-trajectory/core'
 import type { TimelineEvent } from '../../src/fold/event.ts'
 import type { AgentSpawn, EventSynthesizer, SynthMeta, SynthesizerFactory } from '../../src/synth/types.ts'
 import { ContextSession } from '../../src/fold/session.ts'
+import type { InputEvent } from '../../src/synth/requestInput.ts'
 
 const MAIN: SessionFileRef = { id: 'main', role: 'main', path: '/sessions/main.jsonl' }
 const CHILD: SessionFileRef = { id: 'agent-1', role: 'child', path: '/sessions/agent-1.jsonl', parentId: 'main' }
@@ -20,7 +21,7 @@ const CHILD2: SessionFileRef = { id: 'agent-2', role: 'child', path: '/sessions/
  * Anything unparseable emits nothing, exactly like a real synthesizer.
  */
 interface FakeLine {
-  events?: TimelineEvent[]
+  events?: InputEvent[]
   meta?: Partial<Omit<SynthMeta, 'children'>> & { children?: [string, AgentSpawn][] }
   throws?: true
 }
@@ -51,6 +52,47 @@ function fakeFactory(): SynthesizerFactory {
 }
 
 const line = (value: FakeLine): string => JSON.stringify(value)
+
+describe('whole-agent input measurements', () => {
+  test('retains independent input and occupancy peaks across trimming, model changes and child activity', () => {
+    const session = new ContextSession('codex', fakeFactory(), { bounds: { maxRequestSteps: 1 } })
+    const first: InputEvent = { ...assistantEvent(1, 'a'), requestInput: {
+      source: 'reported', tokens: 180_000, model: 'small', window: { tokens: 200_000, source: 'recorded', kind: 'usable' },
+    } }
+    const second: InputEvent = { ...assistantEvent(2, 'b'), requestInput: {
+      source: 'reported', tokens: 300_000, model: 'large', window: { tokens: 1_000_000, source: 'recorded', kind: 'usable' },
+    } }
+    session.push(line({ events: [first, second] }), MAIN)
+    const before = session.timelineOf(MAIN.id)
+    assert.equal(before?.requests.length, 1)
+    assert.equal(before?.requestInput?.peak?.tokens, 300_000)
+    assert.equal(before?.requestInput?.highestRatio?.seq, 1)
+    session.push(line({ events: [{ ...second, seq: 3, requestInput: { source: 'reported', tokens: 900_000 } }] }), CHILD)
+    assert.equal(session.timelineOf(MAIN.id), before)
+    session.push(line({ events: [{ ...assistantEvent(3, 'c'), requestInput: { source: 'reported', tokens: 1 } }] }), MAIN)
+    assert.equal(session.timelineOf(MAIN.id)?.requestInput?.peak?.tokens, 300_000)
+    assert.equal(before?.requestInput?.calls, 2, 'published snapshots stay immutable')
+    const replay = new ContextSession('codex', fakeFactory(), { bounds: { maxRequestSteps: 1 } })
+    replay.push(line({ events: [first, second] }), MAIN)
+    assert.deepEqual(replay.timelineOf(MAIN.id)?.requestInput, before?.requestInput)
+  })
+
+  test('keeps estimates, unknowns and real zero distinct and ignores retained-context replay', () => {
+    const session = new ContextSession('claude', fakeFactory())
+    session.push(line({ events: [
+      { ...assistantEvent(1, 'a'), requestInput: { source: 'reported', tokens: 0, window: { tokens: 1_000_000, source: 'inferred', kind: 'model' } } },
+      { ...assistantEvent(2, 'b'), requestInput: { source: 'estimated', tokens: 1000 } },
+      { ...assistantEvent(3, 'c'), requestInput: { source: 'unknown' } },
+      { ...assistantEvent(4, 'd'), data: { replay: true }, requestInput: { source: 'reported', tokens: 9999 } },
+    ] }), MAIN)
+    const input = session.timelineOf(MAIN.id)?.requestInput
+    assert.equal(input?.calls, 3)
+    assert.equal(input?.reported, 1)
+    assert.equal(input?.peak?.tokens, 0)
+    assert.equal(input?.estimatedPeak?.tokens, 1000)
+    assert.equal(input?.withWindow, 0)
+  })
+})
 
 const text = (t: string) => [{ type: 'text', text: t }]
 

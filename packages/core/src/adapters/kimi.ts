@@ -21,8 +21,8 @@
  * - `llm.request.provider` is the wire protocol (`'openai'`), never the vendor.
  *   The vendor comes from `modelAlias`: `kimi-code/…` is the subscription
  *   provider `kimi-for-coding`, anything else falls back to `moonshotai`.
- * - `llm.request.maxTokens` is the **context window** (1048576 / 262144), not a
- *   generation cap — but only on `kind: 'loop'` requests. A `kind: 'compaction'`
+ * - Current `llm.request.maxTokens` is a completion cap; historical recordings
+ *   do not reliably identify its semantics. A `kind: 'compaction'`
  *   request carries no `turnStep` and its `maxTokens` is the summary model's cap
  *   (131072): it must neither open a step nor replace the window.
  * - Human vs injected input is decided by `message.origin`, never by the text
@@ -419,7 +419,7 @@ class KimiParser implements SessionParser {
   /** `llm.request.model` outranks the `profile.bind` alias tail once it is known. */
   private modelFromRequest = false
   private thinkingEffort: string | null = null
-  private contextWindow: number | null = null
+  private maxTokens: number | null = null
   private cwd: string | null = null
   private startedAt: number | null = null
   private title: string | null = null
@@ -586,7 +586,7 @@ class KimiParser implements SessionParser {
     const effort = asString(record['thinkingEffort'])
     if (effort !== undefined && effort !== '') this.thinkingEffort = effort
     const maxTokens = asNumber(record['maxTokens'])
-    if (maxTokens !== undefined) this.contextWindow = maxTokens
+    this.maxTokens = maxTokens ?? null
     // Normally `step.begin` already opened the step; a truncated head may not have.
     // `turnStep` spells `<0-based turn>.<1-based step>`.
     const parts = asString(record['turnStep'])?.split('.') ?? []
@@ -598,8 +598,8 @@ class KimiParser implements SessionParser {
       provider: this.provider,
       model: this.model ?? '',
       ...(this.thinkingEffort === null ? {} : { reasoningEffort: this.thinkingEffort }),
-      // Kimi's `maxTokens` is the context window; there is no separate field for it.
-      ...(this.contextWindow === null ? {} : { maxTokens: this.contextWindow }),
+      // Preserve the raw request limit, without interpreting it as a context window.
+      ...(this.maxTokens === null ? {} : { maxTokens: this.maxTokens }),
     }
   }
 

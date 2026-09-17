@@ -7,7 +7,7 @@
  */
 
 import type { HarnessKind, SessionFileRef } from '@harness-trajectory/core'
-import type { TimelineEvent } from '../fold/event.ts'
+import type { InputEvent } from './requestInput.ts'
 
 /** A child agent spawned from this file, keyed by the harness-native child key. */
 export interface AgentSpawn {
@@ -48,7 +48,7 @@ export interface SynthMeta {
 export interface EventSynthesizer {
   readonly kind: HarnessKind
   /** Feed one raw JSONL line; returns the fold events it produced, in order. */
-  push(line: string): readonly TimelineEvent[]
+  push(line: string): readonly InputEvent[]
   meta(): SynthMeta
 }
 

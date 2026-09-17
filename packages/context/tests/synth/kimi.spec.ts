@@ -11,6 +11,7 @@ import type { SessionFileRef } from '@harness-trajectory/core'
 import { describe, expect, it } from 'vitest'
 import type { ContentBlock, TimelineEvent } from '../../src/fold/event.ts'
 import { createKimiSynthesizer } from '../../src/synth/kimi.ts'
+import { ContextSession } from '../../src/fold/session.ts'
 
 // -----------------------------------------------------------------------------
 // Fixture helpers
@@ -160,13 +161,23 @@ const TYPICAL_TURN: string[] = [
 // -----------------------------------------------------------------------------
 
 describe('kimi synthesizer', () => {
+  it('measures disjoint input, without output, and excludes compaction model usage', () => {
+    const session = new ContextSession('kimi')
+    for (const entry of [
+      ...TYPICAL_TURN,
+      llmRequest(9, { kind: 'compaction', model: 'summary', maxTokens: 128_000 }),
+      usageRecord(10, { inputOther: 999_000, output: 100 }),
+      line(11, 'context.apply_compaction', { contextSummary: 'summary', keptUserMessageCount: 0 }),
+    ]) session.push(entry, MAIN)
+    expect(session.timelineOf(MAIN.id)?.requestInput).toMatchObject({ calls: 1, reported: 1, peak: { tokens: 3900 }, withWindow: 0 })
+    expect(session.metaOf(MAIN.id)?.model).toBe('k3')
+  })
   it('maps one ordinary turn to the documented event sequence', () => {
     const { events } = run(TYPICAL_TURN)
     expect(typesOf(events)).toEqual([
       'user/message',      // the human prompt
       'step/start',        // step.begin
       'request/header',    // the first tools_snapshot flushes the deferred header
-      'request/context',   // llm.request.maxTokens
       'assistant/message', // the whole buffered step, at its computed completion
       'tool/call',
       'tool/result',
@@ -216,16 +227,18 @@ describe('kimi synthesizer', () => {
     expect(other.synth.meta().model).toBe('kimi-k2.7-code')
   })
 
-  it('takes the context window from llm.request.maxTokens and re-emits only on change', () => {
+  it('does not interpret completion limits or compaction requests as a context window', () => {
     const { events, synth } = run([
       ...TYPICAL_TURN,
       stepBegin(9, '1', 1),
       llmRequest(9, { maxTokens: 1_048_576 }),
       llmRequest(9, { maxTokens: 262_144, model: 'k3-256k' }),
+      llmRequest(10, { kind: 'compaction', maxTokens: 131_072, model: 'summary-model' }),
     ])
     const windows = allOf(events, 'request/context').map(e => dataOf(e)['contextWindow'])
-    expect(windows).toEqual([1_048_576, 262_144])
-    expect(synth.meta().contextWindow).toBe(262_144)
+    expect(windows).toEqual([])
+    expect(synth.meta().contextWindow).toBeUndefined()
+    expect(synth.meta().model).toBe('k3-256k')
   })
 
   it('logs a model switch as a change header that repeats the system prompt', () => {

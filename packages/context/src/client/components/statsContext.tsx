@@ -24,13 +24,13 @@
  * includes. Everything else on the board stays per-agent — those cards
  * describe one context window.
  *
- * PORT ADDITION — a SECOND row of six cells (peak occupancy, wall-clock
+ * PORT ADDITION — a SECOND row of six cells (request input peak, wall-clock
  * duration, compactions, subagents, cost per human prompt, live images) fills
  * the card to its neighbour's height and answers what the count row cannot:
- * how full the window ever got, how long the session stayed open (idle time
+ * how large recorded requests got, how long the session stayed open (idle time
  * included, unlike the Timing card's active time), what maintenance it took,
- * and what one prompt cost. The two derived cells read the request records
- * (peak `prompt`, first/last stamp) — the only collections this card touches.
+ * and what one prompt cost. Input peaks use a whole-history measurement
+ * summary; duration reads the retained request/event timestamps.
  *
  * The counts arrive precomputed: the split-generation wire head carries them
  * (shared/types.ts `TimelineCounts` — computed over the retained records),
@@ -42,6 +42,7 @@
 import { type ReactElement, type ReactNode, useId } from 'react'
 import type { ModelPriceRules } from '@harness-trajectory/core'
 import type { ContextEventRecord, RequestRecord, SessionCostUsage, TimelineCounts, TokenUsage } from '../../shared/types'
+import type { RequestInputSummary } from '../../shared/requestInput'
 import { estimateSessionCost, formatCost, formatPriceRate, offRateOf, priceOf, toCurrency, unpricedCostPairs, write1hOf } from '../cost'
 import type { CostCurrency, ModelPrices, PriceTriple } from '../cost'
 import { cacheHitPercent } from '../format'
@@ -160,24 +161,6 @@ export function countsOfRecords(requests: readonly RequestRecord[], events: read
 }
 
 /**
- * PORT ADDITION — the largest prompt this agent ever sent, in tokens:
- * `RequestRecord.prompt` is the provider-reported prompt size (input +
- * cacheRead + cacheWrite), so the peak is the high-water mark of the context
- * window's occupancy. Rows folded before the fold carried `prompt` fall back
- * to their heuristic `total`. Null when no record carries a usable figure —
- * a peak of zero is not a measurement.
- */
-export function peakContextOf(requests: readonly RequestRecord[]): number | null {
-  let peak = 0
-  for (const req of requests) {
-    const value = req.prompt ?? req.total
-    if (!Number.isFinite(value)) continue
-    if (value > peak) peak = value
-  }
-  return peak > 0 ? peak : null
-}
-
-/**
  * PORT ADDITION — the session's WALL-CLOCK span: the first request's stamp to
  * the last stamp the log carries (the last request, or a later context event —
  * a compaction can land after the final request). Unlike the Timing card's
@@ -216,6 +199,7 @@ export function costPerPromptOf(cost: number | null, humanInputs: number): numbe
 }
 
 export interface StatsContextProps {
+  requestInput?: RequestInputSummary | undefined
   /** The session-shape tally (host-precomputed on the split generation). */
   counts: TimelineCounts
   /** The whole-session human-input tally (the user's messages + question answers; absent on older hosts). */
@@ -229,13 +213,11 @@ export interface StatsContextProps {
   costParts?: readonly CostPart[] | undefined
   /**
    * PORT ADDITION — the shown agent's request records, read ONLY by the two
-   * derived cells (peak occupancy, wall-clock span). Empty/absent dashes them.
+   * duration cell (wall-clock span). Empty/absent dashes it.
    */
   requests?: readonly RequestRecord[] | undefined
   /** PORT ADDITION — the shown agent's context events; only their stamps are read (a trailing compaction extends the span). */
   events?: readonly ContextEventRecord[] | undefined
-  /** PORT ADDITION — the route's context window, when the log records one: it turns the peak into a share. */
-  contextWindow?: number | undefined
   /** PORT ADDITION — image blocks live in the current context (Snapshot.images; absent reads as zero). */
   images?: number | undefined
   /** PORT ADDITION — child agents of the session, main agent excluded. Absent (not zero) dashes the cell. */
@@ -358,15 +340,17 @@ export function makeStatsContext(kit: ViewKit): (props: StatsContextProps) => Re
         <span key={index} className="lc-stat-note" title={typeof line === 'string' ? line : undefined}>{line}</span>
       ))
     }
-    // PORT ADDITION — the second row's derived figures. The peak prompt reads
-    // as a SHARE whenever the route's window is known (the figure the reader
-    // actually judges: "how full did this get"), and falls back to the token
-    // count when it is not.
-    const peak = peakContextOf(props.requests ?? [])
-    const window = props.contextWindow
-    const peakValue = peak === null ? '—'
-      : window !== undefined && window > 0 ? `${Math.round((peak / window) * 100)}%`
-        : fmt(peak)
+    const input = props.requestInput
+    const peak = input?.peak ?? input?.estimatedPeak
+    const peakValue = peak === undefined ? '—' : `${peak.source === 'estimated' ? '≈' : ''}${fmt(peak.tokens)} tokens`
+    const inputNotes: string[] = []
+    if (input !== undefined && input.calls > 0) {
+      inputNotes.push(t('stats.inputCoverage', { n: input.reported, total: input.calls }))
+      if (input.estimatedPeak !== undefined) inputNotes.push(t('stats.inputEstimate', { n: fmt(input.estimatedPeak.tokens) }))
+      const ratio = input.highestRatio
+      if (ratio?.window !== undefined) inputNotes.push(t('stats.inputRatio', { n: Math.round(100 * ratio.tokens / ratio.window.tokens) }))
+      if (input.withWindow > 0) inputNotes.push(t('stats.windowCoverage', { n: input.withWindow, total: input.calls }))
+    }
     const durationMs = durationOf(props.requests ?? [], props.events ?? [])
     const prunes = props.counts.prunes
     const compactionsTip = t('stats.compactionsTip') + (prunes > 0 ? ' ' + t('stats.compactionsPrunes', { n: prunes }) : '')
@@ -443,7 +427,7 @@ export function makeStatsContext(kit: ViewKit): (props: StatsContextProps) => Re
               figures above cannot — how full the window ever got, how long the
               session was open, what maintenance it took, how many agents and
               images it carried, and what one prompt cost. */}
-          {cell(t('stats.peakContext'), peakValue, t('stats.peakContextTip'))}
+          {cell(t('stats.peakContext'), peakValue, t('stats.peakContextTip'), notes(inputNotes))}
           {cell(t('stats.duration'), durationMs === null ? '—' : fmtDuration(durationMs), t('stats.durationTip'))}
           {cell(t('stats.compactions'), props.counts.compactions, compactionsTip)}
           {cell(t('stats.subagents'), props.subagents ?? '—', t('stats.subagentsTip'))}

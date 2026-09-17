@@ -49,10 +49,10 @@
  *     4-call turn). It is therefore APPORTIONED across the turn's calls — which
  *     is why this synthesizer is TURN-GRANULAR: a turn's events are buffered
  *     until its `turn_completed` lands and only then released, the way Kimi
- *     buffers a step. The per-call prompt size comes from `params._meta`:
- *     `streamStartMs` changes once per model call and the FIRST (minimum)
- *     `totalTokens` stamped on a stream is that call's prompt. Verified on real
- *     data (session 01a09b39): summing the per-stream minima reproduces
+ *     buffers a step. Allocation weights come from `params._meta`:
+ *     `streamStartMs` changes once per model call; the minimum `totalTokens`
+ *     is a live-context estimate, not a measured request input. In sampled
+ *     data (session 01a09b39), summing the per-stream minima reproduces
  *     `turn_completed.usage.inputTokens` within 0.05% on every settled turn
  *     (e.g. 195856+197724+198828+199227 = 791635 vs 791923 reported).
  *
@@ -87,6 +87,8 @@ import {
 import type { ContentBlock, MessageSource, StreamRecord, TimelineEvent } from '../fold/event.ts'
 import type { FileOpInput } from '../fold/fold.ts'
 import type { AgentSpawn, EventSynthesizer, SynthMeta } from './types.ts'
+import { disjointInput, setRequestInput } from './requestInput.ts'
+import type { RequestInput } from '../shared/requestInput.ts'
 
 /** Label length cap, matching the Claude/Codex/Kimi synthesizers' session titles. */
 const LABEL_MAX = 80
@@ -121,6 +123,7 @@ const TASK_CALLS_MAX = 64
 
 /** One model call being accumulated: the chunks of one response plus its tool calls. */
 interface OpenStep {
+  input: RequestInput
   turn: number
   step: number
   /** `params._meta.streamStartMs` when this call's stream opened, else the first record's time. */
@@ -149,6 +152,7 @@ interface OpenStep {
 
 /** One settled step of the turn in flight, awaiting its share of the turn's usage. */
 interface PendingStep {
+  input: RequestInput
   /** The buffered `assistant/message` the share is written into. */
   event: TimelineEvent
   /** The model call (`streamStartMs`) this step belongs to; steps sharing one made ONE request. */
@@ -170,7 +174,7 @@ export interface GrokUsage {
 export interface TurnStepUsageInput {
   /** The model call this step belongs to; consecutive steps sharing one made a single request. */
   stream: number | undefined
-  /** That call's prompt size (the first `_meta.totalTokens` on its stream), when stamped. */
+  /** Live-context estimate used only as a billing allocation weight. */
   prompt: number | undefined
   /** Characters this step emitted — the weight its share of `outputTokens` is drawn on. */
   chars: number
@@ -420,10 +424,9 @@ class GrokSynthesizer implements EventSynthesizer {
   }
 
   /**
-   * The prompt size of one model call: the first (smallest) `_meta.totalTokens`
-   * stamped on its stream (unit trap 7). Later records of the same stream carry
-   * a LARGER running total — the context grew as the response and its tool
-   * results landed — so the minimum is the figure the request went out with.
+   * A billing allocation weight: the smallest live-context estimate stamped
+   * on the stream. It can include output or estimated tool results and must
+   * never be presented as a provider-reported prompt measurement.
    */
   private notePromptSize(stream: number, meta: Record<string, unknown> | null): void {
     const total = meta === null ? undefined : asNumber(meta['totalTokens'])
@@ -478,6 +481,7 @@ class GrokSynthesizer implements EventSynthesizer {
       this.tools = [...tools]
       this.toolsKey = toolsKey
     }
+    if (this.model !== undefined && model !== this.model) this.recordedWindow = undefined
     this.model = model
     if (!this.headerEmitted) this.emitHeader(out, time, 'initial')
     else if (changed) this.emitHeader(out, time, 'change')
@@ -558,6 +562,7 @@ class GrokSynthesizer implements EventSynthesizer {
     const model = catalogModel(next)
     if (model === undefined || model === this.model) return
     const previous = this.model
+    if (previous !== undefined) this.recordedWindow = undefined
     this.model = model
     // A model switch has no dedicated fold event: it is a request header that
     // differs from the previous one. The first model ever seen opens the
@@ -672,6 +677,11 @@ class GrokSynthesizer implements EventSynthesizer {
     if (this.pending === null) this.pending = []
     this.emit(out, 'step/start', at)
     const created: OpenStep = {
+      input: {
+        source: 'estimated',
+        ...(this.model === undefined ? {} : { model: this.model }),
+        ...(this.recordedWindow === undefined ? {} : { window: { tokens: this.recordedWindow, source: 'recorded', kind: 'usable' } }),
+      },
       turn: this.turn,
       step: this.step,
       startedAt: at,
@@ -730,7 +740,7 @@ class GrokSynthesizer implements EventSynthesizer {
       step: open.step,
       ...(stream.length === 0 ? {} : { stream }),
     })
-    this.turnSteps.push({ event, stream: open.stream, chars: charsOf(open.blocks), exact: open.exact })
+    this.turnSteps.push({ event, stream: open.stream, chars: charsOf(open.blocks), exact: open.exact, input: open.input })
     this.compactionFresh = false
     for (const block of open.blocks) {
       if (block.type !== 'tool-call' || block.callId === undefined) continue
@@ -779,6 +789,17 @@ class GrokSynthesizer implements EventSynthesizer {
         }
       }
     }
+    // Billing shares are not input measurements. One stream may span several
+    // surface fragments; measure at its first fragment, before its own output.
+    let first: PendingStep | undefined
+    for (const step of steps) {
+      if (first === undefined || step.stream === undefined || step.stream !== first.stream) {
+        first = step
+        setRequestInput(first.event, first.input)
+      } else if (step.input.source === 'reported') {
+        setRequestInput(first.event, step.input)
+      }
+    }
     this.turnSteps = []
     // `streamPrompt` is NOT cleared: `streamStartMs` is an epoch instant, so a
     // key is never reused, and keeping the table makes the lookup independent
@@ -817,10 +838,22 @@ class GrokSynthesizer implements EventSynthesizer {
   private onResponseCompleted(update: Record<string, unknown>): void {
     const usage = responseUsageOf(update['usage'])
     if (usage === undefined) return
-    if (this.open !== null) this.open.exact = usage
+    const raw = update['usage']
+    const input = isRecord(raw) ? disjointInput({
+      inputTokens: raw['input_tokens'] ?? raw['inputTokens'],
+      cacheReadTokens: raw['cache_read_input_tokens'] ?? raw['cacheReadInputTokens'],
+      cacheWriteTokens: raw['cache_creation_input_tokens'] ?? raw['cacheCreationInputTokens'],
+    }, this.model) : { source: 'unknown' as const }
+    if (this.open !== null) {
+      this.open.exact = usage
+      this.open.input = { ...this.open.input, ...input }
+    }
     else {
       const last = this.turnSteps[this.turnSteps.length - 1]
-      if (last !== undefined) last.exact = usage
+      if (last !== undefined) {
+        last.exact = usage
+        last.input = { ...last.input, ...input }
+      }
     }
   }
 
@@ -1427,8 +1460,8 @@ function reconcileTotal(values: number[], total: number): void {
  * and book nothing, exactly as a step that is not a request should.
  *
  * Per group:
- *   promptSize = the first `_meta.totalTokens` on that call's stream (the real
- *                prompt the request went out with), or an even split when the
+ *   promptSize = the minimum `_meta.totalTokens` on that call's stream (an
+ *                estimated allocation weight), or an even split when the
  *                transcript stamped none;
  *   cacheRead / cacheWrite = the turn's totals split on promptSize;
  *   input      = promptSize − cacheRead − cacheWrite, clamped at 0;

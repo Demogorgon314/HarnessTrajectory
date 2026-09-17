@@ -573,8 +573,8 @@ export function makeContextView(
             cost={props.cost ?? data.cost}
             costParts={props.costParts}
             requests={requests}
+            requestInput={data.requestInput}
             events={events}
-            contextWindow={data.contextWindow}
             images={data.images}
             // Children of the SESSION, not of the shown agent: the board's
             // cost and cache-hit cells already answer for the whole family,

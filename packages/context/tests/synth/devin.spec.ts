@@ -136,6 +136,14 @@ const sidecar = (overrides: Record<string, unknown> = {}): string => JSON.string
 })
 
 describe('devin synthesizer', () => {
+  it('keeps ambiguous cached-input semantics unknown and excludes replayed responses', () => {
+    const synth = createDevinSynthesizer(MAIN)
+    const input = synth.push(assistantMsg({ text: 'answer', metrics: { input_tokens: 10, cache_read_tokens: 20, output_tokens: 3 } })(1, 1))
+      .flatMap(event => event.requestInput === undefined ? [] : [event.requestInput])
+    expect(input).toEqual([{ source: 'unknown', model: 'swe-1.5' }])
+    const replay = synth.push(assistantMsg({ text: 'answer' })(2, 2, { kept: true, mid: 'a-1' }))
+    expect(replay.flatMap(event => event.requestInput === undefined ? [] : [event.requestInput])).toEqual([])
+  })
   it('emits header, user, assistant, tool call/result in fold order', () => {
     const synth = createDevinSynthesizer(MAIN)
     const events = feed(synth, [

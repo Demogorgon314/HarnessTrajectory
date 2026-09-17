@@ -6,8 +6,11 @@ constraints in sync with the implementation and its regression tests.
 
 ## Claude
 
-Context window is not recorded; assume 200k, 1M when the model tag is `[1m]`. A main session's
-cost includes its subagents. Subagent files bind through `.meta.json`.
+Context window is not recorded. Only `[1m]` supplies an inferred 1M capacity;
+neither an ordinary model id nor a prompt exceeding 200k establishes a window.
+Request input is input + cache read + cache creation (output excluded); multi-iteration
+aggregate usage is not a single input measurement. A main session's cost includes its
+subagents. Subagent files bind through `.meta.json`.
 
 ## Codex
 
@@ -38,6 +41,12 @@ continue from the surviving history, and markers never become user turns;
 the core adapter records a `turn-error` node.
 
 ### Turn and response lifecycle
+
+Request input measurements use the response's raw `input_tokens` (cache already included),
+independently of billing normalization. `model_context_window` is the CLI's usable capacity,
+which can reserve model headroom; bind it to the call, never to the whole history. Model
+changes without a new window clear the prior capacity. Compaction billing calls are excluded
+from request-input peaks.
 
 `task_started`/`task_complete` carry `turn_id` and delimit turns; extra user input inside an
 open turn is steering, not a new turn. A `token_usage_record` settles the response it closes
@@ -109,6 +118,13 @@ but isn't: a subagent's delegated prompt is `system_trigger`/`subagent`, the one
 CLI itself displays as a prompt, so `kimiMessageClass` counts it as human (titles skip its
 `<git-context>` prelude via `kimiTitleText`).
 
+Current `llm.request.maxTokens` comes from `maxCompletionTokens`, not the context window.
+Older wire records do not reliably identify the field's semantics: preserve the raw request
+limit in Trajectory but do not infer a Context window from it. Ordinary input measurements
+sum `inputOther + inputCacheRead + inputCacheCreation`, excluding output. Missing input is
+unknown even if output is reported. Compaction requests and their usage must not change the
+ordinary model route or provide ordinary request-input samples.
+
 ### Compaction
 
 An `llm.request` with `kind: 'compaction'` is not a loop step: it has no `turnStep` and its
@@ -142,7 +158,12 @@ server's blob route.
 
 Parse only `updates.jsonl` (`chat_history.jsonl` is a derived cache, `events.jsonl` is
 telemetry). Envelope `timestamp` is seconds, `_meta.agentTimestampMs` is ms. Usage arrives per
-turn in `turn_completed`; per-call split uses each stream's first `_meta.totalTokens`. Children
+turn in `turn_completed`; billing allocation uses each stream's minimum `_meta.totalTokens`.
+That field is a live-context estimate (including post-response additions), not measured
+request input. Only a per-call `response_completed.usage` supplies reported input; otherwise
+the viewer labels the reconstructed input estimate separately. One stream's multiple
+surface fragments are one measurement. Recorded windows apply only to their model epoch;
+the catalog fallback never supplies a measured historical occupancy ratio. Children
 are top-level session dirs bound through the parent's `subagents/<id>/meta.json`, never by tool
 call id. Title, cwd, system prompt, and tool schemas live outside the JSONL and reach the
 parsers through the server's sidecar line.
@@ -152,6 +173,10 @@ parsers through the server's sidecar line.
 No JSONL transcripts — `sessions.db` (WAL, live-written) holds `sessions`, `message_nodes`,
 `tool_call_state`; `subagent_heads` exists but is empty in practice. Column timestamps are
 epoch SECONDS; `chat_message.metadata.created_at`/`started_generation_at` are ISO ms.
+
+Without upstream source or a verified protocol, `metrics.input_tokens` may include cached
+input or exclude it. Preserve existing billing behavior, but mark request input unknown;
+do not infer a window. Re-rendered assistant copies are never new measurements.
 
 ### Chain identity
 
@@ -260,3 +285,18 @@ are watched (the WAL is attached lazily once it exists — fs.watch only buys pr
 s poll is the correctness path). The `sessions` row's title/cwd/model re-seed the meta scanner
 in place on change — never re-created, or promptCount and the mid-dedup set would reset.
 `stop()` is idempotent and `start()` re-runs cleanly on the same instance.
+
+## Request-input statistics (shared)
+
+Context follows dsh-context's fold vocabulary and billing buckets; Trajectory follows
+deepseek-harness. Port-owned `InputEvent.requestInput` metadata is consumed by ContextSession,
+outside the vendored fold event data. The per-agent summary survives request retention limits
+and excludes inherited/replayed activity and auxiliary calls. A fresh session on SSE replay
+or file reset rebuilds it from scratch. Peaks cover the loaded logical history, including
+requests preceding ordinary compaction; they never sum parent/child agents.
+
+The UI always displays input peaks in tokens. Reported and reconstructed estimates remain
+separate, with sample coverage. Highest input occupancy is the maximum of per-call
+input/window ratios using recorded windows only; it can belong to a different request from
+the maximum token count. Unknown input is distinct from measured zero. Billing-only output
+samples retain the upstream fold's zero-input accounting without becoming input measurements.

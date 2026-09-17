@@ -157,7 +157,6 @@ describe('claude synthesizer — event sequence', () => {
       'step/start',
       'request/header',
       'assistant/message',
-      'request/context',
       'tool/call',
       'tool/result',
       'step/end',
@@ -169,7 +168,7 @@ describe('claude synthesizer — event sequence', () => {
 
   it('numbers seqs strictly increasing from 1', () => {
     const events = run(typicalTurn())
-    expect(events.map(event => event.seq)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+    expect(events.map(event => event.seq)).toEqual(events.map((_, index) => index + 1))
   })
 
   it('anchors step/start at the last input record and step/end at the last tool result', () => {
@@ -353,7 +352,7 @@ describe('claude synthesizer — tool calls and results', () => {
       toolResult(5, { callId: 'c2' }),
     ])
     expect(types(events).slice(2)).toEqual([
-      'request/header', 'assistant/message', 'request/context', 'tool/call', 'tool/call',
+      'request/header', 'assistant/message', 'tool/call', 'tool/call',
       'tool/result', 'tool/result', 'step/end',
     ])
     expect(only(events, 'tool/call').map(event => data(event).callId)).toEqual(['c1', 'c2'])
@@ -535,12 +534,12 @@ describe('claude synthesizer — compaction', () => {
     const summary = first(events, 'compaction/summary')
     // Live surface nodes: u-0 (seq 1), a-2 assistant (seq 4), u-4 (seq 7), a-6 assistant (seq 9).
     // Only a-6 is preserved, so the first three are shadowed.
-    expect(data(summary).shadowedSeqs).toEqual([1, 4, 7])
+    expect(data(summary).shadowedSeqs).toEqual([1, 4, 6])
     expect(data(summary).shadowedTokenCount).toBe(130_000)
 
     const replacement = events[events.length - 1]
     expect(replacement?.type).toBe('user/message')
-    expect(replacement?.surfaceOp).toEqual({ op: 'replace', startSeq: 1, endSeq: 7 })
+    expect(replacement?.surfaceOp).toEqual({ op: 'replace', startSeq: 1, endSeq: 6 })
     expect(data(replacement).source).toEqual({
       kind: 'plugin', form: 'compaction', plugin: 'compaction', compactionId: 'boundary-1',
     })
@@ -691,14 +690,13 @@ describe('claude synthesizer — images', () => {
 })
 
 describe('claude synthesizer — context window', () => {
-  it('assumes 200k and emits request/context once', () => {
+  it('leaves an unrecorded window unknown', () => {
     const events = run(typicalTurn())
     const contexts = only(events, 'request/context')
-    expect(contexts).toHaveLength(1)
-    expect(data(contexts[0])).toMatchObject({ contextWindow: 200_000, provider: 'anthropic' })
+    expect(contexts).toHaveLength(0)
   })
 
-  it('switches to 1M when a prompt exceeds the 200k window', () => {
+  it('does not infer a 1M window from a large prompt', () => {
     const events = run([
       human(0, 'hello'),
       assistantBlock(2, { requestId: 'r1', index: 0, block: textBlock('a'), usage: usage(10, 0, 0, 5), stopReason: 'end_turn' }),
@@ -706,7 +704,7 @@ describe('claude synthesizer — context window', () => {
       assistantBlock(6, { requestId: 'r2', index: 0, block: textBlock('b'), usage: usage(100_000, 150_000, 0, 5), stopReason: 'end_turn' }),
       human(8, 'third'),
     ])
-    expect(only(events, 'request/context').map(event => data(event).contextWindow)).toEqual([200_000, 1_000_000])
+    expect(only(events, 'request/context')).toEqual([])
   })
 
   it('reads the 1M marker off the model id', () => {
@@ -864,7 +862,7 @@ describe('claude synthesizer — robustness', () => {
       { type: 'assistant', uuid: 'a', timestamp: at(1), requestId: 'r1' },
       { type: 'user', uuid: 'u', timestamp: at(2) },
     ])
-    expect(types(events)).toEqual(['step/start', 'assistant/message', 'request/context', 'step/end', 'user/message'])
+    expect(types(events)).toEqual(['step/start', 'assistant/message', 'step/end', 'user/message'])
     expect((data(first(events, 'assistant/message')).message as { content: unknown[] }).content).toEqual([])
   })
 

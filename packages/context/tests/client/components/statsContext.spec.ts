@@ -5,7 +5,7 @@
 // second row (peak occupancy, wall-clock duration, compactions, subagents,
 // cost per prompt, live images) — in both locales, against an injected
 // model-price book (the store never reaches the network). The derived row's
-// pure model (peakContextOf / durationOf / costPerPromptOf) is pinned on its
+// pure model (durationOf / costPerPromptOf) is pinned on its
 // own below the render tests. The context-event tallies live
 // on the events card's kind filters (contextView.spec.ts); `countsOfRecords`
 // still derives every count the split generation's wire head carries, pinned
@@ -14,7 +14,8 @@
 import { createElement as h } from 'react'
 import assert from '../helpers/assert.ts'
 import { describe, test, beforeEach, afterEach } from 'vitest'
-import { costPerPromptOf, countsOfRecords, durationOf, makeStatsContext, peakContextOf } from '../../../src/client/components/statsContext'
+import { costPerPromptOf, countsOfRecords, durationOf, makeStatsContext } from '../../../src/client/components/statsContext'
+import { addRequestInput } from '../../../src/shared/requestInput'
 import { resetModelPrices, setModelPricesLoader } from '../../../src/client/modelPrices'
 import type { ContextEventRecord, RequestRecord, SessionCostUsage, TokenUsage } from '../../../src/shared/types'
 import { flush, makeKit, mount, queryAll, text } from '../helpers/kit'
@@ -101,7 +102,7 @@ describe('StatsContext', () => {
     assert.equal(labels.length, 12)
     assert.deepEqual(labels, [
       'Turns', 'Steps', 'Human Inputs?', 'Tool Calls', 'Cache Hit?', 'Cost?',
-      'Peak Context?', 'Duration?', 'Compactions?', 'Subagents?', 'Cost / Prompt?', 'Images?',
+      'Peak Request Input?', 'Duration?', 'Compactions?', 'Subagents?', 'Cost / Prompt?', 'Images?',
     ])
     // 1M uncached input at the book's $0.15 miss rate; $0.15 over 7 prompts is
     // $0.021. No records were handed in, so the two derived cells dash, and a
@@ -361,7 +362,7 @@ describe('StatsContext', () => {
     const { labels, values } = cells(m.container)
     assert.deepEqual(labels, [
       '轮次', '步数', '用户输入?', '工具调用', '缓存命中?', '预估费用?',
-      '峰值上下文?', '总时长?', '压缩次数?', '子 Agent?', '每次输入费用?', '图片?',
+      '请求输入峰值?', '总时长?', '压缩次数?', '子 Agent?', '每次输入费用?', '图片?',
     ])
     // $0.15 / 0.15 = ¥1; the rates convert through the same fixed rate.
     assert.deepEqual(values, ['1', '1', '0', '0', '66.66%', '¥1.00', '—', '—', '1', '—', '—', '0'])
@@ -485,14 +486,6 @@ function evAt(time: number, kind: ContextEventRecord['kind'] = 'compaction'): Co
 }
 
 describe('the derived row’s pure model', () => {
-  test('peakContextOf takes the provider-reported prompt, falling back to the heuristic total', () => {
-    assert.equal(peakContextOf([rec(0, { prompt: 100, total: 9_999 }), rec(1, { prompt: 300, total: 1 })]), 300)
-    // A row folded before the fold carried `prompt` contributes its own total.
-    assert.equal(peakContextOf([rec(0, { prompt: 100 }), rec(1, { total: 250 })]), 250)
-    assert.equal(peakContextOf([]), null, 'no records, no peak')
-    assert.equal(peakContextOf([rec(0)]), null, 'an all-zero log is not a measurement')
-  })
-
   test('durationOf spans the first request to the last stamp in the log', () => {
     assert.equal(durationOf([], []), null)
     assert.equal(durationOf([rec(1_000)], []), null, 'one stamp spans nothing')
@@ -519,27 +512,34 @@ describe('StatsContext — the derived second row', () => {
     rec(900_000, { prompt: 8_000, total: 8_000 }),
   ]
 
-  test('the peak prompt reads as a share of the window, and as tokens without one', async () => {
+  test('input stays in tokens and historical occupancy uses the recorded request window', async () => {
+    let input = addRequestInput({ calls: 0, reported: 0, estimated: 0, withWindow: 0 }, {
+      source: 'reported', tokens: 180_000, window: { tokens: 200_000, source: 'recorded', kind: 'usable' },
+    }, 1, 1)
+    input = addRequestInput(input, { source: 'reported', tokens: 300_000, window: { tokens: 1_000_000, source: 'recorded', kind: 'usable' } }, 2, 2)
     const m = await mount(h(StatsContext, {
       counts: { turns: 0, steps: 3, injects: 0, compactions: 0, prunes: 0 },
       usage: null,
       requests: [rec(0, { prompt: 148_000, total: 148_000 })],
-      contextWindow: 200_000,
+      requestInput: input,
       locale: 'en',
     }))
     await flush()
-    assert.equal(cells(m.container).values[6], '74%')
-    assert.ok(text(queryAll(m.container, '.lc-stat-tip')[3]!).includes('share of the context window'))
+    assert.equal(cells(m.container).values[6], '300.0k tokens')
+    assert.ok(text(m.container).includes('Highest input occupancy: 90%'))
     await m.unmount()
     // No window recorded: the cell falls back to the token formatter.
     const m2 = await mount(h(StatsContext, {
       counts: { turns: 0, steps: 3, injects: 0, compactions: 0, prunes: 0 },
       usage: null,
       requests: PROMPTS,
+      requestInput: addRequestInput(input, { source: 'estimated', tokens: 900_000 }, 3, 3),
       locale: 'en',
     }))
     await flush()
-    assert.equal(cells(m2.container).values[6], '369.2k')
+    assert.equal(cells(m2.container).values[6], '300.0k tokens')
+    assert.ok(text(m2.container).includes('Separate estimated peak: ≈900.0k tokens'))
+    assert.ok(text(m2.container).includes('Recorded input: 2/3 calls'))
     await m2.unmount()
   })
 
@@ -672,16 +672,16 @@ describe('StatsContext — the derived second row', () => {
       counts: { turns: 0, steps: 0, injects: 0, compactions: 1, prunes: 2 },
       usage: null,
       requests: PROMPTS,
-      contextWindow: 400_000,
       subagents: 1,
+      requestInput: addRequestInput({ calls: 0, reported: 0, estimated: 0, withWindow: 0 }, { source: 'estimated', tokens: 369_200 }, 1, 1),
       images: 2,
       locale: 'zh',
     }))
     await flush()
     const values = cells(m.container).values
-    assert.deepEqual(values.slice(6), ['92%', '15m0s', '1', '1', '—', '2'])
+    assert.deepEqual(values.slice(6), ['≈369.2k tokens', '15m0s', '1', '1', '—', '2'])
     const tips = queryAll(m.container, '.lc-stat-tip').map(el => text(el))
-    assert.ok(tips[3]!.includes('上下文窗口'))
+    assert.ok(tips[3]!.includes('可用窗口'))
     assert.ok(tips[4]!.includes('耗时统计'))
     assert.equal(tips[5], '本会话执行的上下文压缩次数。 另有 2 次裁剪。')
     assert.ok(tips[6]!.includes('子 Agent'))

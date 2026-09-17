@@ -26,6 +26,7 @@ import {
 import type { ContentBlock, MessageSource, StreamRecord, TimelineEvent } from '../fold/event.ts'
 import type { FileOpRecord } from '../shared/types.ts'
 import type { AgentSpawn, EventSynthesizer, SynthMeta } from './types.ts'
+import { disjointInput, setRequestInput } from './requestInput.ts'
 
 /**
  * The `tool/result` `data.fileOps` element the fold consumes: a
@@ -36,8 +37,7 @@ import type { AgentSpawn, EventSynthesizer, SynthMeta } from './types.ts'
 type FileOpInput = Omit<FileOpRecord, 'seq' | 'tool' | 'time' | 'err'>
 
 const PROVIDER = 'anthropic'
-/** Claude's standard context window, and the extended one `[1m]` model ids select. */
-const SMALL_WINDOW = 200_000
+/** Explicit extended-window hint; ordinary model ids supply no reliable capacity. */
 const LARGE_WINDOW = 1_000_000
 /** Tools that spawn a subagent whose transcript is a separate child file. */
 const SUBAGENT_TOOLS: ReadonlySet<string> = new Set(['Agent', 'Task'])
@@ -74,6 +74,7 @@ interface PendingSpawn {
 
 /** One API response being accumulated from its per-block `assistant` records. */
 interface OpenGroup {
+  aggregateUsage?: boolean
   requestId: string
   /**
    * A second run of records under a requestId already emitted: Claude Code
@@ -159,11 +160,6 @@ function usageOf(value: unknown): Usage | undefined {
     ...(write1h === undefined ? {} : { cacheWrite1hTokens: write1h }),
     ...(output === undefined ? {} : { outputTokens: output }),
   }
-}
-
-function promptOf(usage: Usage | undefined): number {
-  if (usage === undefined) return 0
-  return (usage.inputTokens ?? 0) + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0)
 }
 
 function stringifyArgs(input: unknown): string {
@@ -272,7 +268,6 @@ class ClaudeSynthesizer implements EventSynthesizer {
   private lastTools: unknown[] = []
   private lastHeaderModel: string | undefined
   private lastWindow: number | undefined
-  private maxPrompt = 0
 
   private model: string | undefined
   private version: string | undefined
@@ -298,6 +293,7 @@ class ClaudeSynthesizer implements EventSynthesizer {
 
   meta(): SynthMeta {
     const label = this.labelOf()
+    const window = this.windowOf()
     return {
       // A transcript usually ENDS on the last block record of its last
       // response — nothing follows to close the group — so an open group alone
@@ -309,9 +305,7 @@ class ClaudeSynthesizer implements EventSynthesizer {
       children: this.children,
       provider: PROVIDER,
       ...(this.model === undefined ? {} : { model: this.model }),
-      // The window is always inferable (see `windowOf`), even before the first
-      // response — the Session Info card needs a figure, not a blank.
-      contextWindow: this.windowOf(),
+      ...(window === undefined ? {} : { contextWindow: window }),
       ...(label === undefined ? {} : { label }),
       ...(this.reportedCostUsd === undefined ? {} : { reportedCostUsd: this.reportedCostUsd }),
       ...(this.version === undefined ? {} : { version: this.version }),
@@ -467,6 +461,8 @@ class ClaudeSynthesizer implements EventSynthesizer {
     }
     const usage = usageOf(message?.usage)
     if (usage !== undefined) group.usage = usage
+    const rawUsage = message?.usage
+    if (isRecord(rawUsage) && Array.isArray(rawUsage.iterations) && rawUsage.iterations.length > 1) group.aggregateUsage = true
 
     const raw = message?.content
     const items: readonly unknown[] = typeof raw === 'string' ? [{ type: 'text', text: raw }] : asArray(raw) ?? []
@@ -526,8 +522,10 @@ class ClaudeSynthesizer implements EventSynthesizer {
     const event = this.emit(out, 'assistant/message', group.lastTime, data)
     if (group.blocks.length > 0) this.live.push({ seq: event.seq, uuids: [...group.uuids] })
 
-    if (group.usage !== undefined && !group.continuation) {
-      this.maxPrompt = Math.max(this.maxPrompt, promptOf(group.usage))
+    if (!group.continuation) {
+      const input = group.aggregateUsage === true ? { source: 'unknown' as const } : disjointInput(group.usage, group.model)
+      const window = this.windowOf()
+      setRequestInput(event, { ...input, ...(window === undefined ? {} : { window: { tokens: window, source: 'inferred', kind: 'model' } }) })
     }
     this.emitContext(group.lastTime, out)
 
@@ -913,21 +911,19 @@ class ClaudeSynthesizer implements EventSynthesizer {
 
   /**
    * ASSUMPTION — the context window is not recorded anywhere in a Claude Code
-   * transcript. It is inferred: a model id carrying the `[1m]` extended-window
-   * marker, or any observed request whose billed prompt (input + cacheRead +
-   * cacheWrite) already exceeds the standard 200k window, means the session ran
-   * on the 1M window; otherwise 200k. The figure is emitted only when it
-   * changes, so a session that crosses the threshold logs one route change.
+   * transcript. Only an explicit `[1m]` hint supplies an inferred capacity.
+   * A small prompt cannot establish 200k, nor can a large one establish 1M.
    */
-  private windowOf(): number {
-    if (this.model !== undefined && this.model.includes('[1m]')) return LARGE_WINDOW
-    return this.maxPrompt > SMALL_WINDOW ? LARGE_WINDOW : SMALL_WINDOW
+  private windowOf(): number | undefined {
+    if (this.model !== undefined && /\[1m\]/i.test(this.model)) return LARGE_WINDOW
+    return undefined
   }
 
   private emitContext(time: number, out: TimelineEvent[]): void {
     const window = this.windowOf()
     if (window === this.lastWindow) return
     this.lastWindow = window
+    if (window === undefined) return
     this.emit(out, 'request/context', time, {
       contextWindow: window,
       provider: PROVIDER,

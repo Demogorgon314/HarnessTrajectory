@@ -46,6 +46,7 @@ import {
 } from '@harness-trajectory/core'
 import type { ContentBlock, MessageSource, StreamRecord, TimelineEvent } from '../fold/event.ts'
 import type { AgentSpawn, EventSynthesizer, SynthMeta } from './types.ts'
+import { setRequestInput } from './requestInput.ts'
 
 const LABEL_MAX = 80
 
@@ -449,6 +450,9 @@ class DevinSynthesizer implements EventSynthesizer {
       step: this.step,
       stream,
     })
+    // The store does not establish whether input_tokens includes cached input.
+    // Keep billing compatibility, but never promote that assumption to a measurement.
+    setRequestInput(out.at(-1), { source: 'unknown', ...(this.model === undefined ? {} : { model: this.model }) })
     for (const call of calls) {
       this.openCalls.add(call.id)
       this.emit(out, 'tool/call', time, { callId: call.id, name: call.name, arguments: call.argsRaw })

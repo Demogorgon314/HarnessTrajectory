@@ -15,6 +15,8 @@ import { describe, expect, it } from 'vitest'
 import type { ContentBlock, TimelineEvent } from '../../src/fold/event.ts'
 import type { GrokUsage, TurnStepUsageInput } from '../../src/synth/grok.ts'
 import { apportionTurnUsage, createGrokSynthesizer } from '../../src/synth/grok.ts'
+import { ContextSession } from '../../src/fold/session.ts'
+import type { InputEvent } from '../../src/synth/requestInput.ts'
 
 // -----------------------------------------------------------------------------
 // Fixture helpers
@@ -198,8 +200,8 @@ const TYPICAL_TURN: string[] = [
   sidecar(0),
   prompt(1, 'please read the file', 0),
   // `streamStartMs` + `totalTokens` are the per-model-call stamps every real
-  // record carries: a new stream is a new model call, and the FIRST
-  // `totalTokens` of a stream is that call's prompt size (20000, then 35529).
+  // record carries: a new stream is a new model call; `totalTokens` is a
+  // live-context estimate used as a billing weight (20000, then 35529).
   thought(2, 'I should read it', { streamStartMs: ms(1.5), totalTokens: 20_000 }),
   message(3, 'Reading now.', { streamStartMs: ms(1.5), totalTokens: 20_400 }),
   toolCall(4, 'call-1'),
@@ -216,6 +218,24 @@ const TYPICAL_TURN: string[] = [
 // -----------------------------------------------------------------------------
 
 describe('grok synthesizer', () => {
+  it('counts surface fragments sharing one stream as one input sample', () => {
+    const session = new ContextSession('grok')
+    for (const entry of [
+      ...TYPICAL_TURN.slice(0, -2),
+      message(7, 'continued stream', { streamStartMs: ms(1.5), totalTokens: 35_529 }),
+      turnCompleted(8, PROMPT_ID),
+    ]) session.push(entry, MAIN)
+    expect(session.timelineOf(MAIN.id)?.requestInput).toMatchObject({ calls: 1, reported: 0, estimated: 1 })
+  })
+  it('does not turn per-turn billing shares or live totalTokens into measured request input', () => {
+    const session = new ContextSession('grok')
+    for (const entry of TYPICAL_TURN) session.push(entry, MAIN)
+    const view = session.timelineOf(MAIN.id)
+    expect(view?.requestInput).toMatchObject({ calls: 2, reported: 0, estimated: 2, withWindow: 0 })
+    expect(view?.requestInput?.peak).toBeUndefined()
+    expect(view?.requestInput?.estimatedPeak?.source).toBe('estimated')
+    expect(view?.cost).toBeDefined()
+  })
   it('emits the documented event sequence for one ordinary turn', () => {
     const { events } = run(TYPICAL_TURN)
     expect(typesOf(events)).toEqual([
@@ -913,6 +933,8 @@ describe('grok synthesizer', () => {
     expect(other['cacheReadTokens']).toBe(47_232 - 30_000)
     expect(other['outputTokens']).toBe(717 - 200)
     expect((other['inputTokens'] ?? 0) + 1000).toBe(55_529 - 47_232)
+    expect((first as InputEvent).requestInput?.source).toBe('estimated')
+    expect((last as InputEvent).requestInput).toMatchObject({ source: 'reported', tokens: 31_000 })
   })
 
   it('folds a child transcript as a complete session of its own', () => {
@@ -1028,4 +1050,3 @@ describe('apportionTurnUsage', () => {
     expect(apportionTurnUsage([], TURN)).toEqual([])
   })
 })
-

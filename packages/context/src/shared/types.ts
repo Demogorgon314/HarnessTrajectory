@@ -93,6 +93,8 @@ export interface PluginSettings {
 export type SettingsField = keyof PluginSettings
 
 export interface Snapshot {
+  /** Port-owned, whole-agent request input measurements (not billing totals). */
+  requestInput?: import('./requestInput.ts').RequestInputSummary
   ok: boolean
   /**
    * The host's baseline-gate record, present ONLY when the running harness
