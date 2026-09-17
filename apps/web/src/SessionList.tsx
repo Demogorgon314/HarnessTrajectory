@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import type { SessionSummary } from '@harness-trajectory/core'
 import { icons } from '@harness-trajectory/ui'
@@ -79,6 +79,12 @@ export interface SessionListProps {
   hasMore: boolean
   loadingMore: boolean
   onLoadMore: () => void
+  /**
+   * True per-project totals under the active filters, keyed by `groupKey`
+   * (`cwd`, `''` for none). Only a page of rows is loaded, so
+   * `group.sessions.length` would under-count and grow while scrolling.
+   */
+  projectCounts: Readonly<Record<string, number>>
 }
 
 /**
@@ -89,8 +95,17 @@ export interface SessionListProps {
  */
 export function SessionList({
   sessions, selected, onSelect, folded, onToggleGroup, ready, hasMore, loadingMore, onLoadMore,
+  projectCounts,
 }: SessionListProps) {
   const listRef = useRef<HTMLDivElement | null>(null)
+  // The nav unmounts under the loader/empty states and on sidebar collapse —
+  // an effect keyed on the virtualizer (a stable useState instance) would keep
+  // a stale null element forever. The element itself must be the dep.
+  const [nav, setNav] = useState<HTMLDivElement | null>(null)
+  const bindNav = useCallback((element: HTMLDivElement | null) => {
+    listRef.current = element
+    setNav(element)
+  }, [])
   const now = useNow(NOW_TICK_MS)
   /** Group key → when it was last unfolded; all expanded groups start stamped. */
   const expandedAt = useRef(new Map<string, number>())
@@ -119,7 +134,7 @@ export function SessionList({
         key: `g ${key}`,
         group: key,
         cwd: group.cwd,
-        count: group.sessions.length,
+        count: projectCounts[key] ?? group.sessions.length,
         expanded,
         containsCurrent: selected !== null
           && group.sessions.some(session => session.kind === selected.kind && session.id === selected.id),
@@ -138,7 +153,7 @@ export function SessionList({
     }
     if (hasMore) flat.push({ type: 'tail', key: 'tail' })
     return flat
-  }, [sessions, folded, selected, hasMore])
+  }, [sessions, folded, selected, hasMore, projectCounts])
 
   const virtualizer = useVirtualizer<HTMLDivElement, HTMLDivElement>({
     count: items.length,
@@ -159,6 +174,43 @@ export function SessionList({
     ? 0
     : Math.max(0, virtualizer.getTotalSize() - (virtualItems.at(-1)?.end ?? 0))
 
+  // Scroll anchoring: a refresh or an appended page inserts rows mid-list
+  // (sessions join already-visible groups, new group headers splice into the
+  // sorted order), shifting every item below the insertion point. Keep the
+  // first visible row's viewport offset steady so the list never jumps under
+  // the user. The tail is deliberately NOT an anchor — pinning it would keep
+  // the sentinel in view and auto-chain every remaining page.
+  const anchor = useRef<{ key: string; offset: number } | null>(null)
+  useEffect(() => {
+    if (nav === null) return
+    const capture = () => {
+      const first = virtualizer.getVirtualItems()
+        .find(row => row.end > nav.scrollTop) ?? virtualizer.getVirtualItems().at(-1)
+      anchor.current = first === undefined || first.key === 'tail'
+        ? null
+        : { key: String(first.key), offset: nav.scrollTop - first.start }
+    }
+    nav.addEventListener('scroll', capture, { passive: true })
+    return () => { nav.removeEventListener('scroll', capture) }
+  }, [nav, virtualizer])
+
+  useLayoutEffect(() => {
+    const held = anchor.current
+    const element = listRef.current
+    if (held === null || element === null) return
+    const index = items.findIndex(item => item.key === held.key)
+    if (index < 0) return
+    // Heights are fixed estimates, so the row's new start is a prefix sum.
+    let start = 0
+    for (let at = 0; at < index; at += 1) {
+      const item = items[at]
+      start += item?.type === 'group' ? GROUP_ITEM_HEIGHT
+        : item?.type === 'tail' ? TAIL_ITEM_HEIGHT : SESSION_ITEM_HEIGHT
+    }
+    const target = start + held.offset
+    if (Math.abs(element.scrollTop - target) > 1) element.scrollTop = target
+  }, [items])
+
   // The tail sentinel scrolling into view (or near it) fetches the next page.
   const lastVirtual = virtualItems.at(-1)
   useEffect(() => {
@@ -175,7 +227,6 @@ export function SessionList({
     if (index >= 0) virtualizer.scrollToIndex(index, { align: 'auto' })
     // Only the selection drives the scroll — re-running on `items` would yank
     // the scroll position on every appended page.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedKey])
 
   const toggle = (key: string) => {
@@ -186,7 +237,7 @@ export function SessionList({
   if (!ready) return <div className={css.listEmpty}>Loading…</div>
   if (sessions.length === 0) return <div className={css.listEmpty}>No sessions found.</div>
   return (
-    <nav ref={listRef} className={css.list} aria-label="Sessions" role="tree">
+    <nav ref={bindNav} className={css.list} aria-label="Sessions" role="tree">
       <div style={{ height: virtualTop }} aria-hidden="true" />
       {virtualItems.map((virtualItem) => {
         const item = items[virtualItem.index]

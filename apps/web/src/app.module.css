@@ -539,9 +539,10 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
+  /* `[data-animate]` is needed: the attribute selector raises the mount-fade
+     rule above a bare `.sessionRow`, and media queries add no specificity. */
   .sessionRow,
-  .sessionWrap,
-  .sessionInner,
+  .sessionRow[data-animate],
   .arrow {
     animation: none;
     transition: none;

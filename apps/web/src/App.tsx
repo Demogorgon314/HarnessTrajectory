@@ -1,11 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { HARNESS_KINDS, type HarnessKind, type SessionListPage, type SessionSummary } from '@harness-trajectory/core'
+import { HARNESS_KINDS, type HarnessKind } from '@harness-trajectory/core'
 import {
   createTrajectoryDurationStore, createTrajectoryTranslate, icons, Tooltip, useSnapshotSelector,
   type TrajectoryLocale,
 } from '@harness-trajectory/ui'
-import { listSessions } from './api.ts'
-import { anySessionLive, appendSessions, mergeSessions } from './session-list.ts'
+import { useSessionListing } from './use-session-listing.ts'
 import { DragHandle } from './DragHandle.tsx'
 import { HarnessFilter } from './HarnessFilter.tsx'
 import { SessionList } from './SessionList.tsx'
@@ -21,34 +20,12 @@ import css from './app.module.css'
 
 const { IconPanelLeftOutline16, IconSettingsOutline16 } = icons
 
-const LIST_REFRESH_MS = 5_000
-/** Sessions per `/api/sessions` page; the sidebar fetches the next on scroll. */
-const LIST_PAGE = 100
 /** Keystrokes settle this long before the list is re-filtered server-side. */
 const LIST_QUERY_DEBOUNCE_MS = 200
 /** Wide content stays mounted this long after a collapse so it can fade out. */
 const COLLAPSE_SETTLE_MS = 150
 const THEME_CYCLE: readonly ThemePreference[] = ['system', 'light', 'dark']
 const EMPTY_KINDS: ReadonlySet<HarnessKind> = new Set()
-const EMPTY_COUNTS: ReadonlyMap<HarnessKind, number> = new Map()
-
-/**
- * The loaded window of the listing plus the paging book-keeping that must not
- * wait for a React commit — a `loadMore` landing between refresh and render
- * still has to see the newest cursor. Mutated only inside `refresh`/`loadMore`
- * and the reset effect.
- */
-interface ListingState {
-  /** Bumped on every filter change so in-flight responses die with their epoch. */
-  epoch: number
-  /** Last seen `/api/sessions` revision; sent as `?rev=` while nothing live shows. */
-  rev: number | null
-  /** Cursor for the next page; null ends the listing. */
-  cursor: string | null
-  /** The loaded window, newest first — the same objects `sessions` renders. */
-  loaded: readonly SessionSummary[]
-  moreLoading: boolean
-}
 
 /** The pane's tabs; `trajectory` is the address without a tab segment. */
 export type SessionTab = 'trajectory' | 'context'
@@ -190,12 +167,6 @@ function useFrameWidth(ref: React.RefObject<HTMLDivElement | null>): number {
 
 export function App() {
   const [route, navigate] = useHashRoute()
-  const [sessions, setSessions] = useState<readonly SessionSummary[]>([])
-  const [listError, setListError] = useState<string | null>(null)
-  const [listReady, setListReady] = useState(false)
-  const [hasMore, setHasMore] = useState(false)
-  const [loadingMore, setLoadingMore] = useState(false)
-  const [counts, setCounts] = useState<ReadonlyMap<HarnessKind, number>>(EMPTY_COUNTS)
   const [kinds, setKinds] = useState<ReadonlySet<HarnessKind>>(EMPTY_KINDS)
   const [query, setQuery] = useState('')
   /** `query` as the listing sees it — debounced so typing never refetches. */
@@ -246,104 +217,14 @@ export function App() {
   if (!collapsed) lastWideWidth.current = sidebar.width
 
   // -- session list ----------------------------------------------------------
-  const list = useRef<ListingState>({ epoch: 0, rev: null, cursor: null, loaded: [], moreLoading: false })
-
   useEffect(() => {
     const timer = setTimeout(() => { setListQuery(query.trim()) }, LIST_QUERY_DEBOUNCE_MS)
     return () => { clearTimeout(timer) }
   }, [query])
 
-  const applyPage = useCallback((page: SessionListPage, mode: 'replace' | 'append') => {
-    const s = list.current
-    s.rev = page.revision
-    s.cursor = page.nextCursor
-    if (mode === 'append') {
-      s.loaded = appendSessions(s.loaded, page.sessions)
-    } else {
-      const merged = mergeSessions(s.loaded, page.sessions)
-      // The server caps one page at its own maximum; when the loaded window
-      // outgrew the page, keep the uncovered tail — the cursor chain re-walks
-      // it and `appendSessions` dedupes whatever it re-sends.
-      s.loaded = page.nextCursor !== null && page.sessions.length < s.loaded.length
-        ? [...merged, ...s.loaded.slice(page.sessions.length)]
-        : merged
-    }
-    setSessions(s.loaded)
-    setHasMore(s.cursor !== null)
-    setCounts((prev) => {
-      const next = new Map(Object.entries(page.counts) as [HarnessKind, number][])
-      return prev.size === next.size && [...prev].every(([kind, count]) => next.get(kind) === count) ? prev : next
-    })
-  }, [])
-
-  /**
-   * Re-cover the loaded window (`limit` = what is shown) so new and updated
-   * sessions merge in place; the cursor chain then continues below it. `?rev=`
-   * goes out only while nothing on screen can silently stale — a live flag
-   * flips on a clock, not on a `change` event.
-   */
-  const refresh = useCallback(async () => {
-    const s = list.current
-    const epoch = s.epoch
-    const rev = s.rev !== null && !anySessionLive(s.loaded) ? s.rev : undefined
-    try {
-      const page = await listSessions({
-        kinds,
-        query: listQuery,
-        limit: Math.max(LIST_PAGE, s.loaded.length),
-        ...(rev === undefined ? {} : { rev }),
-      })
-      if (epoch !== s.epoch) return
-      setListReady(true)
-      setListError(null)
-      if (page === null) return
-      applyPage(page, 'replace')
-    } catch (error) {
-      if (epoch !== s.epoch) return
-      setListReady(true)
-      setListError(error instanceof Error ? error.message : String(error))
-    }
-  }, [applyPage, kinds, listQuery])
-
-  const loadMore = useCallback(async () => {
-    const s = list.current
-    if (s.cursor === null || s.moreLoading) return
-    const epoch = s.epoch
-    const cursor = s.cursor
-    s.moreLoading = true
-    setLoadingMore(true)
-    try {
-      const page = await listSessions({ kinds, query: listQuery, limit: LIST_PAGE, cursor })
-      if (epoch !== s.epoch || page === null) return
-      applyPage(page, 'append')
-    } catch {
-      // A failed page keeps its cursor: the next pass near the bottom retries.
-    } finally {
-      s.moreLoading = false
-      setLoadingMore(false)
-    }
-  }, [applyPage, kinds, listQuery])
-
-  // A filter change restarts paging: the window, cursor and revision all
-  // belong to the previous filter's listing.
-  useEffect(() => {
-    const s = list.current
-    s.epoch += 1
-    s.rev = null
-    s.cursor = null
-    s.loaded = []
-    setSessions([])
-    setHasMore(false)
-    setListReady(false)
-    void refresh()
-    const timer = setInterval(() => { void refresh() }, LIST_REFRESH_MS)
-    const onFocus = () => { void refresh() }
-    window.addEventListener('focus', onFocus)
-    return () => {
-      clearInterval(timer)
-      window.removeEventListener('focus', onFocus)
-    }
-  }, [refresh])
+  const {
+    sessions, listReady, listError, hasMore, loadingMore, counts, projectCounts, loadMore,
+  } = useSessionListing(kinds, listQuery)
 
   const selectedSummary = useMemo(
     () => (route === null ? null : sessions.find(s => s.kind === route.kind && s.id === route.id) ?? null),
@@ -450,6 +331,7 @@ export function App() {
               hasMore={hasMore}
               loadingMore={loadingMore}
               onLoadMore={loadMore}
+              projectCounts={projectCounts}
             />
             {/* The slow half of the same query: hits from the server's index. */}
             <SessionSearch query={query} kinds={kinds} selected={route} onSelect={navigate} />

@@ -101,6 +101,11 @@ export interface SessionListPage {
   nextCursor: string | null
   /** Sessions per kind under the `q` filter — the kind filter itself is NOT applied. */
   counts: Partial<Record<HarnessKind, number>>
+  /**
+   * Sessions per project (`cwd`, `''` for none) under the kind AND `q`
+   * filters — group headers show the true total while only a page is loaded.
+   */
+  projectCounts: Record<string, number>
 }
 
 /** Lifecycle of one subagent run as the parent transcript reports it. */

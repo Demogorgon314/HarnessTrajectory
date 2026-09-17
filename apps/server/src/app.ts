@@ -140,7 +140,10 @@ export function createApp({ index, staticDir, search: searchService, settings }:
    */
   app.get('/api/sessions', (c) => {
     // `?rev=` short-circuits only a first-page request: a cursor page is a
-    // different slice of the same listing and must always get its body.
+    // different slice of the same listing and must always get its body. The
+    // revision is global, so it cannot be bound to this request's kind/q —
+    // the client contract is to send `rev` only for the same filter it was
+    // issued under (a filter change must reset it).
     const cursorParam = c.req.query('cursor')
     const rev = c.req.query('rev')
     if (cursorParam === undefined && rev !== undefined && Number(rev) === listRevision) {
@@ -164,6 +167,14 @@ export function createApp({ index, staticDir, search: searchService, settings }:
     const counts: SessionListPage['counts'] = {}
     for (const session of queried) counts[session.kind] = (counts[session.kind] ?? 0) + 1
     let filtered = kindsFilter === null ? queried : queried.filter(session => kindsFilter.has(session.kind))
+    // Project totals share the kind filter (they describe what the loaded
+    // groups contain), so they're counted before the cursor narrows the page.
+    // Null-prototype: a cwd like "constructor" must not read an inherited member.
+    const projectCounts: Record<string, number> = Object.create(null)
+    for (const session of filtered) {
+      const key = session.cwd ?? ''
+      projectCounts[key] = (projectCounts[key] ?? 0) + 1
+    }
     if (cursor !== null) filtered = filtered.filter(session => afterListCursor(session, cursor))
     const sessions = filtered.slice(0, limit)
     const last = sessions[sessions.length - 1]
@@ -172,6 +183,7 @@ export function createApp({ index, staticDir, search: searchService, settings }:
       sessions,
       nextCursor: filtered.length > limit && last !== undefined ? listCursorOf(last) : null,
       counts,
+      projectCounts,
     }
     return c.json(page)
   })

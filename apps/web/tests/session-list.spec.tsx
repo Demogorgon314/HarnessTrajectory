@@ -8,7 +8,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
-import { cleanup, render } from '@testing-library/react'
+import { cleanup, fireEvent, render } from '@testing-library/react'
 import type { SessionSummary } from '@harness-trajectory/core'
 import { SessionList } from '../src/SessionList.tsx'
 import { anySessionLive, appendSessions, mergeSessions, sameSession } from '../src/session-list.ts'
@@ -125,6 +125,7 @@ describe('SessionList', () => {
     hasMore: false,
     onLoadMore: () => {},
     loadingMore: false,
+    projectCounts: {} as Record<string, number>,
   }
 
   test('mounts only the viewport rows of a long listing', () => {
@@ -145,6 +146,19 @@ describe('SessionList', () => {
     expect(container.querySelectorAll('[role="treeitem"]').length).toBeLessThan(60)
   })
 
+  test('group headers show the project total, not the loaded count', () => {
+    // 3 loaded sessions in project-0 while the server says it really has 40.
+    const sessions = listing(6, 3)
+    const { queryByText } = render(
+      <SessionList {...base} sessions={sessions} projectCounts={{ '/work/project-0': 40 }} />,
+    )
+    const header = queryByText('work/project-0')?.closest('[role="treeitem"]')
+    expect(header?.textContent).toContain('40')
+    // Groups the page didn't count fall back to their loaded size.
+    const other = queryByText('work/project-1')?.closest('[role="treeitem"]')
+    expect(other?.textContent).toContain('2')
+  })
+
   test('the tail in view asks for the next page; without it nothing is asked', () => {
     const onLoadMore = vi.fn()
     render(<SessionList {...base} sessions={listing(10)} hasMore={true} onLoadMore={onLoadMore} />)
@@ -152,6 +166,40 @@ describe('SessionList', () => {
     const quiet = vi.fn()
     render(<SessionList {...base} sessions={listing(10)} hasMore={false} onLoadMore={quiet} />)
     expect(quiet).not.toHaveBeenCalled()
+  })
+
+  test('a page landing mid-list holds the first visible row steady', () => {
+    // 60 sessions over 3 projects = 63 flat items. Scroll into project-2's
+    // run (its header sits at 1432, first session at 1468).
+    const { container, rerender } = render(<SessionList {...base} sessions={listing(60, 3)} />)
+    const nav = container.querySelector('[role="tree"]') as HTMLElement
+    nav.scrollTop = 1500
+    fireEvent.scroll(nav)
+
+    // An appended page inserts 5 session rows inside project-0's run
+    // (flat items 21..25): everything below moves down by 5*34 = 170px.
+    const appended = [...listing(60, 3), ...Array.from({ length: 5 }, (_, i) => summary({
+      id: `new-${i}`,
+      cwd: '/work/project-0',
+      updatedAt: T0 + 9_000_000,
+    }))]
+    rerender(<SessionList {...base} sessions={appended} />)
+    expect(nav.scrollTop).toBe(1670)
+  })
+
+  test('the tail sentinel is not an anchor — resting at it never auto-follows', () => {
+    const { container, rerender } = render(
+      <SessionList {...base} sessions={listing(60, 3)} hasMore={true} />,
+    )
+    const nav = container.querySelector('[role="tree"]') as HTMLElement
+    nav.scrollTop = 2200 // past the last item: the tail is the anchor candidate
+    fireEvent.scroll(nav)
+
+    const appended = [...listing(60, 3), ...Array.from({ length: 5 }, (_, i) => summary({
+      id: `new-${i}`, cwd: '/work/project-0', updatedAt: T0 + 9_000_000,
+    }))]
+    rerender(<SessionList {...base} sessions={appended} hasMore={true} />)
+    expect(nav.scrollTop).toBe(2200)
   })
 
   test('before the first answer it is a loader, then an empty listing says so', () => {

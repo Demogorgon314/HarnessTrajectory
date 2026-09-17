@@ -68,6 +68,8 @@ describe('GET /api/sessions', () => {
       .toEqual(Array.from({ length: SESSIONS }, (_, i) => `sess-${SESSIONS - 1 - i}`))
     expect(result.nextCursor).toBeNull()
     expect(result.counts).toEqual({ claude: SESSIONS })
+    // Project totals respect the kind filter; kind counts do not.
+    expect(result.projectCounts).toEqual({ '/work/project': SESSIONS })
     expect(result.revision).toBeGreaterThan(0)
   })
 
@@ -119,6 +121,7 @@ describe('GET /api/sessions', () => {
     const byCwd = await page(app, '?kind=codex&q=project')
     expect(byCwd.sessions).toHaveLength(0)
     expect(byCwd.counts).toEqual({ claude: SESSIONS })
+    expect(byCwd.projectCounts).toEqual({})
   })
 
   it('answers 304 while the revision stands, then 200 once a file moves', async () => {
