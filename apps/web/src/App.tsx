@@ -360,7 +360,8 @@ export function App() {
               <div className={css.emptyTitle}>Pick a session</div>
               <div className={css.emptyHint}>
                 Sessions are scanned from <code>~/.claude/projects</code>, <code>~/.codex/sessions</code>,{' '}
-                <code>~/.kimi-code/sessions</code>, and <code>~/.grok/sessions</code> on this machine.
+                <code>~/.kimi-code/sessions</code>, <code>~/.grok/sessions</code>, and Devin CLI's{' '}
+                <code>~/.local/share/devin/cli/sessions.db</code> on this machine.
                 Running sessions update live.
               </div>
             </div>
