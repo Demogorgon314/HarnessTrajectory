@@ -216,18 +216,19 @@ describe('codex synthesizer', () => {
       })
     })
 
-    it('flattens dynamic_tools groups into the header tool list', () => {
+    it('flattens dynamic_tools namespaces into the header tool list', () => {
       const { events } = run([
         sessionMeta(0, {
           dynamic_tools: [
-            { type: 'group', name: 'g1', description: 'd', tools: [{ type: 'function', name: 'alpha', description: 'a', inputSchema: {} }] },
-            { type: 'group', name: 'g2', description: 'd', tools: [{ type: 'function', name: 'beta', inputSchema: {} }] },
+            { type: 'namespace', name: 'g1', description: 'd', tools: [{ type: 'function', name: 'alpha', description: 'a', inputSchema: {} }] },
+            { type: 'namespace', name: 'g2', description: 'd', tools: [{ type: 'function', name: 'beta', inputSchema: {} }] },
           ],
         }),
         turnContext(1, 'gpt-5.2-codex'),
       ])
-      const tools = (dataOf(firstOf(events, 'request/header'))['header'] as { tools: { name: string }[] }).tools
+      const tools = (dataOf(firstOf(events, 'request/header'))['header'] as { tools: { name: string; namespace?: string }[] }).tools
       expect(tools.map(t => t.name)).toEqual(['alpha', 'beta'])
+      expect(tools.map(t => t.namespace)).toEqual(['g1', 'g2'])
     })
 
     it('emits exactly one initial header even though session_meta precedes the model', () => {
@@ -405,35 +406,35 @@ describe('codex synthesizer', () => {
       expect(synth.meta().label).toBe('hello there')
     })
 
-    it('classifies XML-ish wrappers as injections named by their tag', () => {
+    it('classifies marked fragments as injections, named by their marker', () => {
       const { events } = run([
         sessionMeta(0), taskStarted(1), turnContext(1, 'm'),
         userMessage(2, '<environment_context>\ncwd=/tmp/work\n</environment_context>'),
-        userMessage(3, '<user_instructions>be nice</user_instructions>'),
+        userMessage(3, '<turn_aborted>\nstop that\n</turn_aborted>'),
         userMessage(4, 'real prompt'),
       ])
       const users = allOf(events, 'user/message')
       expect(users.map(sourceOf)).toEqual([
-        { kind: 'environment_context', form: 'context' },
-        { kind: 'user_instructions', form: 'context' },
+        { kind: 'environment-context', form: 'context' },
+        { kind: 'turn-aborted', form: 'context' },
         { kind: 'user' },
       ])
     })
 
-    it('classifies the Markdown preambles as injections, named as core names them', () => {
+    it('classifies the Markdown and relay preambles as injections, named as core names them', () => {
       const { events } = run([
         sessionMeta(0), taskStarted(1), turnContext(1, 'm'),
-        userMessage(2, '# AGENTS.md\n\nproject rules'),
+        userMessage(2, '# AGENTS.md instructions\n\n<INSTRUCTIONS>\nproject rules\n</INSTRUCTIONS>'),
         userMessage(3, 'The following is the Codex agent history for the previous window.'),
+        // Neither a bare list intro nor a prompt about the file is an
+        // injection — the fallback is exact markers, never loose preambles.
         userMessage(4, 'Here is a list of the available skills.'),
-        // Only an ANCHORED preamble is an injection; a prompt about the file
-        // stays a prompt (the rule lives in core's `isCodexHumanPrompt`).
         userMessage(5, 'please update # AGENTS.md with the new rule'),
       ])
       expect(allOf(events, 'user/message').map(sourceOf)).toEqual([
         { kind: 'agents-md', form: 'context' },
-        { kind: 'history', form: 'context' },
-        { kind: 'catalog', form: 'context' },
+        { kind: 'guardian-history', form: 'context' },
+        { kind: 'user' },
         { kind: 'user' },
       ])
     })
@@ -532,6 +533,61 @@ describe('codex synthesizer', () => {
         // A bare `ls` lists the command's own working directory.
         { kind: 'search', path: '/tmp/work' },
       ])
+    })
+
+    it('keeps parallel calls\' items on their own call by command match', () => {
+      const { events } = run([
+        sessionMeta(0), taskStarted(1), turnContext(1, 'm'),
+        // Two exec calls in flight at once (parallel calls in one response).
+        customToolCall(2, 'call_a', 'cat /tmp/a.ts'),
+        customToolCall(2, 'call_b', 'rm -rf /tmp/b'),
+        // A's item completes first: its read op must NOT land on B's result.
+        itemCompleted(3, {
+          type: 'CommandExecution', id: 'exec-a', process_id: '1',
+          command: ['bash', '-lc', 'cat /tmp/a.ts'], cwd: '/tmp',
+          parsed_cmd: [{ type: 'read', cmd: 'cat /tmp/a.ts', name: 'a.ts', path: '/tmp/a.ts' }],
+          status: 'failed',
+        }),
+        tokenUsage(4, { input_tokens: 1, output_tokens: 1 }),
+        toolOutput(5, 'call_a', 'a-contents'),
+        toolOutput(6, 'call_b', 'done'),
+      ])
+      const results = allOf(events, 'tool/result')
+      const a = results.find(e => ((dataOf(e)['message'] as Rec).source as Rec)?.['callId'] === 'call_a')!
+      const b = results.find(e => ((dataOf(e)['message'] as Rec).source as Rec)?.['callId'] === 'call_b')!
+      expect(dataOf(a)['fileOps']).toEqual([{ kind: 'read', path: '/tmp/a.ts' }])
+      expect(dataOf(a)['error']).toBe(true)
+      expect(dataOf(b)['fileOps']).toBeUndefined()
+      expect(dataOf(b)['error']).toBeUndefined()
+    })
+
+    it('keeps an unpairable item as its own result when several calls are open', () => {
+      const { events } = run([
+        sessionMeta(0), taskStarted(1), turnContext(1, 'm'),
+        customToolCall(2, 'call_a', 'cat /tmp/a.ts'),
+        customToolCall(2, 'call_b', 'cat /tmp/b.ts'),
+        // The item ran a command NEITHER pending call carries — no verifiable link.
+        itemCompleted(3, {
+          type: 'CommandExecution', id: 'exec-orphan', process_id: '1',
+          command: ['bash', '-lc', 'cat /tmp/orphan.ts'], cwd: '/tmp',
+          parsed_cmd: [{ type: 'read', cmd: 'cat /tmp/orphan.ts', name: 'o.ts', path: '/tmp/orphan.ts' }],
+          status: 'failed',
+        }),
+        tokenUsage(4, { input_tokens: 1, output_tokens: 1 }),
+        toolOutput(5, 'call_a', 'a'),
+        toolOutput(6, 'call_b', 'b'),
+      ])
+      const results = allOf(events, 'tool/result')
+      expect(results).toHaveLength(3)
+      const orphan = results.find(e => (dataOf(e)['message'] as Rec).source === undefined)!
+      expect(dataOf(orphan)['fileOps']).toEqual([{ kind: 'read', path: '/tmp/orphan.ts' }])
+      expect(dataOf(orphan)['error']).toBe(true)
+      expect(blocksOf(orphan)).toEqual([{ type: 'text', text: 'cat /tmp/orphan.ts' }])
+      for (const e of results) {
+        const src = (dataOf(e)['message'] as Rec).source as Rec | undefined
+        if (src === undefined) continue
+        expect(dataOf(e)['error']).toBeUndefined()
+      }
     })
 
     it('counts unified-diff lines for FileChange rows and merges them with command rows', () => {
@@ -659,6 +715,66 @@ describe('codex synthesizer', () => {
       ])
       expect(allOf(events, 'tool/ops')).toEqual([])
     })
+
+    it('files a late item under its SETTLED call by exact id, not the lone pending one', () => {
+      // A and B run in parallel; A's output settles first, then A's
+      // `item_completed` arrives. B being the only PENDING call proves nothing
+      // — the exact id names the already-settled A.
+      const { events } = run([
+        sessionMeta(0), taskStarted(1), turnContext(1, 'm'),
+        customToolCall(2, 'call_a', 'cat /tmp/a.ts'),
+        customToolCall(3, 'call_b', 'cat /tmp/b.ts'),
+        tokenUsage(4, { input_tokens: 1, output_tokens: 1 }),
+        toolOutput(5, 'call_a', 'a'),
+        itemCompleted(6, {
+          type: 'CommandExecution', id: 'call_a', process_id: '1',
+          command: ['bash', '-lc', 'cat /tmp/a.ts'], cwd: '/tmp',
+          parsed_cmd: [{ type: 'read', cmd: 'cat /tmp/a.ts', name: 'a.ts', path: '/tmp/a.ts' }],
+          source: 'model', status: 'failed', stdout: '', stderr: '', aggregated_output: '',
+          exit_code: 1, duration: { secs: 0, nanos: 1 }, formatted_output: '',
+        }),
+        toolOutput(7, 'call_b', 'b'),
+      ])
+      const results = allOf(events, 'tool/result')
+      const late = firstOf(events, 'tool/ops')
+      expect(dataOf(late)).toEqual({
+        resultSeq: results[0]!.seq,
+        tool: 'exec',
+        err: true,
+        fileOps: [{ kind: 'read', path: '/tmp/a.ts' }],
+      })
+      // B's own result is untouched: nothing was misfiled under the open call.
+      expect(dataOf(results[1])['fileOps']).toBeUndefined()
+      expect(dataOf(results[1])['error']).toBeUndefined()
+    })
+
+    it('files a late item under its settled call by command when the id is foreign', () => {
+      // Same ordering, but the item id is not a call id: the command string
+      // inside the SETTLED call's arguments still proves the link.
+      const { events } = run([
+        sessionMeta(0), taskStarted(1), turnContext(1, 'm'),
+        customToolCall(2, 'call_a', 'cat /tmp/a.ts'),
+        customToolCall(3, 'call_b', 'cat /tmp/b.ts'),
+        tokenUsage(4, { input_tokens: 1, output_tokens: 1 }),
+        toolOutput(5, 'call_a', 'a'),
+        itemCompleted(6, {
+          type: 'CommandExecution', id: '0199-item-6', process_id: '1',
+          command: ['bash', '-lc', 'cat /tmp/a.ts'], cwd: '/tmp',
+          parsed_cmd: [{ type: 'read', cmd: 'cat /tmp/a.ts', name: 'a.ts', path: '/tmp/a.ts' }],
+          source: 'model', status: 'completed', stdout: '', stderr: '', aggregated_output: '',
+          exit_code: 0, duration: { secs: 0, nanos: 1 }, formatted_output: '',
+        }),
+        toolOutput(7, 'call_b', 'b'),
+      ])
+      const results = allOf(events, 'tool/result')
+      const late = firstOf(events, 'tool/ops')
+      expect(dataOf(late)).toEqual({
+        resultSeq: results[0]!.seq,
+        tool: 'exec',
+        fileOps: [{ kind: 'read', path: '/tmp/a.ts' }],
+      })
+      expect(dataOf(results[1])['fileOps']).toBeUndefined()
+    })
   })
 
   describe('time to first token', () => {
@@ -719,7 +835,7 @@ describe('codex synthesizer', () => {
       first_window_id: 'win-1',
       previous_window_id: 'win-1',
       window_id: 'win-2',
-      latest_token_usage_record: { thread_token_usage: { total_tokens: 12345 } },
+      latest_token_usage_record: { usage: { input_tokens: 12345 } },
       ...extra,
     })
 
@@ -748,10 +864,11 @@ describe('codex synthesizer', () => {
       expect(blocksOf(replacements[0])).toEqual([{ type: 'text', text: 'kept prompt' }])
     })
 
-    it('falls back to the last thread usage total when the record omits one', () => {
+    it('falls back to the last response context size when the record omits one', () => {
       const { events } = run([...TYPICAL_TURN, line(11, 'compacted', { message: '', replacement_history: [], window_id: 'win-2' })])
-      // The last token_usage_record of TYPICAL_TURN reported total_tokens 1540.
-      expect(dataOf(firstOf(events, 'compaction/summary'))['shadowedTokenCount']).toBe(1540)
+      // The last token_usage_record of TYPICAL_TURN reported input_tokens 1500 —
+      // the context occupancy at compaction, not the cumulative thread total.
+      expect(dataOf(firstOf(events, 'compaction/summary'))['shadowedTokenCount']).toBe(1500)
     })
 
     it('still claims the replaced range when the replacement history is empty', () => {
@@ -768,6 +885,308 @@ describe('codex synthesizer', () => {
       const second = dataOf(summaries[1])['shadowedSeqs'] as number[]
       expect(second).toHaveLength(3)
       expect(Math.min(...second)).toBeGreaterThan(summaries[0]!.seq)
+    })
+
+    it('claims a buffered usage-only response through compaction_response_id', () => {
+      const { events } = run([
+        ...TYPICAL_TURN,
+        // The remote compaction's own response is a usage-only
+        // `token_usage_record` settling no open response; the `compacted`
+        // record names it through `compaction_response_id`.
+        line(11, 'token_usage_record', {
+          thread_id: 'thread-1', turn_id: 'turn-1', response_id: 'resp-compact',
+          usage: { input_tokens: 500, output_tokens: 80, total_tokens: 580 },
+        }),
+        compacted(12, { compaction_response_id: 'resp-compact' }),
+      ])
+      const usageOnly = allOf(events, 'assistant/message').find(e =>
+        dataOf(e)['usage'] !== undefined && blocksOf(e).length === 0)
+      expect(usageOnly).toBeDefined()
+      expect(dataOf(usageOnly)['usage']).toEqual({ inputTokens: 500, outputTokens: 80 })
+      // Its zero-token node folds inside the window the compaction shadows.
+      const summary = firstOf(events, 'compaction/summary')!
+      expect(usageOnly!.seq).toBeLessThan(summary.seq)
+      expect(dataOf(summary)['shadowedSeqs']).toContain(usageOnly!.seq)
+    })
+
+    it('keeps retained agent messages and holds retained user messages as host evidence', () => {
+      const { events } = run([
+        ...TYPICAL_TURN,
+        compacted(11, {
+          replacement_history: [
+            { type: 'message', id: 'r1', role: 'user', content: [{ type: 'input_text', text: 'kept prompt' }] },
+            { type: 'agent_message', id: 'r2', author: 'parent', recipient: 'child',
+              content: [{ type: 'input_text', text: 'keep coordinating' }] },
+            { type: 'compaction', id: 'r3', encrypted_content: 'gAAA' },
+          ],
+          retained_context: {
+            user_messages: [{ turn_id: 'turn-1', message_id: 'm1', text: 'host-only instruction', complete: true }],
+          },
+        }),
+      ])
+      const summary = firstOf(events, 'compaction/summary')!
+      const replacements = events.filter(e => e.type === 'user/message' && e.seq > summary.seq)
+      // `replacement_history` is authoritative: the retained agent_message
+      // survives under its relay identity alongside the kept messages.
+      expect(replacements.map(sourceOf)).toEqual([
+        { kind: 'compaction-retained', form: 'compaction' },
+        { kind: 'agent-message', form: 'relay', name: 'parent → child' },
+        { kind: 'plugin', form: 'compaction', plugin: 'compaction', compactionId: 'win-2' },
+      ])
+      expect(blocksOf(replacements[1])).toEqual([{ type: 'text', text: 'keep coordinating' }])
+      // `retained_context.user_messages` is host-review evidence: it annotates
+      // the summary event but never joins the model-visible surface.
+      expect(dataOf(summary)['retained']).toEqual(['host-only instruction'])
+      const surfaceTexts = allOf(events, 'user/message')
+        .flatMap(e => blocksOf(e))
+        .map(block => block.text)
+      expect(surfaceTexts).not.toContain('host-only instruction')
+    })
+  })
+
+  describe('durable items', () => {
+    it('settles a web_search_call on arrival: call event first, then the result', () => {
+      const { events } = run([
+        sessionMeta(0), taskStarted(1), turnContext(1, 'm'), userMessage(2, 'search it'),
+        line(3, 'response_item', {
+          type: 'web_search_call', id: 'ws-1', status: 'completed',
+          action: { type: 'search', query: 'codex rollout format' },
+        }),
+        tokenUsage(4, { input_tokens: 10, output_tokens: 2 }),
+        assistantMessage(5, 'found'),
+        tokenUsage(6, { input_tokens: 12, output_tokens: 3 }),
+        taskComplete(7),
+      ])
+      const call = allOf(events, 'tool/call').find(e => dataOf(e)['callId'] === 'ws-1')
+      expect(call).toBeDefined()
+      expect(dataOf(call)['name']).toBe('web_search')
+      const result = allOf(events, 'tool/result').find(e =>
+        (((dataOf(e)['message'] as Rec).source ?? {}) as Rec)['callId'] === 'ws-1')
+      expect(result).toBeDefined()
+      // The fold pairs a result only with a call it has already seen.
+      expect(call!.seq).toBeLessThan(result!.seq)
+      // The self-contained call must not leave the step open awaiting an output.
+      expect(typesOf(events).lastIndexOf('step/end')).toBeGreaterThan(typesOf(events).lastIndexOf('tool/call'))
+    })
+
+    it('completes image_generation_call with an image block', () => {
+      const { events } = run([
+        sessionMeta(0), taskStarted(1), turnContext(1, 'm'), userMessage(2, 'draw'),
+        line(3, 'response_item', {
+          type: 'image_generation_call', id: 'ig-1', status: 'completed',
+          revised_prompt: 'a gray tabby', result: 'aW1hZ2U=',
+        }),
+        tokenUsage(4, { input_tokens: 10, output_tokens: 2 }),
+        taskComplete(7),
+      ])
+      const result = allOf(events, 'tool/result').find(e =>
+        (((dataOf(e)['message'] as Rec).source ?? {}) as Rec)['callId'] === 'ig-1')
+      expect(result).toBeDefined()
+      const inner = ((blocksOf(result)[0] ?? {}) as Rec)
+      const innerContent = (inner['content'] ?? []) as ContentBlock[]
+      expect(innerContent[0]?.type).toBe('image')
+    })
+
+    it('pairs tool_search_call with tool_search_output', () => {
+      const { events } = run([
+        sessionMeta(0), taskStarted(1), turnContext(1, 'm'), userMessage(2, 'find tools'),
+        line(3, 'response_item', {
+          type: 'tool_search_call', id: 'ts-1', call_id: 'call-ts', execution: 'client',
+          arguments: { query: 'file tools' },
+        }),
+        line(4, 'response_item', {
+          type: 'tool_search_output', call_id: 'call-ts', status: 'completed', execution: 'client',
+          tools: [{ type: 'function', name: 'read_file' }],
+        }),
+        tokenUsage(5, { input_tokens: 10, output_tokens: 2 }),
+        taskComplete(7),
+      ])
+      const call = allOf(events, 'tool/call').find(e => dataOf(e)['callId'] === 'call-ts')
+      expect(dataOf(call)['name']).toBe('tool_search')
+      const result = allOf(events, 'tool/result').find(e =>
+        (((dataOf(e)['message'] as Rec).source ?? {}) as Rec)['callId'] === 'call-ts')
+      expect(result).toBeDefined()
+      const inner = (blocksOf(result)[0] ?? {}) as Rec
+      expect(((inner['content'] ?? []) as ContentBlock[])[0]?.text).toBe('[{"type":"function","name":"read_file"}]')
+    })
+
+    it('marks a failed tool_search_output as an error result', () => {
+      const { events } = run([
+        sessionMeta(0), taskStarted(1), turnContext(1, 'm'), userMessage(2, 'go'),
+        line(3, 'response_item', {
+          type: 'tool_search_call', call_id: 'call-ts', execution: 'client', arguments: {},
+        }),
+        line(4, 'response_item', {
+          type: 'tool_search_output', call_id: 'call-ts', status: 'failed', execution: 'client', tools: [],
+        }),
+        taskComplete(7),
+      ])
+      const result = allOf(events, 'tool/result').find(e =>
+        (((dataOf(e)['message'] as Rec).source ?? {}) as Rec)['callId'] === 'call-ts')
+      expect(dataOf(result)['error']).toBe(true)
+    })
+
+    it('qualifies a namespaced function_call name', () => {
+      const { events } = run([
+        sessionMeta(0), taskStarted(1), turnContext(1, 'm'), userMessage(2, 'open'),
+        line(3, 'response_item', {
+          type: 'function_call', id: 'fc-ns', call_id: 'call-ns',
+          namespace: 'codex_app', name: 'open_in_codex', arguments: '{}',
+        }),
+        tokenUsage(4, { input_tokens: 10, output_tokens: 2 }),
+        taskComplete(7),
+      ])
+      const call = allOf(events, 'tool/call').find(e => dataOf(e)['callId'] === 'call-ns')
+      expect(dataOf(call)['name']).toBe('codex_app.open_in_codex')
+    })
+
+    it('renders agent_message and inter_agent_communication as relay injects, never prompts', () => {
+      const { events } = run([
+        sessionMeta(0), taskStarted(1), turnContext(1, 'm'), userMessage(2, 'delegate'),
+        line(3, 'response_item', {
+          type: 'agent_message', id: 'am-1', author: '/child/explorer', recipient: '/root',
+          content: [{ type: 'input_text', text: 'found it in src/x.ts' }],
+        }),
+        line(4, 'inter_agent_communication', {
+          author: '/root', recipient: '/child/explorer', content: 'now check tests', trigger_turn: false,
+        }),
+        tokenUsage(5, { input_tokens: 10, output_tokens: 2 }),
+        taskComplete(7),
+      ])
+      const relays = allOf(events, 'user/message').filter(e => sourceOf(e)['kind'] === 'agent-message')
+      expect(relays).toHaveLength(2)
+      expect(sourceOf(relays[0])['name']).toBe('/child/explorer → /root')
+      expect(sourceOf(relays[1])['name']).toBe('/root → /child/explorer')
+      // Neither is a human prompt.
+      expect(allOf(events, 'user/message').filter(e => sourceOf(e)['kind'] === 'user')).toHaveLength(1)
+    })
+
+    it('shows a retained_context verified_answer as a notice without model content', () => {
+      const { events } = run([
+        sessionMeta(0), taskStarted(1), turnContext(1, 'm'), userMessage(2, 'go'),
+        line(3, 'retained_context', {
+          type: 'verified_answer', turn_id: 'turn-1', call_id: 'call-q',
+          questions: [{ question: 'which db?', answer: 'sqlite' }],
+        }),
+        taskComplete(7),
+      ])
+      const relay = allOf(events, 'user/message').find(e => sourceOf(e)['kind'] === 'verified-answer')
+      expect(relay).toBeDefined()
+      expect(blocksOf(relay)).toEqual([])
+      expect(sourceOf(relay)['summary']).toContain('sqlite')
+    })
+
+    it('emits a configuration_update marker and a thread_goal inject', () => {
+      const { events } = run([
+        sessionMeta(0), taskStarted(1), turnContext(1, 'm'), userMessage(2, 'go'),
+        line(3, 'response_item', { type: 'configuration_update', reasoning: { effort: 'high' } }),
+        line(4, 'event_msg', {
+          type: 'thread_goal_updated', threadId: 'thread-1',
+          goal: { threadId: 'thread-1', objective: 'build it in one hour', status: 'active' },
+        }),
+        taskComplete(7),
+      ])
+      const kinds = allOf(events, 'user/message').map(e => sourceOf(e)['kind'])
+      expect(kinds).toEqual(expect.arrayContaining(['configuration-update', 'thread-goal']))
+    })
+
+    it('applies a thread_settings_applied model switch as a change header', () => {
+      const { events, synth } = run([
+        sessionMeta(0), taskStarted(1), turnContext(1, 'gpt-old'), userMessage(2, 'go'),
+        line(3, 'event_msg', {
+          type: 'thread_settings_applied', thread_id: 'thread-1',
+          thread_settings: { model: 'gpt-new', model_provider_id: 'openai' },
+        }),
+        taskComplete(7),
+      ])
+      const headers = allOf(events, 'request/header')
+      const change = headers.find(e => dataOf(e)['reason'] === 'change')
+      expect(change).toBeDefined()
+      expect(((dataOf(change)['header'] as Rec)['config'] as Rec)['model']).toBe('gpt-new')
+      expect(synth.meta().model).toBe('gpt-new')
+    })
+  })
+
+  describe('thread_rolled_back', () => {
+    it('prunes the last N turns\' surface nodes and leaves a marker', () => {
+      const { events } = run([
+        sessionMeta(0),
+        taskStarted(1), turnContext(1, 'm'), userMessage(2, 'first prompt'),
+        reasoning(3, 'thinking'), assistantMessage(4, 'answer one'),
+        tokenUsage(5, { input_tokens: 10, output_tokens: 2 }),
+        taskComplete(6),
+        line(7, 'event_msg', { type: 'task_started', turn_id: 'turn-2', started_at: secs(7) }),
+        userMessage(8, 'second prompt'),
+        assistantMessage(9, 'answer two'),
+        tokenUsage(10, { input_tokens: 12, output_tokens: 3 }),
+        taskComplete(11),
+        line(12, 'event_msg', { type: 'thread_rolled_back', num_turns: 1 }),
+      ])
+      const prune = firstOf(events, 'compaction/prune')
+      expect(prune).toBeDefined()
+      const shadowed = dataOf(prune)['shadowedSeqs'] as number[]
+      // Turn 2's user message and assistant answer are shadowed; turn 1's stay.
+      const turn2User = allOf(events, 'user/message').find(e => blocksOf(e)[0]?.text === 'second prompt')!
+      const turn1User = allOf(events, 'user/message').find(e => blocksOf(e)[0]?.text === 'first prompt')!
+      expect(shadowed).toContain(turn2User.seq)
+      expect(shadowed).not.toContain(turn1User.seq)
+      const marker = allOf(events, 'user/message').find(e => sourceOf(e)['kind'] === 'rollback')
+      expect(marker).toBeDefined()
+      expect(marker!.surfaceOp).toMatchObject({ op: 'replace' })
+    })
+
+    it('keeps turn-0 injections out of the rollback', () => {
+      const { events } = run([
+        sessionMeta(0),
+        developerMessage(1, 'injected instructions'),
+        taskStarted(2), turnContext(2, 'm'), userMessage(3, 'only prompt'),
+        assistantMessage(4, 'answer'),
+        taskComplete(5),
+        line(6, 'event_msg', { type: 'thread_rolled_back', num_turns: 5 }),
+      ])
+      const prune = firstOf(events, 'compaction/prune')!
+      const shadowed = dataOf(prune)['shadowedSeqs'] as number[]
+      const inject = allOf(events, 'user/message').find(e => sourceOf(e)['kind'] === 'developer')!
+      expect(shadowed).not.toContain(inject.seq)
+    })
+  })
+
+  describe('dynamic_tools normalization', () => {
+    const headerTools = (events: readonly TimelineEvent[]): unknown[] =>
+      ((dataOf(firstOf(events, 'request/header'))['header'] as Rec | undefined)?.['tools'] ?? []) as unknown[]
+
+    it('keeps canonical function entries and expands namespaces', () => {
+      const { events } = run([
+        sessionMeta(0, {
+          dynamic_tools: [
+            { type: 'function', name: 'ping', description: 'p', inputSchema: {} },
+            { type: 'namespace', name: 'codex_app', description: 'app tools',
+              tools: [{ type: 'function', name: 'open_in_codex', description: 'd', inputSchema: {} }] },
+          ],
+        }),
+        taskStarted(1), turnContext(1, 'm'), userMessage(2, 'hi'),
+      ])
+      const tools = headerTools(events) as Rec[]
+      expect(tools.map(tool => tool['name'])).toEqual(['ping', 'open_in_codex'])
+      expect(tools[1]?.['namespace']).toBe('codex_app')
+    })
+
+    it('normalizes the legacy flat shape, preserving namespace and deferLoading', () => {
+      const { events } = run([
+        sessionMeta(0, {
+          dynamic_tools: [
+            { name: 'lookup', description: 'd', inputSchema: {}, namespace: 'search', exposeToContext: false },
+            { name: 'plain', description: 'd', inputSchema: {} },
+          ],
+        }),
+        taskStarted(1), turnContext(1, 'm'), userMessage(2, 'hi'),
+      ])
+      const tools = headerTools(events) as Rec[]
+      expect(tools[0]?.['type']).toBe('function')
+      expect(tools[0]?.['namespace']).toBe('search')
+      expect(tools[0]?.['deferLoading']).toBe(true)
+      expect(tools[0]?.['exposeToContext']).toBeUndefined()
+      expect(tools[1]?.['namespace']).toBeUndefined()
     })
   })
 

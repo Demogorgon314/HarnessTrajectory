@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { createCodexParser, isCodexHumanPrompt } from '../src/adapters/codex.ts'
+import { codexHumanPromptText, codexUserItems, createCodexParser, isCodexHumanPrompt } from '../src/adapters/codex.ts'
 import type { SessionFileRef } from '../src/session.ts'
 import type { AssistantMessageNode, ToolResultNode } from '../src/contract.ts'
 
@@ -185,7 +185,9 @@ describe('codex adapter', () => {
   })
 
   it('exposes an open step as partial output with its running call', () => {
-    const lines = twoTurnFixture().slice(0, 9)
+    // Stop before the `token_usage_record`: it marks the response complete, so
+    // the step is only "open" while the response is still streaming.
+    const lines = twoTurnFixture().slice(0, 8)
     const parser = feed(lines)
     const snapshot = parser.snapshot()
     expect(snapshot.partial).toEqual({
@@ -257,7 +259,7 @@ describe('codex adapter', () => {
     const parser = feed(twoTurnFixture())
     const contexts = parser.snapshot().eventNodes.filter(node => node.kind === 'context')
     expect(contexts.map(node => node.kind === 'context' ? [node.provenance.label, node.form] : null))
-      .toEqual([['developer', 'instructions'], ['environment_context', 'snapshot']])
+      .toEqual([['developer', 'instructions'], ['environment-context', 'snapshot']])
     expect(parser.meta().promptCount).toBe(2)
   })
 
@@ -284,6 +286,52 @@ describe('codex adapter', () => {
       summary: [{ type: 'text', text: 'Earlier context summarized.' }],
     })
     expect(assistants(parser).map(node => node.turn)).toEqual([1, 2])
+  })
+
+  it('attributes a usage-only response to the compaction it belongs to', () => {
+    // Remote compaction runs its own usage-only response: a `token_usage_record`
+    // with no open step must not overwrite the previous request's usage; the
+    // `compacted` record claims it through `compaction_response_id`.
+    const parser = feed([
+      sessionMeta(0),
+      taskStarted(1_000, 'turn-1'),
+      userMessage(2_000, 'go'),
+      assistantMessage(3_000, 'working'),
+      usageRecord(4_000, 'turn-1', { input_tokens: 10, output_tokens: 2, total_tokens: 12 }),
+      taskComplete(5_000, 'turn-1', 'working'),
+      line('token_usage_record', {
+        thread_id: 'thread-main', turn_id: 'turn-1', response_id: 'resp-compact-1',
+        usage: { input_tokens: 100, output_tokens: 20, total_tokens: 120 },
+      }, 6_000),
+      line('compacted', {
+        message: '', compaction_response_id: 'resp-compact-1', replacement_history: [],
+      }, 7_000),
+    ])
+    const requests = parser.snapshot().requests
+    const normal = requests.find(item => item.purpose === 'assistant')
+    const compaction = requests.find(item => item.purpose === 'compaction')
+    expect(normal?.usage).toEqual({ inputTokens: 10, outputTokens: 2, totalTokens: 12 })
+    expect(compaction?.usage).toEqual({ inputTokens: 100, outputTokens: 20, totalTokens: 120 })
+  })
+
+  it('keeps each request\'s usage when a stray usage-only record arrives', () => {
+    const parser = feed([
+      sessionMeta(0),
+      taskStarted(1_000, 'turn-1'),
+      userMessage(2_000, 'go'),
+      assistantMessage(3_000, 'working'),
+      usageRecord(4_000, 'turn-1', { input_tokens: 10, output_tokens: 2, total_tokens: 12 }),
+      taskComplete(5_000, 'turn-1', 'working'),
+      // Unclaimed by any `compacted` record: buffered, never booked.
+      line('token_usage_record', {
+        thread_id: 'thread-main', turn_id: 'turn-1', response_id: 'resp-stray',
+        usage: { input_tokens: 999, output_tokens: 999, total_tokens: 1_998 },
+      }, 6_000),
+    ])
+    const requests = parser.snapshot().requests
+    expect(requests.find(item => item.purpose === 'assistant')?.usage)
+      .toEqual({ inputTokens: 10, outputTokens: 2, totalTokens: 12 })
+    expect(requests.find(item => item.purpose === 'compaction')).toBeUndefined()
   })
 
   it('nests a child thread under a synthetic subagent call', () => {
@@ -347,6 +395,137 @@ describe('codex adapter', () => {
     expect(snapshot.runningCalls).toEqual([])
   })
 
+  it('reopens a child thread when records follow its task_complete', () => {
+    const parser = createCodexParser()
+    parser.push(sessionMeta(0), MAIN)
+    parser.push(taskStarted(1_000, 'turn-1'), MAIN)
+    parser.push(userMessage(2_000, 'go'), MAIN)
+    const childMeta = line('session_meta', {
+      id: 'thread-child', thread_source: 'subagent', parent_thread_id: 'thread-main',
+      source: { subagent: { other: 'guardian' } },
+    }, 3_000)
+    for (const item of [
+      childMeta,
+      taskStarted(3_100, 'child-turn-1'),
+      assistantMessage(3_500, 'first answer'),
+      taskComplete(4_000, 'child-turn-1', 'first answer'),
+      // Codex resumes an existing agent with new input (core/agent/control.rs):
+      // the run boundary is not the thread's end.
+      taskStarted(5_000, 'child-turn-2'),
+      customToolCall(5_500, 'child-call-2', 'ls -la'),
+      customToolOutput(6_000, 'child-call-2', 'a.ts'),
+      assistantMessage(6_500, 'second answer'),
+      taskComplete(7_000, 'child-turn-2', 'second answer'),
+    ]) parser.push(item, CHILD)
+
+    const results = toolResults(parser)
+    expect(results.map(result => result.callId))
+      .toEqual(['subagent:thread-child', 'subagent:thread-child#2'])
+    expect(results[0]?.content).toEqual([{ type: 'text', text: 'first answer' }])
+    expect(results[1]?.content).toEqual([{ type: 'text', text: 'second answer' }])
+    expect(results[1]?.subCalls.map(call => call.callId)).toEqual(['child-call-2'])
+    const [run] = parser.subagents()
+    expect(run).toMatchObject({ agentId: 'thread-child', status: 'completed', toolCalls: 1 })
+  })
+
+  it('excludes a child\'s inherited parent history below subagent_history_start_ordinal', () => {
+    const parser = createCodexParser()
+    parser.push(sessionMeta(0), MAIN)
+    const childMeta = JSON.stringify({
+      timestamp: at(0), ordinal: 0, type: 'session_meta',
+      payload: {
+        id: 'thread-child', thread_source: 'subagent', parent_thread_id: 'thread-main',
+        source: { subagent: { other: 'guardian' } },
+        subagent_history_start_ordinal: '3',
+      },
+    })
+    const atOrdinal = (record: string, ordinal: number): string => {
+      const parsed = JSON.parse(record) as Record<string, unknown>
+      parsed['ordinal'] = ordinal
+      return JSON.stringify(parsed)
+    }
+    for (const item of [
+      childMeta,
+      // Inherited parent records (materialized for the model, not the child's own activity):
+      atOrdinal(userMessage(0, 'the parent prompt'), 1),
+      atOrdinal(customToolCall(0, 'inherited-call', 'ls'), 2),
+      // The child's own records start at the boundary:
+      atOrdinal(customToolCall(1_000, 'own-call', 'git diff'), 3),
+      atOrdinal(assistantMessage(2_000, 'own answer'), 4),
+    ]) parser.push(item, CHILD)
+
+    const [run] = parser.subagents()
+    expect(run?.toolCalls).toBe(1)
+    const calls = parser.snapshot().runningCalls
+    expect(calls.map(call => call.callId)).toEqual(['subagent:thread-child'])
+    expect(calls[0]?.subCalls.map(call => call.callId)).toEqual(['own-call'])
+  })
+
+  it('applies the ref\'s historyStartOrdinal when a child transcript is opened standalone', () => {
+    // Served as a main file, the boundary still separates the parent's
+    // materialized history from the child's own activity — and because the ref
+    // carries it, inherited records replayed BEFORE the head's `session_meta`
+    // (lineage bases come first) are skipped too.
+    const ref: SessionFileRef = {
+      id: 'thread-child', role: 'main', path: '/tmp/rollout-child.jsonl',
+      historyStartOrdinal: 10,
+    }
+    const parser = createCodexParser()
+    const atOrdinal = (record: string, ordinal: number): string => {
+      const parsed = JSON.parse(record) as Record<string, unknown>
+      parsed['ordinal'] = ordinal
+      return JSON.stringify(parsed)
+    }
+    parser.push(atOrdinal(userMessage(0, 'inherited prompt'), 1), ref)
+    parser.push(atOrdinal(line('session_meta', {
+      id: 'thread-child', thread_source: 'subagent', parent_thread_id: 'thread-main',
+      subagent_history_start_ordinal: '10',
+    }, 0), 0), ref)
+    parser.push(atOrdinal(userMessage(1_000, 'own prompt'), 11), ref)
+    expect(parser.meta().promptCount).toBe(1)
+    expect(parser.meta().title).toBe('own prompt')
+  })
+
+  it('uses child ownership before lineage bases replay in the parent view', () => {
+    const parser = createCodexParser()
+    const ref = { ...CHILD, historyStartOrdinal: 10 }
+    const ordinal = (record: string, value: number) => JSON.stringify({ ...JSON.parse(record), ordinal: value })
+    parser.push(ordinal(sessionMeta(0), 0), ref)
+    parser.push(ordinal(customToolCall(1, 'parent-call', 'ls'), 1), ref)
+    expect(parser.subagents()).toHaveLength(0)
+    parser.push(ordinal(line('session_meta', { id: CHILD.id, subagent_history_start_ordinal: 10 }, 2), 9), ref)
+    parser.push(ordinal(customToolCall(3, 'own-call', 'pwd'), 10), ref)
+    expect(parser.subagents()).toMatchObject([{ agentId: CHILD.id, toolCalls: 1 }])
+  })
+
+  it('keeps a completed child completed when late bookkeeping records arrive', () => {
+    const parser = createCodexParser()
+    parser.push(sessionMeta(0), MAIN)
+    parser.push(line('session_meta', {
+      id: 'thread-child', thread_source: 'subagent', parent_thread_id: 'thread-main',
+      source: { subagent: { other: 'guardian' } },
+    }, 500), CHILD)
+    parser.push(taskStarted(1_000, 'child-turn-1'), CHILD)
+    parser.push(customToolCall(1_500, 'child-call-1', 'ls'), CHILD)
+    parser.push(taskComplete(2_000, 'child-turn-1', 'done'), CHILD)
+    // Stats and status records after `task_complete` update the finished run —
+    // they must not resurrect it as `subagent:thread-child#2`.
+    parser.push(line('event_msg', {
+      type: 'token_count', turn_id: 'child-turn-1',
+      info: { total_token_usage: { input_tokens: 50, output_tokens: 5, total_tokens: 55 } },
+    }, 2_500), CHILD)
+    parser.push(line('token_usage_record', {
+      thread_id: 'thread-child', turn_id: 'child-turn-1', response_id: 'resp-c1',
+      usage: { input_tokens: 50, output_tokens: 5, total_tokens: 55 },
+    }, 2_600), CHILD)
+    const [run] = parser.subagents()
+    expect(run).toMatchObject({ callId: 'subagent:thread-child', status: 'completed', toolCalls: 1 })
+    // Only a genuinely new turn reopens the run.
+    parser.push(taskStarted(3_000, 'child-turn-2'), CHILD)
+    const [resumed] = parser.subagents()
+    expect(resumed).toMatchObject({ callId: 'subagent:thread-child#2', status: 'running' })
+  })
+
   it('shows a child thread as running until it completes', () => {
     const parser = createCodexParser()
     parser.push(sessionMeta(0), MAIN)
@@ -360,6 +539,73 @@ describe('codex adapter', () => {
     const running = parser.snapshot().runningCalls
     expect(running.map(call => call.callId)).toEqual(['subagent:thread-child'])
     expect(running[0]?.subCalls.map(call => call.callId)).toEqual(['child-call-1'])
+  })
+
+  it('keeps mid-turn steering input in the same turn', () => {
+    const parser = feed([
+      sessionMeta(0),
+      taskStarted(1_000, 'turn-1'),
+      userMessage(2_000, 'start the work'),
+      reasoning(3_000, 'Working'),
+      // Steering: Codex accepts user input while the turn runs; the turn's
+      // `task_complete` has not been written yet (core/session/turn.rs).
+      userMessage(3_500, 'also check the tests'),
+      reasoning(4_000, 'Adjusting'),
+      assistantMessage(4_500, 'Done both.'),
+      usageRecord(5_000, 'turn-1', { input_tokens: 10, output_tokens: 2, total_tokens: 12 }),
+      taskComplete(6_000, 'turn-1', 'Done both.'),
+    ])
+    const snapshot = parser.snapshot()
+    const users = snapshot.eventNodes.filter(node => node.kind === 'user')
+    expect(users).toHaveLength(2)
+    // Both responses stay in turn 1: the steering input opened a new STEP, not a turn.
+    expect(assistants(parser).map(node => [node.turn, node.step])).toEqual([[1, 1], [1, 2]])
+    expect(parser.meta().promptCount).toBe(2)
+    for (const user of users) {
+      expect(snapshot.eventLocations.get(user.seq))
+        .toEqual({ kind: 'turn', turn: { turn: 1, status: 'closed' } })
+    }
+  })
+
+  it('joins a turn its turn_id names even without task_started', () => {
+    const parser = feed([
+      sessionMeta(0),
+      taskStarted(1_000, 'turn-1'),
+      userMessage(2_000, 'first'),
+      assistantMessage(3_000, 'one'),
+      taskComplete(4_000, 'turn-1', 'one'),
+      // A resumed file can lose the event but still annotate the record.
+      line('response_item', {
+        type: 'message', role: 'user', content: [{ type: 'input_text', text: 'second' }],
+        internal_chat_message_metadata_passthrough: { turn_id: 'turn-2' },
+      }, 5_000),
+      assistantMessage(6_000, 'two'),
+      taskComplete(7_000, 'turn-2', 'two'),
+    ])
+    const users = parser.snapshot().eventNodes.filter(node => node.kind === 'user')
+    expect(users).toHaveLength(2)
+    expect(parser.snapshot().eventLocations.get(users[1]?.seq ?? -1))
+      .toEqual({ kind: 'turn', turn: { turn: 2, status: 'closed' } })
+    expect(assistants(parser).map(node => node.turn)).toEqual([1, 2])
+  })
+
+  it('settles each model response at its token_usage_record', () => {
+    const parser = feed([
+      sessionMeta(0),
+      taskStarted(1_000, 'turn-1'),
+      userMessage(2_000, 'go'),
+      assistantMessage(3_000, 'part one'),
+      usageRecord(3_500, 'turn-1', { input_tokens: 10, output_tokens: 2, total_tokens: 12 }),
+      // `end_turn=false`: the turn continues with a second response — it must
+      // not fold into the first step or overwrite its usage.
+      assistantMessage(4_000, 'part two'),
+      usageRecord(4_500, 'turn-1', { input_tokens: 20, output_tokens: 3, total_tokens: 23 }),
+      taskComplete(5_000, 'turn-1', 'part two'),
+    ])
+    const nodes = assistants(parser)
+    expect(nodes.map(node => [node.turn, node.step])).toEqual([[1, 1], [1, 2]])
+    expect(nodes[0]?.usage).toEqual({ inputTokens: 10, outputTokens: 2, totalTokens: 12 })
+    expect(nodes[1]?.usage).toEqual({ inputTokens: 20, outputTokens: 3, totalTokens: 23 })
   })
 
   it('marks an aborted turn as an error', () => {
@@ -435,11 +681,11 @@ describe('codex adapter', () => {
     expect(parser.kind).toBe('codex')
   })
 
-  it('treats an AGENTS.md preamble as project instructions, not a prompt', () => {
+  it('treats an AGENTS.md instructions block as project instructions, not a prompt', () => {
     const parser = feed([
       sessionMeta(0),
       taskStarted(1_000, 'turn-1'),
-      userMessage(1_100, '# AGENTS.md\n\nBe brief in this repo.'),
+      userMessage(1_100, '# AGENTS.md instructions for /work/project\n\n<INSTRUCTIONS>\nBe brief in this repo.\n</INSTRUCTIONS>'),
       userMessage(2_000, 'Please list the files'),
       assistantMessage(3_000, 'Two files.'),
       taskComplete(4_000, 'turn-1', 'Two files.'),
@@ -467,6 +713,223 @@ describe('codex adapter', () => {
   })
 })
 
+describe('codex durable items', () => {
+  const contexts = (parser: ReturnType<typeof createCodexParser>) =>
+    parser.snapshot().eventNodes.filter(node => node.kind === 'context')
+
+  it('settles a web_search_call on arrival (self-contained durable item)', () => {
+    const parser = feed([
+      sessionMeta(0),
+      taskStarted(1_000, 'turn-1'),
+      turnContext(1_100, 'turn-1'),
+      userMessage(2_000, 'search for it'),
+      line('response_item', {
+        type: 'web_search_call', id: 'ws-1', status: 'completed',
+        action: { type: 'search', query: 'codex rollout format' },
+      }, 3_000),
+      usageRecord(3_500, 'turn-1', { input_tokens: 10, output_tokens: 2, total_tokens: 12 }),
+      assistantMessage(4_000, 'found it'),
+      taskComplete(5_000, 'turn-1', 'found it'),
+    ])
+    const [step] = assistants(parser)
+    expect(step?.blocks).toEqual([{
+      kind: 'tool-call',
+      callId: 'ws-1',
+      name: 'web_search',
+      argsRaw: '{"type":"search","query":"codex rollout format"}',
+    }])
+    const [result] = toolResults(parser)
+    expect(result?.callId).toBe('ws-1')
+    expect(result?.call?.name).toBe('web_search')
+    expect(result?.isError).toBe(false)
+    expect(result?.content).toEqual([])
+    expect(parser.snapshot().runningCalls).toEqual([])
+  })
+
+  it('completes image_generation_call with its image result', () => {
+    const parser = feed([
+      sessionMeta(0),
+      taskStarted(1_000, 'turn-1'),
+      turnContext(1_100, 'turn-1'),
+      userMessage(2_000, 'draw a cat'),
+      line('response_item', {
+        type: 'image_generation_call', id: 'ig-1', status: 'completed',
+        revised_prompt: 'a gray tabby', result: 'aW1hZ2U=',
+      }, 3_000),
+      taskComplete(5_000, 'turn-1', 'done'),
+    ])
+    const [result] = toolResults(parser)
+    expect(result?.call?.name).toBe('image_generation')
+    expect(result?.content[0]?.type).toBe('image')
+    const attachment = result?.content[0]?.type === 'image' ? result.content[0].attachment : undefined
+    expect(attachment).toBeDefined()
+    expect(parser.imageUrl(attachment!)).toContain('data:image/png')
+  })
+
+  it('pairs tool_search_call with tool_search_output', () => {
+    const parser = feed([
+      sessionMeta(0),
+      taskStarted(1_000, 'turn-1'),
+      turnContext(1_100, 'turn-1'),
+      userMessage(2_000, 'find tools'),
+      line('response_item', {
+        type: 'tool_search_call', id: 'ts-1', call_id: 'call-ts', execution: 'client',
+        arguments: { query: 'file tools' },
+      }, 3_000),
+      line('response_item', {
+        type: 'tool_search_output', call_id: 'call-ts', status: 'completed', execution: 'client',
+        tools: [{ type: 'function', name: 'read_file' }],
+      }, 4_000),
+      taskComplete(5_000, 'turn-1', 'done'),
+    ])
+    const [result] = toolResults(parser)
+    expect(result?.callId).toBe('call-ts')
+    expect(result?.call?.name).toBe('tool_search')
+    expect(result?.content).toEqual([{ type: 'text', text: '[{"type":"function","name":"read_file"}]' }])
+  })
+
+  it('qualifies a namespaced function_call name', () => {
+    const parser = feed([
+      sessionMeta(0),
+      taskStarted(1_000, 'turn-1'),
+      turnContext(1_100, 'turn-1'),
+      userMessage(2_000, 'open it'),
+      line('response_item', {
+        type: 'function_call', id: 'fc-ns', call_id: 'call-ns',
+        namespace: 'codex_app', name: 'open_in_codex', arguments: '{}',
+      }, 3_000),
+      functionOutput(4_000, 'call-ns', 'opened'),
+      taskComplete(5_000, 'turn-1', 'done'),
+    ])
+    const [result] = toolResults(parser)
+    expect(result?.call?.name).toBe('codex_app.open_in_codex')
+  })
+
+  it('renders agent_message as relay context, never a prompt', () => {
+    const parser = feed([
+      sessionMeta(0),
+      taskStarted(1_000, 'turn-1'),
+      turnContext(1_100, 'turn-1'),
+      userMessage(2_000, 'delegate'),
+      line('response_item', {
+        type: 'agent_message', id: 'am-1', author: '/child/explorer', recipient: '/root',
+        content: [{ type: 'input_text', text: 'the file lives in src/x.ts' }],
+      }, 3_000),
+      assistantMessage(4_000, 'noted'),
+      taskComplete(5_000, 'turn-1', 'noted'),
+    ])
+    expect(parser.meta().promptCount).toBe(1)
+    const nodes = contexts(parser)
+    const relay = nodes.find(node => node.kind === 'context' && node.provenance.label === 'agent-message')
+    expect(relay).toBeDefined()
+    expect(relay?.kind === 'context' ? relay.form : null).toBe('relay')
+    expect(parser.snapshot().eventNodes.filter(node => node.kind === 'user')).toHaveLength(1)
+  })
+
+  it('renders top-level inter_agent_communication the same way', () => {
+    const parser = feed([
+      sessionMeta(0),
+      taskStarted(1_000, 'turn-1'),
+      userMessage(2_000, 'go'),
+      line('inter_agent_communication', {
+        author: '/root', recipient: '/child/w1', content: 'please inspect src/', trigger_turn: true,
+      }, 3_000),
+      taskComplete(5_000, 'turn-1', 'done'),
+    ])
+    const relay = contexts(parser).find(node => node.kind === 'context' && node.provenance.label === 'agent-message')
+    expect(relay).toBeDefined()
+    expect(parser.meta().promptCount).toBe(1)
+  })
+
+  it('applies configuration_update effort to later requests', () => {
+    const parser = feed([
+      sessionMeta(0),
+      taskStarted(1_000, 'turn-1'),
+      turnContext(1_100, 'turn-1'),
+      userMessage(2_000, 'go'),
+      line('response_item', {
+        type: 'configuration_update', reasoning: { effort: 'high' },
+      }, 2_500),
+      reasoning(3_000, 'thinking'),
+      usageRecord(3_500, 'turn-1', { input_tokens: 10, output_tokens: 2, total_tokens: 12 }),
+      taskComplete(5_000, 'turn-1', 'done'),
+    ])
+    const [step] = assistants(parser)
+    const request = parser.snapshot().requests.find(item => item.startSeq === step?.seq)
+    expect(request?.requestConfig?.reasoningEffort).toBe('high')
+    expect(contexts(parser).some(node => node.kind === 'context' && node.provenance.label === 'configuration-update')).toBe(true)
+  })
+
+  it('marks thread_rolled_back as a turn-error node', () => {
+    const parser = feed([
+      sessionMeta(0),
+      taskStarted(1_000, 'turn-1'),
+      turnContext(1_100, 'turn-1'),
+      userMessage(2_000, 'first'),
+      assistantMessage(3_000, 'one'),
+      taskComplete(4_000, 'turn-1', 'one'),
+      line('event_msg', { type: 'thread_rolled_back', num_turns: 1 }, 5_000),
+    ])
+    const errors = parser.snapshot().eventNodes.filter(node => node.kind === 'turn-error')
+    expect(errors.map(node => node.kind === 'turn-error' ? node.code : null)).toEqual(['thread_rolled_back'])
+    expect(errors[0]?.kind === 'turn-error' ? errors[0].message : '').toBe('Rolled back 1 turn')
+  })
+
+  it('applies thread_settings_applied model to later requests', () => {
+    const parser = feed([
+      sessionMeta(0),
+      taskStarted(1_000, 'turn-1'),
+      turnContext(1_100, 'turn-1'),
+      userMessage(2_000, 'go'),
+      line('event_msg', {
+        type: 'thread_settings_applied', thread_id: 'thread-main',
+        thread_settings: { model: 'gpt-other-2', model_provider_id: 'openai', reasoning_effort: 'low' },
+      }, 2_500),
+      reasoning(3_000, 'thinking'),
+      usageRecord(3_500, 'turn-1', { input_tokens: 10, output_tokens: 2, total_tokens: 12 }),
+      taskComplete(5_000, 'turn-1', 'done'),
+    ])
+    const [step] = assistants(parser)
+    const request = parser.snapshot().requests.find(item => item.startSeq === step?.seq)
+    expect(request?.provenance?.model).toBe('gpt-other-2')
+    expect(request?.requestConfig?.reasoningEffort).toBe('low')
+    expect(parser.meta().model).toBe('gpt-other-2')
+  })
+
+  it('surfaces thread_goal_updated, world_state, and retained_context as context', () => {
+    const parser = feed([
+      sessionMeta(0),
+      taskStarted(1_000, 'turn-1'),
+      userMessage(2_000, 'go'),
+      line('world_state', { full: true, state: { agents_md: { text: 'x' }, host_skills: { body: 'y' } } }, 2_200),
+      line('event_msg', {
+        type: 'thread_goal_updated', threadId: 'thread-main',
+        goal: { threadId: 'thread-main', objective: 'build it in one hour', status: 'active' },
+      }, 2_500),
+      line('retained_context', {
+        type: 'verified_answer', turn_id: 'turn-1', call_id: 'call-q',
+        questions: [{ question: 'which db?', answer: 'sqlite' }],
+      }, 2_700),
+      taskComplete(5_000, 'turn-1', 'done'),
+    ])
+    const labels = contexts(parser).map(node => node.kind === 'context' ? node.provenance.label : '')
+    expect(labels).toEqual(expect.arrayContaining(['world-state', 'thread-goal', 'verified-answer']))
+    expect(parser.meta().promptCount).toBe(1)
+  })
+
+  it('emits a compaction node for a durable context_compaction item', () => {
+    const parser = feed([
+      sessionMeta(0),
+      taskStarted(1_000, 'turn-1'),
+      userMessage(2_000, 'go'),
+      line('response_item', { type: 'context_compaction', id: 'cc-1' }, 3_000),
+      taskComplete(5_000, 'turn-1', 'done'),
+    ])
+    const nodes = parser.snapshot().eventNodes.filter(node => node.kind === 'compaction')
+    expect(nodes).toHaveLength(1)
+  })
+})
+
 describe('isCodexHumanPrompt', () => {
   it('accepts a person\'s prompt', () => {
     expect(isCodexHumanPrompt('Please list the files')).toBe(true)
@@ -475,25 +938,82 @@ describe('isCodexHumanPrompt', () => {
     expect(isCodexHumanPrompt('<image>')).toBe(true)
   })
 
-  it('rejects the injected wrappers and preambles', () => {
+  it('accepts tag-shaped text that is not a known injected fragment', () => {
+    // The fallback is exact fragment markers, never "any XML tag" — real
+    // prompts like these were being rejected as injections.
+    expect(isCodexHumanPrompt('<question>Help me understand this</question>')).toBe(true)
+    expect(isCodexHumanPrompt('<user_instructions>Be brief.</user_instructions>')).toBe(true)
+    expect(isCodexHumanPrompt('Here is a list of bugs to fix')).toBe(true)
+  })
+
+  it('rejects the marked injected fragments', () => {
     expect(isCodexHumanPrompt('<environment_context>\n  <cwd>/work</cwd>\n</environment_context>')).toBe(false)
-    expect(isCodexHumanPrompt('<user_instructions>Be brief.</user_instructions>')).toBe(false)
+    expect(isCodexHumanPrompt('# AGENTS.md instructions\n\n<INSTRUCTIONS>\nBe brief.\n</INSTRUCTIONS>')).toBe(false)
+    expect(isCodexHumanPrompt('<turn_aborted>\nstop that\n</turn_aborted>')).toBe(false)
+    expect(isCodexHumanPrompt('<recommended_plugins>\nHere is a list of plugins\n</recommended_plugins>')).toBe(false)
+    expect(isCodexHumanPrompt('<skill>\n<name>x</name>\nbody\n</skill>')).toBe(false)
+    expect(isCodexHumanPrompt('<codex_internal_context source="goal">\nkeep going\n</codex_internal_context>')).toBe(false)
+    expect(isCodexHumanPrompt('<external_memory>\nremembered\n</external_memory>')).toBe(false)
+    expect(isCodexHumanPrompt('<hook_prompt hook_run_id="r-1">\nhook text\n</hook_prompt>')).toBe(false)
+  })
+
+  it('rejects guardian review relay fragments', () => {
     expect(isCodexHumanPrompt('The following is the Codex agent history for the previous window.')).toBe(false)
-    expect(isCodexHumanPrompt('Here is a list of the available skills.')).toBe(false)
+    expect(isCodexHumanPrompt('>>> TRANSCRIPT START')).toBe(false)
+    expect(isCodexHumanPrompt('>>> APPROVAL REQUEST END')).toBe(false)
+    expect(isCodexHumanPrompt('Reviewed Codex session id: 01a08ec9-447e-7422-ab3c-64550678d9')).toBe(false)
+    expect(isCodexHumanPrompt('[3] user: rebase 一下到 dev 分支')).toBe(false)
   })
 
-  it('rejects an AGENTS.md project-instruction block', () => {
-    expect(isCodexHumanPrompt('# AGENTS.md\n\nBe brief in this repo.')).toBe(false)
-    expect(isCodexHumanPrompt('#AGENTS.md\n\nno space after the hash')).toBe(false)
-    expect(isCodexHumanPrompt('\n\n  # AGENTS.md\n\nleading blank lines')).toBe(false)
-  })
-
-  it('keeps a prompt that only mentions AGENTS.md', () => {
-    // The rule is anchored at the start of the message: a person asking about
-    // the file is still a person.
-    expect(isCodexHumanPrompt('please update # AGENTS.md with the new rule')).toBe(true)
-    expect(isCodexHumanPrompt('# AGENTS.mdx is a different file')).toBe(true)
+  it('requires both markers, not just the opening tag', () => {
+    // A person pasting a half-written tag is still a person.
+    expect(isCodexHumanPrompt('<environment_context>\n  <cwd>/work</cwd>')).toBe(true)
+    expect(isCodexHumanPrompt('# AGENTS.md\n\nBe brief in this repo.')).toBe(true)
     expect(isCodexHumanPrompt('## AGENTS.md section')).toBe(true)
+    expect(isCodexHumanPrompt('please update # AGENTS.md with the new rule')).toBe(true)
+  })
+})
+
+describe('codexUserItems / codexHumanPromptText', () => {
+  const userMessage = (items: unknown[], kinds?: string[]) => ({
+    type: 'message', role: 'user',
+    content: items.map(item => typeof item === 'string' ? { type: 'input_text', text: item } : item),
+    ...(kinds === undefined ? {} : {
+      internal_chat_message_metadata_passthrough: { turn_id: 't-1', content_item_kinds: kinds },
+    }),
+  })
+
+  it('honours content_item_kinds over text markers', () => {
+    // Annotated rollouts classify by kind, so an injected fragment whose text
+    // would not match any marker is still context.
+    const payload = userMessage(
+      ['<mystery>injected</mystery>', 'fix the flaky test'],
+      ['guardian.followup_review_reminder', 'user.text'],
+    )
+    const items = codexUserItems(payload)
+    expect(items.map(item => item.human)).toEqual([false, true])
+    expect(items[0]?.label).toBe('guardian.followup_review_reminder')
+    expect(codexHumanPromptText(payload)).toBe('fix the flaky test')
+  })
+
+  it('falls back to per-item text markers on unannotated messages', () => {
+    const payload = userMessage([
+      '<environment_context>\n  <cwd>/work</cwd>\n</environment_context>',
+      'ship it',
+    ])
+    expect(codexUserItems(payload).map(item => item.human)).toEqual([false, true])
+    expect(codexHumanPromptText(payload)).toBe('ship it')
+  })
+
+  it('treats an image-only message as human input with no text', () => {
+    const payload = userMessage([{ type: 'input_image', image_url: 'data:image/png;base64,AA==' }])
+    expect(codexUserItems(payload).map(item => item.human)).toEqual([true])
+    expect(codexHumanPromptText(payload)).toBe('')
+  })
+
+  it('returns null for a fully injected message', () => {
+    const payload = userMessage(['<turn_aborted>\nstop\n</turn_aborted>'])
+    expect(codexHumanPromptText(payload)).toBeNull()
   })
 })
 

@@ -31,8 +31,8 @@ export function devinDbPath(env: NodeJS.ProcessEnv = process.env): string {
  * (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `KIMI_CODE_HOME`, `GROK_HOME`) plus
  * explicit `HARNESS_TRAJECTORY_*` overrides.
  *
- * Defaults: `~/.claude/projects`, `~/.codex/sessions`, `~/.kimi-code/sessions`,
- * `~/.grok/sessions`.
+ * Defaults: `~/.claude/projects`, `~/.codex/sessions` + `~/.codex/archived_sessions`,
+ * `~/.kimi-code/sessions`, `~/.grok/sessions`.
  */
 export function defaultRoots(env: NodeJS.ProcessEnv = process.env): HarnessRoot[] {
   const home = homedir()
@@ -46,6 +46,10 @@ export function defaultRoots(env: NodeJS.ProcessEnv = process.env): HarnessRoot[
   return [
     { kind: 'claude', dir: resolve(env['HARNESS_TRAJECTORY_CLAUDE_ROOT'] ?? join(claudeConfig, 'projects')) },
     { kind: 'codex', dir: resolve(env['HARNESS_TRAJECTORY_CODEX_ROOT'] ?? join(codexHome, 'sessions')) },
+    // Codex moves archived threads to a sibling store; rollout lookups
+    // (`find_rollout_path_by_id`) search both, and archived sessions stay
+    // viewable (rollout/src/list.rs, thread-store/src/local/archive_thread.rs).
+    { kind: 'codex', dir: resolve(env['HARNESS_TRAJECTORY_CODEX_ARCHIVED_ROOT'] ?? join(codexHome, 'archived_sessions')) },
     { kind: 'kimi', dir: resolve(env['HARNESS_TRAJECTORY_KIMI_ROOT'] ?? join(kimiHome, 'sessions')) },
     { kind: 'grok', dir: resolve(env['HARNESS_TRAJECTORY_GROK_ROOT'] ?? join(grokHome, 'sessions')) },
   ]

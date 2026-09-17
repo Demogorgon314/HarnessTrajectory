@@ -650,7 +650,9 @@ function applySurface(
     // Empty assistant messages project to no model message (usage-only), so
     // they price 0 — `deriveEventMessage` returns null for that case, and
     // `estimateMessage(null, true)` short-circuits before ROLE_OVERHEAD.
-    tokens: estimateMessage(message, type === 'assistant/message'),
+    // A content-free notice displays host bookkeeping, not a model message.
+    tokens: message?.source?.form === 'notice' && message.content?.length === 0
+      ? 0 : estimateMessage(message, type === 'assistant/message'),
   }
   // Image blocks ride the NODE (absent when zero): the stats board's image
   // cell sums the live surface, so a compacted message's images stop counting.
@@ -704,6 +706,8 @@ function applySurface(
       st.callNames = kept
     }
     if (data !== undefined && Boolean(data.error)) node.err = true
+  } else if (source?.form === 'notice' && typeof source.summary === 'string') {
+    node.text = source.summary
   } else if (source?.kind === 'skill-invocation') {
     node.skill = typeof source.name === 'string' ? source.name : '?'
   } else if (source?.kind === 'plugin') {

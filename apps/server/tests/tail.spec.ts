@@ -1,8 +1,12 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import * as zlib from 'node:zlib'
 import { afterEach, describe, expect, it } from 'vitest'
-import { readLines, utf8IncompleteTail } from '../src/tail.ts'
+import {
+  compressedTranscriptPath, plainTranscriptPath, readDecodedPrefix, readFirstLine, readLines,
+  resolveTranscriptFile, utf8IncompleteTail, zstdSupported,
+} from '../src/tail.ts'
 
 const dirs: string[] = []
 
@@ -71,5 +75,66 @@ describe('readLines', () => {
     expect(first.lines).toEqual([firstLine])
     const rest = await readLines(path, first.offset, first.rest)
     expect(rest.lines).toEqual([secondLine])
+  })
+})
+
+describe.skipIf(!zstdSupported())('compressed transcripts (.jsonl.zst)', () => {
+  async function zst(dir: string, name: string, body: string): Promise<string> {
+    const path = join(dir, `${name}.zst`)
+    await writeFile(path, zlib.zstdCompressSync(Buffer.from(body, 'utf8')))
+    return path
+  }
+
+  it('reads decoded lines with decoded-byte offsets', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'harness-trajectory-tail-'))
+    dirs.push(dir)
+    const one = JSON.stringify({ n: 0, text: '你好' })
+    const two = JSON.stringify({ n: 1 })
+    const path = await zst(dir, 'rollout.jsonl', `${one}\n${two}\n`)
+    const all = await readLines(path, 0)
+    expect(all.lines).toEqual([one, two])
+    expect(all.offset).toBe(Buffer.byteLength(`${one}\n${two}\n`))
+    // A `to` bound is a decoded-byte offset: only the prefix is sliced out.
+    const cut = Buffer.byteLength(`${one}\n`)
+    const prefix = await readLines(path, 0, '', cut)
+    expect(prefix.lines).toEqual([one])
+    expect(prefix.offset).toBe(cut)
+    const rest = await readLines(path, prefix.offset, prefix.rest)
+    expect(rest.lines).toEqual([two])
+  })
+
+  it('readFirstLine returns the decoded first record without a full decode error', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'harness-trajectory-tail-'))
+    dirs.push(dir)
+    const meta = JSON.stringify({ type: 'session_meta', payload: { id: 'thread-1' } })
+    const path = await zst(dir, 'rollout.jsonl', `${meta}\n${JSON.stringify({ n: 1 })}\n`)
+    expect(await readFirstLine(path)).toBe(meta)
+  })
+
+  it('readDecodedPrefix honours the byte cut on either representation', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'harness-trajectory-tail-'))
+    dirs.push(dir)
+    const one = JSON.stringify({ n: 0 })
+    const two = JSON.stringify({ n: 1 })
+    const three = JSON.stringify({ n: 2 })
+    const cut = Buffer.byteLength(`${one}\n${two}\n`)
+    const path = await zst(dir, 'base.jsonl', `${one}\n${two}\n${three}\n`)
+    // The canonical plain spelling resolves to the `.zst` on disk.
+    const slice = await readDecodedPrefix(plainTranscriptPath(path), cut)
+    expect(slice.lines).toEqual([one, two])
+    expect(slice.offset).toBe(cut)
+  })
+
+  it('resolveTranscriptFile prefers the plain sibling when both exist', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'harness-trajectory-tail-'))
+    dirs.push(dir)
+    const plain = join(dir, 'rollout.jsonl')
+    await writeFile(plain, '{}\n')
+    const compressed = await zst(dir, 'rollout.jsonl', '{}\n')
+    const resolved = await resolveTranscriptFile(compressed)
+    expect(resolved?.path).toBe(plain)
+    expect(resolved?.compressed).toBe(false)
+    expect(compressedTranscriptPath(plain)).toBe(compressed)
+    expect(plainTranscriptPath(compressed)).toBe(plain)
   })
 })

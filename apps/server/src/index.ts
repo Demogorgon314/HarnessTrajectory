@@ -9,13 +9,13 @@ import { watch, type FSWatcher } from 'node:fs'
 import { readdir, readFile, stat } from 'node:fs/promises'
 import { basename, dirname, join, relative, sep } from 'node:path'
 import {
-  asArray, asString, isRecord, GROK_SIDECAR_METHOD,
+  asArray, asNumber, asString, isRecord, parseJsonLine, GROK_SIDECAR_METHOD,
   type AgentFileMeta, type HarnessKind, type SessionDetail, type SessionFileRef,
   type SessionLiveEvent, type SessionSummary,
 } from '@harness-trajectory/core'
 import {
   agentMetaEqual, createMetaScanner, hydrateMeta, listingScannerFor, mergeChildAgent, META_SCANNER_VERSION,
-  readHead, serializeMeta, type MetaScanner,
+  readHead, serializeMeta, type FileHead, type MetaScanner,
 } from './meta.ts'
 import type { ListingCache } from './listing-cache.ts'
 import type { HarnessRoot } from './roots.ts'
@@ -25,7 +25,27 @@ import {
   SessionBook, sessionKey, standaloneRef, type SourceEntry, type SourceSession,
   type SessionSource, type Subscriber,
 } from './source.ts'
-import { readFirstLine, readLines } from './tail.ts'
+import {
+  isCompressedTranscript, plainTranscriptPath, readDecodedPrefix, readFirstLine, readLines,
+  resolveTranscriptFile, zstdSupported,
+} from './tail.ts'
+import {
+  CodexRollouts, codexFootprintMatches, codexIdsFromName, parseCodexFootprint,
+  serializeCodexFootprint, type CodexBase,
+} from './codex-rollouts.ts'
+
+/** Keep the owning header even though it precedes the child's activity boundary. */
+function isOwnCodexRecord(entry: FileEntry, line: string): boolean {
+  if (entry.historyStartOrdinal === undefined) return true
+  const record = parseJsonLine(line)
+  if (!isRecord(record)) return true
+  if (record['type'] === 'session_meta') {
+    const payload = record['payload']
+    return isRecord(payload) && payload['id'] === entry.ref.id
+  }
+  const ordinal = asNumber(record['ordinal'])
+  return ordinal === undefined || ordinal >= entry.historyStartOrdinal
+}
 
 // The shared source plumbing lives in `source.ts`; these re-exports keep the
 // historical `index.ts` import surface (tests, app.ts) intact.
@@ -56,9 +76,15 @@ interface FileEntry extends SourceEntry {
   ref: SessionFileRef
   /** Owning session id (`ref.id` for main files, the parent id for children). */
   sessionId: string
+  /**
+   * Size of the stream's own content in DECODED bytes (a plain file's size;
+   * for a `.jsonl.zst` head the decompressed length). Excludes lineage bases.
+   */
   size: number
+  /** Physical size of the on-disk representation; the watch/listing change check. */
+  physicalSize: number
   mtimeMs: number
-  /** Byte offset up to which lines have been consumed. */
+  /** Byte offset up to which lines have been consumed (decoded for compressed heads). */
   offset: number
   rest: string
   /**
@@ -94,6 +120,36 @@ interface FileEntry extends SourceEntry {
    * and no parent binding existed yet. Re-probed until it settles.
    */
   grokUnresolved?: boolean
+
+  // -- Codex lineage / compression ------------------------------------------
+  /** Codex only: the rollout id from the filename (last UUID), which `history_base` references. */
+  rolloutId?: string
+  /** Codex only: `session_meta.id` — stable across revert; shared by several physical files. */
+  threadId?: string
+  /** Codex only: the root the file registered under (bases resolve across every codex root). */
+  rootDir?: string
+  /** Codex only: the head's own `session_meta.history_base`, kept for re-resolution. */
+  historyBase?: FileHead['historyBase']
+  /** Codex only: records below this stream ordinal are inherited parent history — never indexed. */
+  historyStartOrdinal?: number
+  /** Codex only: resolved lineage bases, oldest first. */
+  bases?: CodexBase[] | undefined
+  /** Codex only: rollout ids `resolveCodexBases` could not find on disk yet. */
+  pendingBases?: Set<string> | undefined
+  /** Codex only: a base registered after this head consumed — re-resolve and re-read. */
+  basesStale?: boolean | undefined
+  /** Codex only: decoded bytes/lines the resolved bases contributed. */
+  baseBytes: number
+  baseLines: number
+  basesConsumed: boolean
+  /** Codex only: `{resolved path, physical size, mtime}` per consumed base — the listing fingerprint. */
+  baseFootprint?: { p: string; s: number; m: number }[] | undefined
+  /** Codex only: the head's on-disk representation is `.jsonl.zst` (immutable). */
+  compressed?: boolean | undefined
+  /** Codex only: decoded length of a compressed head — its cursor's end. */
+  decodedSize?: number
+  /** Codex only: a superseded same-thread rollout — never listed as a session. */
+  superseded?: boolean
 }
 
 type SessionRecord = SourceSession<FileEntry>
@@ -123,16 +179,30 @@ export interface SessionIndexOptions {
   deferBackfill?: boolean
 }
 
+interface Classified {
+  /**
+   * Pre-meta identity. Codex: the rollout id (last filename UUID), the value
+   * `history_base` references. Other harnesses: the path-derived session/file id.
+   */
+  id: string
+  role: 'main' | 'child'
+  parentId?: string
+  /** Codex only: rollout id and filename thread id (the first UUID). */
+  rolloutId?: string
+  threadUuid?: string
+}
+
 /** Identify the transcript role of a file from its path; `null` when it is not a transcript. */
 export function classifyPath(
   kind: HarnessKind,
   root: string,
   path: string,
-): { id: string; role: 'main' | 'child'; parentId?: string } | null {
-  if (!path.endsWith('.jsonl')) return null
+): Classified | null {
+  const codex = kind === 'codex'
+  if (!path.endsWith('.jsonl') && !(codex && path.endsWith('.jsonl.zst'))) return null
   const rel = relative(root, path)
   if (rel.startsWith('..')) return null
-  const name = basename(path, '.jsonl')
+  let name = basename(path, '.jsonl')
   const parts = rel.split(sep)
   if (kind === 'claude') {
     // <slug>/<uuid>.jsonl, <slug>/agent-<id>.jsonl, <slug>/<uuid>/subagents/agent-<id>.jsonl
@@ -148,11 +218,22 @@ export function classifyPath(
     }
     return null
   }
-  if (kind === 'codex') {
-    // YYYY/MM/DD/rollout-<timestamp>-<threadId>.jsonl; identity comes from session_meta.
+  if (codex) {
+    // YYYY/MM/DD/rollout-<timestamp>-<threadId>[_<rolloutId>].jsonl[.zst]; a
+    // reverted thread's new file appends its own rollout id after the stable
+    // thread id, and cold files carry `.zst` (rollout/src/rollout_file_name.rs).
+    let stem = basename(path)
+    if (stem.endsWith('.zst')) stem = stem.slice(0, -'.zst'.length)
+    name = stem.endsWith('.jsonl') ? stem.slice(0, -'.jsonl'.length) : stem
     if (!name.startsWith('rollout-')) return null
-    const match = /-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(name)
-    return { id: match?.[1] ?? name, role: 'main' }
+    const ids = codexIdsFromName(name)
+    const rolloutId = ids.rolloutId ?? name
+    return {
+      id: rolloutId,
+      role: 'main',
+      ...(ids.rolloutId === undefined ? {} : { rolloutId: ids.rolloutId }),
+      ...(ids.threadUuid === undefined ? {} : { threadUuid: ids.threadUuid }),
+    }
   }
   if (kind === 'kimi') {
     // <workspace>/session_<id>/agents/<agentId>/wire.jsonl — identity is entirely path-derived.
@@ -195,6 +276,22 @@ export class SessionIndex extends EventEmitter implements SessionSource {
   private grokGeneration = 0
   /** Grok root → the generation its whole-root sweep ran at (negative cache). */
   private readonly grokSwept = new Map<string, number>()
+
+  // -- Codex rollout lineage -------------------------------------------------
+  /**
+   * Codex filename/registry/lineage bookkeeping — rollout ids, representation
+   * dedup, `history_base` resolution, same-thread supersession. The mechanics
+   * live in `codex-rollouts.ts`; this index only applies its verdicts to the
+   * shared `SessionBook`.
+   */
+  private readonly codex = new CodexRollouts<FileEntry>(() =>
+    this.roots.filter(root => root.kind === 'codex').map(root => root.dir))
+  /**
+   * Session keys whose live head was demoted by a revert and whose
+   * replacement has not registered yet — the new head's `file` event must
+   * carry `reset` because the demote already cleared the session's pointer.
+   */
+  private readonly codexResets = new Set<string>()
   private readonly watchers: FSWatcher[] = []
   private readonly pending = new Map<string, NodeJS.Timeout>()
   private poll: NodeJS.Timeout | null = null
@@ -238,7 +335,20 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     const planned: { root: HarnessRoot; path: string; mtimeMs: number }[] = []
     for (const root of this.roots) {
       if (this.stopped) return
-      const paths = (await walk(root.dir)).filter(path => classifyPath(root.kind, root.dir, path) !== null)
+      let paths = (await walk(root.dir)).filter(path => classifyPath(root.kind, root.dir, path) !== null)
+      if (root.kind === 'codex') {
+        // One rollout can sit on disk twice mid-transition; Codex itself
+        // resolves the plain file first, so the `.zst` twin is never a
+        // second session (rollout/src/compression.rs).
+        const seen = new Set(paths)
+        paths = paths.filter(path => !isCompressedTranscript(path) || !seen.has(plainTranscriptPath(path)))
+        // Seed the rollout-id → path index; `history_base` resolution looks
+        // bases up here before they are registered (or listed at all).
+        for (const path of paths) {
+          const rolloutId = classifyPath(root.kind, root.dir, path)?.rolloutId
+          if (rolloutId !== undefined) this.codex.notePath(rolloutId, path)
+        }
+      }
       // Watch before the sweep, not after it: a transcript created while the
       // pool below is still reading older files is announced by the watcher
       // instead of waiting for the next start. The consume lock keeps a watch
@@ -371,7 +481,7 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     for (const entry of entries) emit({ type: 'file', file: refOf(entry) })
     const sources = await Promise.all(entries.map(async (entry) => {
       // Read up to the index's consumed offset; live events cover the rest.
-      const lines = await readWholeFile(entry.path, entry.offset)
+      const lines = await this.readEntryLines(entry)
       // Grok's session facts, system prompt and tool schemas live beside the
       // transcript, so one synthetic line carries them into the fold
       // (GROK-DESIGN §3). Its `timestamp` is the session's creation instant, so
@@ -396,6 +506,24 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     emit({ type: 'meta', summary: this.book.summarize(session), children: this.book.childSummaries(session) })
   }
 
+  /**
+   * The entry's consumed records as one logical stream: a Codex head replays
+   * its lineage bases' decoded prefixes first (immutable, so read whole each
+   * time), then its own bytes up to the cursor.
+   */
+  private async readEntryLines(entry: FileEntry): Promise<string[]> {
+    if (entry.bases === undefined || entry.bases.length === 0) {
+      return readWholeFile(entry.path, entry.offset)
+    }
+    const lines: string[] = []
+    for (const base of entry.bases) {
+      const slice = await readDecodedPrefix(base.path, base.endByteOffset ?? undefined)
+      lines.push(...slice.lines)
+    }
+    lines.push(...await readWholeFile(entry.path, entry.offset))
+    return lines
+  }
+
   subscribe(kind: HarnessKind, id: string, subscriber: Subscriber): () => void {
     return this.book.subscribe(kind, id, subscriber)
   }
@@ -410,29 +538,90 @@ export class SessionIndex extends EventEmitter implements SessionSource {
   private async register(root: HarnessRoot, path: string, initial = false): Promise<FileEntry | undefined> {
     const classified = classifyPath(root.kind, root.dir, path)
     if (classified === null) return undefined
-    let info
-    try {
-      info = await stat(path)
-    } catch {
-      return undefined
+    let info: { size: number; mtimeMs: number }
+    let compressed = false
+    if (root.kind === 'codex') {
+      // Codex resolves the plain `.jsonl` before its `.jsonl.zst` twin
+      // (rollout/src/compression.rs), and a watch event can name either
+      // spelling — resolve before touching rollout-level dedup.
+      const file = await resolveTranscriptFile(path)
+      if (file === null || (file.compressed && !zstdSupported())) return undefined
+      path = file.path
+      compressed = file.compressed
+      info = file
+    } else {
+      try {
+        const found = await stat(path)
+        if (!found.isFile()) return undefined
+        info = found
+      } catch {
+        return undefined
+      }
     }
-    if (!info.isFile()) return undefined
     let id = classified.id
     let parentId = classified.parentId
+    // Codex's session id is `session_meta.id` (the THREAD id, stable across
+    // revert); `classified.id` is the rollout id (the file's own identity).
+    let rolloutId: string | undefined
+    let threadId: string | undefined
+    let historyBase: FileHead['historyBase']
+    let historyStartOrdinal: number | undefined
+    if (root.kind === 'codex') {
+      rolloutId = classified.rolloutId ?? classified.id
+      const canonical = plainTranscriptPath(path)
+      this.codex.notePath(rolloutId, canonical)
+      if (this.codex.isSuperseded(canonical)) {
+        await this.noteCodexBaseAvailable(rolloutId)
+        return undefined
+      }
+      const existing = this.codex.entry(rolloutId)
+      if (existing !== undefined) {
+        await this.noteCodexBaseAvailable(rolloutId)
+        if (existing.path === path) return existing
+        return this.migrateCodexRepresentation(existing, path, info, compressed, initial)
+      }
+    }
     // Codex identity lives in `session_meta`; a Claude child names its parent in its first record.
     // Kimi needs no probe: `classifyPath` already derived both ids from the path.
     if (root.kind === 'codex' || (root.kind === 'claude' && classified.role === 'child')) {
       try {
         const head = readHead(root.kind, await readFirstLine(path))
         if (root.kind === 'codex') {
-          id = head.id ?? id
+          threadId = head.id ?? classified.threadUuid ?? rolloutId
+          id = threadId ?? id
           parentId = head.parentId ?? undefined
+          historyBase = head.historyBase ?? undefined
+          historyStartOrdinal = head.historyStartOrdinal ?? undefined
         } else if (parentId === undefined) {
           parentId = head.id ?? undefined
         }
       } catch {
         // Unreadable head: keep the path-derived identity.
+        if (root.kind === 'codex') threadId = classified.threadUuid ?? rolloutId
       }
+    }
+    // Codex lineage: `history_base` names the older rollout this file's
+    // history starts from, and a reverted thread leaves several physical
+    // files sharing one thread id — only the head of the chain is a session.
+    let bases: CodexBase[] = []
+    let pendingBases: Set<string> | undefined
+    if (root.kind === 'codex') {
+      const lineage = await this.codex.resolveBases(historyBase)
+      bases = lineage.bases
+      if (lineage.missing.length > 0) pendingBases = new Set(lineage.missing)
+      const outcome = this.codex.arbitrate({
+        rolloutId: rolloutId ?? '',
+        threadId,
+        bases,
+        pendingBases,
+        mtimeMs: info.mtimeMs,
+      })
+      if (outcome.superseded) {
+        this.codex.markSuperseded(plainTranscriptPath(path))
+        await this.noteCodexBaseAvailable(rolloutId ?? '')
+        return undefined
+      }
+      for (const other of outcome.demote) this.demoteCodexFile(other, !initial)
     }
     // Grok's role is not path-derived: a child session is a top-level directory
     // like any other and only `summary.json` says otherwise (GROK-DESIGN §2).
@@ -460,6 +649,7 @@ export class SessionIndex extends EventEmitter implements SessionSource {
       path,
       ...(parentId === undefined ? {} : { parentId }),
       ...(agent === undefined ? {} : { agent }),
+      ...(historyStartOrdinal === undefined ? {} : { historyStartOrdinal }),
     }
     const entry: FileEntry = {
       kind: root.kind,
@@ -467,6 +657,7 @@ export class SessionIndex extends EventEmitter implements SessionSource {
       ref,
       sessionId,
       size: 0,
+      physicalSize: info.size,
       mtimeMs: info.mtimeMs,
       offset: 0,
       rest: '',
@@ -476,15 +667,44 @@ export class SessionIndex extends EventEmitter implements SessionSource {
       searchFrom: 0,
       searchSkipped: false,
       meta: listingScannerFor(root.kind, role, agent, grokSummary),
+      baseBytes: 0,
+      baseLines: 0,
+      basesConsumed: false,
       ...(root.kind === 'grok' ? { summaryTitle: grokSummaryTitle(grokSummary) } : {}),
       ...(grokUnresolved && role === 'main' ? { grokUnresolved: true } : {}),
+      ...(root.kind === 'codex' ? {
+        rootDir: root.dir,
+        ...(rolloutId === undefined ? {} : { rolloutId }),
+        ...(threadId === undefined ? {} : { threadId }),
+        ...(historyStartOrdinal === undefined ? {} : { historyStartOrdinal }),
+        ...(historyBase === undefined || historyBase === null ? {} : { historyBase }),
+        ...(bases.length === 0 ? {} : { bases }),
+        ...(pendingBases === undefined ? {} : { pendingBases }),
+        ...(compressed ? { compressed: true } : {}),
+      } : {}),
     }
     if (this.book.files.has(path)) return this.book.files.get(path)
     this.book.files.set(path, entry)
+    if (root.kind === 'codex') {
+      this.codex.registered(entry)
+      // Heads still waiting for this file as a lineage base re-resolve through it.
+      await this.noteCodexBaseAvailable(rolloutId ?? '')
+      if (pendingBases !== undefined) this.codex.setWaiting(entry, [...pendingBases])
+    }
     const session = this.book.sessionFor(root.kind, sessionId)
+    // A live revert demotes the old head above, which already clears
+    // `session.main`/`children` — `session.main !== null` can therefore never
+    // observe the replacement. The demote records the fact instead, and the
+    // new head's `file` event carries `reset` so an open view refolds.
+    const demoted = this.codexResets.delete(sessionKey(root.kind, sessionId))
+    const replaced = demoted
+      || (role === 'main' && session.main !== null && session.main !== entry)
+      || (role === 'child' && session.children.get(id) !== undefined && session.children.get(id) !== entry)
     if (role === 'main') session.main = entry
     else session.children.set(id, entry)
-    if (role === 'child' && !initial) this.book.emitTo(session, { type: 'file', file: ref })
+    if (!initial && (role === 'child' || replaced)) {
+      this.book.emitTo(session, { type: 'file', file: ref, ...(replaced ? { reset: true } : {}) })
+    }
     // The meta scanner replays from byte 0 unless the listing cache restores
     // it; the search index answers with the first line it has not stored yet.
     // A transcript untouched for longer than the retention window stays
@@ -498,7 +718,7 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     // (a subagent transcript that just appeared) is always read, since its
     // lines are forwarded to whoever is watching.
     const restored = initial
-      ? this.restoreListing(entry, info, await this.sidecarMtime(entry))
+      ? await this.restoreListing(entry, info, await this.sidecarMtime(entry))
       : 'none'
     if (restored === 'none') {
       if (initial) this.sweepRead += 1
@@ -518,6 +738,99 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     await this.syncGrokSummary(entry, true)
     this.saveListing(entry)
     return entry
+  }
+
+  /**
+   * Remove a superseded same-thread rollout from the listing: it stays on
+   * disk as a lineage base (or dead branch) but is no longer a session of its
+   * own. Its indexed rows are dropped — the surviving head re-indexes the
+   * shared prefix under its own key.
+   */
+  private demoteCodexFile(entry: FileEntry, live: boolean): void {
+    entry.superseded = true
+    this.book.files.delete(entry.path)
+    this.codex.forget(entry)
+    const key = sessionKey(entry.kind, entry.sessionId)
+    // The replacement registers moments later; by then the session no longer
+    // points at this entry, so the reset must be remembered here.
+    if (live) this.codexResets.add(key)
+    const session = this.book.sessions.get(key)
+    if (session !== undefined) {
+      if (session.main === entry) session.main = null
+      for (const [childId, child] of session.children) {
+        if (child === entry) session.children.delete(childId)
+      }
+      if (session.main === null && session.children.size === 0) {
+        this.book.sessions.delete(key)
+      } else {
+        this.book.emitTo(session, {
+          type: 'meta',
+          summary: this.book.summarize(session),
+          children: this.book.childSummaries(session),
+        })
+      }
+    }
+    this.search?.reset(entry.path)
+    this.emit('change', entry.kind, entry.sessionId)
+  }
+
+  /**
+   * Re-point an entry at the other representation of its rollout — Codex
+   * materializes a `.jsonl.zst` back to `.jsonl` before appending
+   * (rollout/src/compression.rs). Decoded offsets carry over unchanged, but
+   * the stream is re-read so search/meta stay consistent under the new path
+   * key and any appended bytes are picked up.
+   */
+  private async migrateCodexRepresentation(
+    entry: FileEntry,
+    path: string,
+    info: { size: number; mtimeMs: number },
+    compressed: boolean,
+    initial: boolean,
+  ): Promise<FileEntry> {
+    this.book.files.delete(entry.path)
+    this.search?.reset(entry.path)
+    entry.path = path
+    entry.ref = { ...entry.ref, path }
+    entry.compressed = compressed ? true : undefined
+    entry.physicalSize = info.size
+    this.book.files.set(path, entry)
+    this.resetCodexStream(entry)
+    const session = this.book.sessions.get(sessionKey(entry.kind, entry.sessionId))
+    if (session !== undefined) this.book.emitTo(session, { type: 'file', file: entry.ref, reset: true })
+    await this.consume(entry, info.size, info.mtimeMs, initial)
+    this.saveListing(entry)
+    return entry
+  }
+
+  /**
+   * A rollout a head was waiting for is now on disk: re-resolve its base
+   * chain and re-read the stream so the new slices land ahead of the head's
+   * own records.
+   */
+  private async noteCodexBaseAvailable(rolloutId: string): Promise<void> {
+    for (const entry of this.codex.baseAvailable(rolloutId)) {
+      // Serialized by the consume lock: a waiter mid-consume folds this into
+      // `consumePending` and re-resolves when the in-flight read drains.
+      await this.consume(entry, entry.physicalSize, entry.mtimeMs)
+      this.saveListing(entry)
+    }
+  }
+
+  /** Rewind a Codex entry's stream state so `consume` replays it with its current bases. */
+  private resetCodexStream(entry: FileEntry): void {
+    entry.offset = 0
+    entry.rest = ''
+    entry.lines = 0
+    entry.baseBytes = 0
+    entry.baseLines = 0
+    entry.baseFootprint = undefined
+    entry.basesConsumed = false
+    entry.searchFrom = 0
+    this.search?.reset(entry.path)
+    if (entry.meta !== null) entry.meta = createMetaScanner(entry.kind, null)
+    const session = this.book.sessions.get(sessionKey(entry.kind, entry.sessionId))
+    if (session !== undefined) this.book.emitTo(session, { type: 'file', file: entry.ref, reset: true })
   }
 
   /**
@@ -733,23 +1046,40 @@ export class SessionIndex extends EventEmitter implements SessionSource {
    * the appended bytes are read through the restored scanner, exactly like the
    * live tail. `none`: anything else, and the file is scanned from byte 0.
    */
-  private restoreListing(
+  private async restoreListing(
     entry: FileEntry,
     info: { size: number; mtimeMs: number },
     sidecarMtimeMs: number | null,
-  ): 'none' | 'full' | 'tail' {
+  ): Promise<'none' | 'full' | 'tail'> {
     const cache = this.listing
     if (cache === undefined) return 'none'
     const row = cache.load(entry.path)
     if (row === undefined || row.scannerVersion !== META_SCANNER_VERSION) return 'none'
     if (row.sidecarMtimeMs !== sidecarMtimeMs) return 'none'
+    // Codex rows carry a footprint: the head's physical size plus each lineage
+    // base's resolved stat. Any change to a base — or a base resolved now that
+    // was missing at save time — invalidates the snapshot.
+    if (entry.kind === 'codex' && !(await codexFootprintMatches(entry, row.footprint))) {
+      // The LOGICAL stream changed although the head's own stat did not:
+      // `beginFile` already answered from the head's size/mtime, so the stored
+      // rows are indexed under the old base-less line numbering. Drop them and
+      // re-queue every replayed line.
+      this.search?.reset(entry.path)
+      entry.searchFrom = 0
+      return 'none'
+    }
     // `unchanged` also requires the snapshot to have been fully consumed: a row
-    // that stopped mid-file must not skip the bytes past `consumedBytes`.
+    // that stopped mid-file must not skip the bytes past `consumedBytes`. For
+    // a compressed head `consumedBytes` is a decoded offset, so the comparison
+    // target is the saved decoded length, not the physical size.
+    const decodedSize = entry.compressed === true ? parseCodexFootprint(row.footprint)?.d ?? row.size : row.size
     const unchanged =
-      row.consumedBytes === row.size && info.size === row.size && info.mtimeMs === row.mtimeMs
+      row.consumedBytes === decodedSize && info.size === row.size && info.mtimeMs === row.mtimeMs
     // `appended` covers both a grown transcript and a partially consumed one:
-    // resuming at `consumedBytes` reads the remainder through `rest`.
+    // resuming at `consumedBytes` reads the remainder through `rest`. A
+    // compressed head never appends — a different physical size is a rewrite.
     const appended =
+      entry.compressed !== true &&
       info.size >= row.size && info.size > row.consumedBytes && info.mtimeMs >= row.mtimeMs
     if (!unchanged && !appended) return 'none'
     // A scanner exists now but none ran back then: it cannot own state for
@@ -763,7 +1093,15 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     entry.offset = row.consumedBytes
     entry.rest = row.rest
     entry.lines = row.lines
-    entry.size = info.size
+    entry.size = decodedSize
+    if (entry.compressed === true) entry.decodedSize = decodedSize
+    if (entry.bases !== undefined && entry.bases.length > 0) {
+      entry.basesConsumed = true
+      const saved = parseCodexFootprint(row.footprint)
+      entry.baseBytes = saved?.bb ?? 0
+      entry.baseLines = saved?.bl ?? 0
+      entry.baseFootprint = saved?.b
+    }
     return unchanged ? 'full' : 'tail'
   }
 
@@ -779,8 +1117,11 @@ export class SessionIndex extends EventEmitter implements SessionSource {
 
   /** Persist the consume cursor and scanner state at a settle point. */
   private saveListing(entry: FileEntry): void {
+    // `size`/`mtimeMs` are the head representation's physical stat — for a
+    // `.zst` head the decoded cursor lives in `consumedBytes`/`footprint.d`.
+    const footprint = entry.kind === 'codex' ? serializeCodexFootprint(entry) : null
     this.listing?.save(entry.path, {
-      size: entry.size,
+      size: entry.physicalSize,
       mtimeMs: entry.mtimeMs,
       consumedBytes: entry.offset,
       rest: entry.rest,
@@ -788,6 +1129,7 @@ export class SessionIndex extends EventEmitter implements SessionSource {
       scannerVersion: META_SCANNER_VERSION,
       sidecarMtimeMs: entry.kind === 'grok' ? entry.summaryMtimeMs ?? null : null,
       state: serializeMeta(entry.meta),
+      footprint,
     })
   }
 
@@ -796,6 +1138,12 @@ export class SessionIndex extends EventEmitter implements SessionSource {
    * per call, so a multi-hundred-megabyte rollout is walked rather than loaded.
    */
   private async consumeInitial(entry: FileEntry, size: number, mtimeMs: number, initial: boolean): Promise<void> {
+    // A compressed head is decompressed whole in one pass; `size` is its
+    // physical (compressed) size and says nothing about the decoded stream.
+    if (entry.compressed === true) {
+      await this.consume(entry, size, mtimeMs, initial)
+      return
+    }
     let end = Math.min(INITIAL_CHUNK_BYTES, size)
     for (;;) {
       if (this.stopped) return
@@ -840,10 +1188,24 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     }
   }
 
-  /** Consume appended bytes: update metadata and forward new lines to subscribers. */
+  /**
+   * Consume appended bytes: update metadata and forward new lines to
+   * subscribers. `size` is the PHYSICAL size of the head's on-disk
+   * representation; a compressed head's cursor and `entry.size` live in
+   * decoded bytes instead.
+   */
   private async consumeInner(entry: FileEntry, size: number, mtimeMs: number, initial = false): Promise<void> {
     const session = this.book.sessions.get(sessionKey(entry.kind, entry.sessionId))
-    if (size < entry.offset) {
+    // A lineage base registered after this head consumed: re-resolve the chain
+    // under the consume lock and replay the whole stream.
+    if (entry.basesStale === true) {
+      entry.basesStale = false
+      this.resetCodexStream(entry)
+      const lineage = await this.codex.resolveBases(entry.historyBase)
+      entry.bases = lineage.bases
+      this.codex.setWaiting(entry, lineage.missing)
+    }
+    if (entry.compressed !== true && size < entry.offset) {
       // Truncated or rewritten: start over and tell subscribers to reset the file.
       entry.offset = 0
       entry.rest = ''
@@ -862,23 +1224,86 @@ export class SessionIndex extends EventEmitter implements SessionSource {
         : null
       if (session !== undefined) this.book.emitTo(session, { type: 'file', file: entry.ref, reset: true })
     }
-    entry.size = size
+    // A compressed rollout is immutable in practice: any stat change means the
+    // archive was rewritten, so the decoded stream is re-read whole.
+    if (
+      entry.compressed === true && entry.decodedSize !== undefined
+      && (size !== entry.physicalSize || mtimeMs !== entry.mtimeMs)
+    ) {
+      this.resetCodexStream(entry)
+    }
+    entry.physicalSize = size
     entry.mtimeMs = Math.max(entry.mtimeMs, mtimeMs)
+
+    // Codex lineage: the head's effective stream is its resolved bases'
+    // decoded prefixes (immutable, read once) followed by its own records.
+    if (entry.basesConsumed !== true && entry.bases !== undefined && entry.bases.length > 0) {
+      entry.basesConsumed = true
+      entry.baseFootprint = []
+      for (const base of entry.bases) {
+        const file = await resolveTranscriptFile(base.path)
+        entry.baseFootprint.push({ p: file?.path ?? base.path, s: file?.size ?? -1, m: file?.mtimeMs ?? -1 })
+        const slice = await readDecodedPrefix(base.path, base.endByteOffset ?? undefined)
+        entry.baseBytes += slice.offset
+        entry.baseLines += slice.lines.length
+        await this.feedLines(entry, session, slice.lines, initial)
+      }
+    }
+
+    if (entry.compressed === true) {
+      // Immutable: decoded size is learned on the first read; afterwards only
+      // a physical change (a rewritten archive) matters — the watcher's stat
+      // comparison gates that before we get here.
+      if (entry.offset === entry.decodedSize && entry.decodedSize !== undefined) return
+      const result = await readLines(entry.path, entry.offset, entry.rest)
+      entry.offset = result.offset
+      entry.rest = result.rest
+      entry.decodedSize = result.offset
+      entry.size = result.offset
+      await this.feedLines(entry, session, result.lines, initial)
+      return
+    }
+
+    entry.size = size
     if (size === entry.offset) return
     const result = await readLines(entry.path, entry.offset, entry.rest, size)
     entry.offset = result.offset
     entry.rest = result.rest
-    if (entry.meta !== null) {
-      for (const line of result.lines) entry.meta.push(line)
-    }
+    await this.feedLines(entry, session, result.lines, initial)
+  }
+
+  /**
+   * Feed one batch of freshly consumed lines to the meta scanner, the search
+   * index and the session's subscribers. `startLine` counts across the whole
+   * logical stream — lineage bases first — so a search hit's `line` matches
+   * the index `readAll` replays.
+   */
+  private async feedLines(
+    entry: FileEntry,
+    session: SessionRecord | undefined,
+    lines: readonly string[],
+    initial: boolean,
+  ): Promise<void> {
     // `index` advances `entry.lines`, so the first appended line's index is the
     // count as it stands here — the same one the search index gives the record.
     const startLine = entry.lines
-    this.index(entry, result.lines)
-    if (result.lines.length === 0 || session === undefined) return
+    if (entry.meta !== null) {
+      for (const line of lines) {
+        // A child's inherited records (below `historyStartOrdinal`, possibly
+        // replayed from lineage bases before the head's own `session_meta`
+        // arrives) are the parent's history — they must not steer the child's
+        // title or prompt tally. The scanner re-learns the boundary in-band
+        // for files registered without a head probe.
+        if (isOwnCodexRecord(entry, line)) {
+          entry.meta.push(line)
+        }
+      }
+    }
+    this.index(entry, lines)
+    if (lines.length === 0 || session === undefined) return
     this.applyChildListing(session)
     if (!initial) {
-      this.book.emitTo(session, { type: 'lines', file: entry.ref, lines: result.lines, startLine })
+      this.book.emitTo(session, { type: 'lines', file: entry.ref, lines: [...lines], startLine })
       this.book.emitTo(session, { type: 'meta', summary: this.book.summarize(session), children: this.book.childSummaries(session) })
     }
     this.emit('change', entry.kind, entry.sessionId)
@@ -897,11 +1322,16 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     }
     const key = searchKeyOf(entry)
     for (const line of lines) {
-      if (entry.lines >= entry.searchFrom) search.queue(key, entry.lines, line)
+      // Stream line numbers address search hits; durable ordinals determine
+      // ownership even when a base is missing or ordinal ranges have gaps.
+      const own = isOwnCodexRecord(entry, line)
+      if (own && entry.lines >= entry.searchFrom) search.queue(key, entry.lines, line)
       entry.lines += 1
     }
+    // `size` is what `beginFile` compares against the next start's stat: the
+    // physical representation's size, not a compressed head's decoded length.
     search.noteProgress(key, {
-      size: entry.size,
+      size: entry.physicalSize,
       mtimeMs: entry.mtimeMs,
       indexedBytes: entry.offset,
       indexedLines: entry.lines,
@@ -940,7 +1370,7 @@ export class SessionIndex extends EventEmitter implements SessionSource {
       const watcher = watch(root.dir, { recursive: true, persistent: true }, (_event, filename) => {
         if (filename === null || filename === undefined) return
         const name = filename.toString()
-        if (!name.endsWith('.jsonl')) return
+        if (!name.endsWith('.jsonl') && !(root.kind === 'codex' && name.endsWith('.jsonl.zst'))) return
         this.schedule(root, join(root.dir, name))
       })
       watcher.on('error', (error) => { this.emit('error', error) })
@@ -963,6 +1393,24 @@ export class SessionIndex extends EventEmitter implements SessionSource {
   }
 
   private async refresh(root: HarnessRoot, path: string): Promise<void> {
+    // A watch event can name either representation; the entry lives under the
+    // resolved one (the plain `.jsonl` while it exists).
+    if (root.kind === 'codex') {
+      const file = await resolveTranscriptFile(path)
+      if (file === null) return
+      const entry = this.book.files.get(file.path)
+      if (entry === undefined) {
+        await this.register(root, path)
+        return
+      }
+      try {
+        await this.consume(entry, file.size, file.mtimeMs)
+        this.saveListing(entry)
+      } catch {
+        // Deleted or momentarily unreadable; keep the last known state.
+      }
+      return
+    }
     const entry = this.book.files.get(path)
     if (entry === undefined) {
       await this.register(root, path)
@@ -988,8 +1436,20 @@ export class SessionIndex extends EventEmitter implements SessionSource {
       for (const entry of [session.main, ...session.children.values()]) {
         if (entry === null) continue
         try {
-          const info = await stat(entry.path)
-          if (info.size !== entry.size) await this.consume(entry, info.size, info.mtimeMs)
+          // Codex: the poll sees the physical representation's size; the entry
+          // may point at a `.zst` whose decoded size is tracked separately, or
+          // a materialized `.jsonl` the watcher has not delivered yet.
+          const file = entry.kind === 'codex'
+            ? await resolveTranscriptFile(entry.path)
+            : await stat(entry.path).then(info => info.isFile()
+              ? { path: entry.path, compressed: false, size: info.size, mtimeMs: info.mtimeMs }
+              : null)
+          if (file === null) continue
+          if (file.path !== entry.path && entry.kind === 'codex') {
+            await this.migrateCodexRepresentation(entry, file.path, file, file.compressed, false)
+          } else if (file.size !== entry.physicalSize || (entry.compressed === true && file.mtimeMs !== entry.mtimeMs)) {
+            await this.consume(entry, file.size, file.mtimeMs)
+          }
           await this.refreshAgentMeta(session, entry)
           await this.syncKimiTitle(entry)
           await this.syncGrokSummary(entry)
@@ -1321,7 +1781,7 @@ async function readWholeFile(path: string, end: number): Promise<string[]> {
   return lines
 }
 
-/** Recursively list `.jsonl` files under a directory; missing directories yield nothing. */
+/** Recursively list transcript files under a directory; missing directories yield nothing. */
 export async function walk(dir: string): Promise<string[]> {
   let entries
   try {
@@ -1335,7 +1795,7 @@ export async function walk(dir: string): Promise<string[]> {
     if (entry.isDirectory()) {
       if (entry.name === 'memory' || entry.name.startsWith('.')) continue
       paths.push(...await walk(path))
-    } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+    } else if (entry.isFile() && (entry.name.endsWith('.jsonl') || entry.name.endsWith('.jsonl.zst'))) {
       paths.push(path)
     }
   }

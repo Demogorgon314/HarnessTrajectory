@@ -49,7 +49,7 @@
 
 import {
   asArray, asNumber, asString, classifyInjectedUser, devinMessageClass, grokMessageClass,
-  isCodexHumanPrompt, isRecord, kimiMessageClass, kimiTitleText, parseDevinLine, parseGrokLine,
+  codexHumanPromptText, isRecord, kimiMessageClass, kimiTitleText, parseDevinLine, parseGrokLine,
   parseJsonLine, parseTime, GROK_SIDECAR_METHOD, type HarnessKind, type SearchRole,
 } from '@harness-trajectory/core'
 
@@ -290,26 +290,55 @@ function codexDocs(line: string): SearchDocDraft[] {
   const record = parseJsonLine(line)
   if (!isRecord(record)) return []
   const builder = new DocBuilder(parseTime(record['timestamp']))
-  // `event_msg` mirrors the response items and `session_meta` holds the system
-  // prompt; indexing either would double or flood the index.
-  if (asString(record['type']) !== 'response_item') return builder.docs
+  const recordType = asString(record['type'])
   const payload = record['payload']
   if (!isRecord(payload)) return builder.docs
 
+  // Agent traffic and retained answers are top-level records, not response
+  // items; `thread_goal_updated` is the one durable `event_msg` with unique
+  // user-authored text (the rest mirror response items — indexing them would
+  // double the index).
+  if (recordType === 'inter_agent_communication') {
+    const route = [asString(payload['author']), asString(payload['recipient'])]
+      .filter((part): part is string => part !== undefined && part !== '')
+      .join(' → ')
+    builder.add('other', `${route}\n${asString(payload['content']) ?? ''}`)
+    return builder.docs
+  }
+  if (recordType === 'retained_context') {
+    if (asString(payload['type']) !== 'verified_answer') return builder.docs
+    for (const entry of asArray(payload['questions']) ?? []) {
+      if (!isRecord(entry)) continue
+      builder.add('other', `${asString(entry['question']) ?? ''}\n${asString(entry['answer']) ?? ''}`)
+    }
+    return builder.docs
+  }
+  if (recordType === 'event_msg') {
+    if (asString(payload['type']) !== 'thread_goal_updated') return builder.docs
+    const goal = payload['goal']
+    if (isRecord(goal)) builder.add('other', asString(goal['objective']) ?? '')
+    return builder.docs
+  }
+  if (recordType !== 'response_item') return builder.docs
+
   switch (asString(payload['type'])) {
     case 'message': {
+      const role = asString(payload['role'])
+      if (role === 'user') {
+        // Environment snapshots, skill catalogs, and guardian relays ride the
+        // user role too; `codexHumanPromptText` keeps only the human items.
+        const text = codexHumanPromptText(payload)
+        if (text !== null && text.trim() !== '') builder.add('human', text)
+        break
+      }
       const text = (asArray(payload['content']) ?? [])
         .flatMap(item => (isRecord(item) && asString(item['type']) !== 'input_image'
           ? [asString(item['text']) ?? '']
           : []))
         .join('\n')
       if (text.trim() === '') break
-      const role = asString(payload['role'])
-      if (role === 'assistant') builder.add('assistant', text)
-      // Environment snapshots, skill catalogs, and compaction replays ride the
-      // user role too; `isCodexHumanPrompt` is the shared classifier for them.
       // `developer` is always instruction injection and never a prompt.
-      else if (role === 'user' && isCodexHumanPrompt(text)) builder.add('human', text)
+      if (role === 'assistant') builder.add('assistant', text)
       break
     }
     case 'reasoning':
@@ -330,8 +359,40 @@ function codexDocs(line: string): SearchDocDraft[] {
     case 'local_shell_call_output':
       builder.add('tool', codexOutputText(payload['output']), MAX_TOOL_OUTPUT_CHARS)
       break
+    case 'web_search_call':
+      builder.add('tool', renderToolCall('web_search', payload['action']))
+      break
+    case 'image_generation_call':
+      builder.add('tool', renderToolCall('image_generation', {
+        prompt: payload['revised_prompt'],
+      }))
+      break
+    case 'tool_search_call':
+      builder.add('tool', renderToolCall('tool_search', payload['arguments']))
+      break
+    case 'tool_search_output': {
+      // `tools` is a schema array — index the discovered tool names.
+      const names = (asArray(payload['tools']) ?? [])
+        .flatMap(tool => (isRecord(tool) ? [asString(tool['name']) ?? ''] : []))
+        .filter(name => name !== '')
+      builder.add('tool', names.join('\n'), MAX_TOOL_OUTPUT_CHARS)
+      break
+    }
+    case 'agent_message': {
+      // Inter-agent traffic: sender/recipient + plaintext content parts.
+      const route = [asString(payload['author']), asString(payload['recipient'])]
+        .filter((part): part is string => part !== undefined && part !== '')
+        .join(' → ')
+      const text = (asArray(payload['content']) ?? [])
+        .flatMap(item => (isRecord(item) ? [asString(item['text']) ?? ''] : []))
+        .filter(part => part !== '')
+        .join('\n')
+      builder.add('other', `${route}\n${text}`)
+      break
+    }
     default:
-      // `compaction` (an encrypted replay), `web_search_call`, and future items.
+      // `compaction`/`context_compaction` (encrypted replays),
+      // `configuration_update`, and future items.
       break
   }
   return builder.docs

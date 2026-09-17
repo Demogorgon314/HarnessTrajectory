@@ -108,9 +108,25 @@ describe('extractSearchDocs — Codex', () => {
       content: [{ type: 'input_text', text: 'Refactor the parser' }],
     }))).toEqual([{ role: 'human', text: 'Refactor the parser', timeMs: T0 }])
 
-    for (const text of ['<environment_context>cwd</environment_context>', '# AGENTS.md instructions', 'Here is a list of skills']) {
+    for (const text of [
+      '<environment_context>cwd</environment_context>',
+      '# AGENTS.md instructions\n\n<INSTRUCTIONS>\nBe brief.\n</INSTRUCTIONS>',
+      '>>> TRANSCRIPT START',
+      // Annotated injected fragment — `content_item_kinds` decides, not text.
+    ]) {
       expect(docs('codex', item({ type: 'message', role: 'user', content: [{ type: 'input_text', text }] }))).toEqual([])
     }
+    // Text that only resembles an injection stays searchable human input.
+    for (const text of ['Here is a list of skills', '<question>what now?</question>']) {
+      expect(docs('codex', item({ type: 'message', role: 'user', content: [{ type: 'input_text', text }] })))
+        .toEqual([{ role: 'human', text, timeMs: T0 }])
+    }
+    // A `content_item_kinds` annotation classifies even unmarked text.
+    expect(docs('codex', item({
+      type: 'message', role: 'user',
+      content: [{ type: 'input_text', text: 'unmarked injected context' }],
+      internal_chat_message_metadata_passthrough: { content_item_kinds: ['guardian.followup_review_reminder'] },
+    }))).toEqual([])
     // `developer` is always instruction injection.
     expect(docs('codex', item({
       type: 'message', role: 'developer', content: [{ type: 'input_text', text: 'Always run the tests.' }],
@@ -156,6 +172,64 @@ describe('extractSearchDocs — Codex', () => {
       type: 'function_call_output', call_id: 'call_2',
       output: JSON.stringify({ output: 'exit 0', metadata: { exit_code: 0 } }),
     })))).toEqual(['tool: exit 0'])
+  })
+
+  it('indexes the durable web/image/tool-search calls as tools', () => {
+    expect(pairs(docs('codex', item({
+      type: 'web_search_call', id: 'ws-1', status: 'completed',
+      action: { type: 'search', query: 'codex rollout format' },
+    })))).toEqual(['tool: web_search\nquery: codex rollout format'])
+
+    expect(pairs(docs('codex', item({
+      type: 'image_generation_call', id: 'ig-1', revised_prompt: 'a gray tabby', result: 'aW1hZ2U=',
+    })))).toEqual(['tool: image_generation\nprompt: a gray tabby'])
+
+    expect(pairs(docs('codex', item({
+      type: 'tool_search_call', call_id: 'call-ts', execution: 'client',
+      arguments: { query: 'file tools' },
+    })))).toEqual(['tool: tool_search\nquery: file tools'])
+
+    // The discovered tool names are the searchable payload of the output.
+    expect(pairs(docs('codex', item({
+      type: 'tool_search_output', call_id: 'call-ts', status: 'completed', execution: 'client',
+      tools: [{ type: 'function', name: 'read_file' }, { type: 'function', name: 'write_file' }],
+    })))).toEqual(['tool: read_file\nwrite_file'])
+  })
+
+  it('indexes agent traffic, retained answers, and the thread goal as other', () => {
+    expect(pairs(docs('codex', item({
+      type: 'agent_message', id: 'am-1', author: '/child/explorer', recipient: '/root',
+      content: [{ type: 'input_text', text: 'found it in src/x.ts' }],
+    })))).toEqual(['other: /child/explorer → /root\nfound it in src/x.ts'])
+
+    expect(pairs(docs('codex', {
+      timestamp: iso(0), type: 'inter_agent_communication',
+      payload: { author: '/root', recipient: '/child/explorer', content: 'now check tests', trigger_turn: false },
+    }))).toEqual(['other: /root → /child/explorer\nnow check tests'])
+
+    expect(pairs(docs('codex', {
+      timestamp: iso(0), type: 'retained_context',
+      payload: {
+        type: 'verified_answer', turn_id: 'turn-1', call_id: 'call-q',
+        questions: [{ question: 'which db?', answer: 'sqlite' }],
+      },
+    }))).toEqual(['other: which db?\nsqlite'])
+
+    expect(pairs(docs('codex', {
+      timestamp: iso(0), type: 'event_msg',
+      payload: {
+        type: 'thread_goal_updated', threadId: 'thread-1',
+        goal: { threadId: 'thread-1', objective: 'build it in one hour', status: 'active' },
+      },
+    }))).toEqual(['other: build it in one hour'])
+    // Other event_msg records mirror response items — never indexed twice.
+    expect(docs('codex', {
+      timestamp: iso(0), type: 'event_msg',
+      payload: { type: 'thread_settings_applied', thread_settings: { model: 'gpt' } },
+    })).toEqual([])
+    // Encrypted compaction replays carry no readable text.
+    expect(docs('codex', item({ type: 'compaction', encrypted_content: 'gAAAA' }))).toEqual([])
+    expect(docs('codex', item({ type: 'context_compaction', encrypted_content: 'gAAAA' }))).toEqual([])
   })
 
   it('skips the mirrored event stream, session metadata, and data-URL images', () => {

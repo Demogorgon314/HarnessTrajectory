@@ -37,6 +37,15 @@ export interface SessionFileRef {
   parentId?: string
   /** Subagent facts when this file is (or was served as) an agent transcript. */
   agent?: AgentFileMeta
+  /**
+   * Codex only: `session_meta.subagent_history_start_ordinal`. Stream records
+   * whose `ordinal` sits below it are the PARENT's history materialized into
+   * this file — context for the model, but not the thread's own activity.
+   * The server reads it from the head's first record so the boundary is known
+   * before any lineage-base lines replay; parsers still honor the in-band
+   * `session_meta` copy when the field is absent.
+   */
+  historyStartOrdinal?: number
 }
 
 /** Listing row for one child transcript of a session. */

@@ -1,11 +1,17 @@
 import { mkdtemp, mkdir, rm, utimes, writeFile, appendFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import * as zlib from 'node:zlib'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { GROK_SIDECAR_METHOD, type SessionLiveEvent } from '@harness-trajectory/core'
 import { SessionIndex, classifyPath, lineTime, lineTimes, mergeChronologically, scopeToFile } from '../src/index.ts'
+import { zstdSupported } from '../src/tail.ts'
 import { createMetaScanner, emptyMeta, listingScannerFor, mergeChildAgent } from '../src/meta.ts'
 import { defaultRoots } from '../src/roots.ts'
+import { ListingCache } from '../src/listing-cache.ts'
+import { SearchIndexer } from '../src/search/indexer.ts'
+import { SearchStore, unpackText } from '../src/search/store.ts'
+import { extractSearchDocs } from '../src/search/extract.ts'
 
 function jsonl(records: readonly unknown[]): string {
   return records.map(record => JSON.stringify(record)).join('\n') + '\n'
@@ -29,10 +35,10 @@ function claudeAssistant(text: string, sessionId: string, offset: number) {
   }
 }
 
-function codexMeta(id: string, offset: number, parent?: string) {
+function codexMeta(id: string, offset: number, parent?: string, extra: Record<string, unknown> = {}) {
   return {
     timestamp: iso(offset), type: 'session_meta',
-    payload: { id, cwd: '/work/codex', model_provider: 'openai', thread_source: parent === undefined ? 'user' : 'subagent', ...(parent === undefined ? {} : { parent_thread_id: parent }) },
+    payload: { id, cwd: '/work/codex', model_provider: 'openai', thread_source: parent === undefined ? 'user' : 'subagent', ...(parent === undefined ? {} : { parent_thread_id: parent }), ...extra },
   }
 }
 
@@ -126,10 +132,32 @@ describe('classifyPath', () => {
     expect(classifyPath('claude', root, '/r/-slug/memory/notes.md')).toBeNull()
   })
 
-  it('recognizes Codex rollouts by name and extracts the thread id', () => {
+  it('recognizes Codex rollouts by name and extracts the rollout id', () => {
     const path = '/r/2026/09/14/rollout-2026-09-14T10-00-00-0199aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee.jsonl'
-    expect(classifyPath('codex', '/r', path)).toEqual({ id: '0199aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee', role: 'main' })
+    expect(classifyPath('codex', '/r', path)).toEqual({
+      id: '0199aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee',
+      role: 'main',
+      rolloutId: '0199aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee',
+      threadUuid: '0199aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee',
+    })
+    // A reverted thread's file carries `<threadId>_<rolloutId>`; the rollout
+    // id (what `history_base` references) is the last UUID.
+    const reverted = '/r/2026/09/16/rollout-2026-09-16T02-25-36-0199aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee_01a0a989-33bd-78e3-a255-8a5791f4b10a.jsonl'
+    expect(classifyPath('codex', '/r', reverted)).toEqual({
+      id: '01a0a989-33bd-78e3-a255-8a5791f4b10a',
+      role: 'main',
+      rolloutId: '01a0a989-33bd-78e3-a255-8a5791f4b10a',
+      threadUuid: '0199aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee',
+    })
+    // Cold rollouts are `.jsonl.zst`; the same ids parse through the suffix.
+    expect(classifyPath('codex', '/r', `${path}.zst`)).toEqual({
+      id: '0199aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee',
+      role: 'main',
+      rolloutId: '0199aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee',
+      threadUuid: '0199aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee',
+    })
     expect(classifyPath('codex', '/r', '/r/2026/09/14/notes.jsonl')).toBeNull()
+    expect(classifyPath('codex', '/r', '/r/2026/09/14/notes.jsonl.zst')).toBeNull()
   })
 
   it('recognizes Kimi wire transcripts and binds children to their session directory', () => {
@@ -174,16 +202,18 @@ describe('defaultRoots', () => {
     })).toEqual([
       { kind: 'claude', dir: join('/h', '.claude', 'projects') },
       { kind: 'codex', dir: join('/h', '.codex', 'sessions') },
+      { kind: 'codex', dir: join('/h', '.codex', 'archived_sessions') },
       { kind: 'kimi', dir: join('/h', '.kimi-code', 'sessions') },
       { kind: 'grok', dir: join('/h', '.grok', 'sessions') },
     ])
     expect(defaultRoots({
       HARNESS_TRAJECTORY_CLAUDE_ROOT: join('/roots', 'c'),
       HARNESS_TRAJECTORY_CODEX_ROOT: join('/roots', 'x'),
+      HARNESS_TRAJECTORY_CODEX_ARCHIVED_ROOT: join('/roots', 'xa'),
       HARNESS_TRAJECTORY_KIMI_ROOT: join('/roots', 'k'),
       HARNESS_TRAJECTORY_GROK_ROOT: join('/roots', 'g'),
     }).map(root => root.dir))
-      .toEqual([join('/roots', 'c'), join('/roots', 'x'), join('/roots', 'k'), join('/roots', 'g')])
+      .toEqual([join('/roots', 'c'), join('/roots', 'x'), join('/roots', 'xa'), join('/roots', 'k'), join('/roots', 'g')])
     // An empty `GROK_HOME` is not an override: grok itself falls back to the home default.
     expect(defaultRoots({ GROK_HOME: '' }).at(-1)?.dir.endsWith(join('.grok', 'sessions'))).toBe(true)
   })
@@ -935,6 +965,272 @@ describe('SessionIndex — Grok Build', () => {
     await index.refreshPath(join(mainDir, 'updates.jsonl'))
     expect(events).toEqual([])
     unsubscribe()
+  })
+})
+
+describe('SessionIndex Codex lineage and compression', () => {
+  let dir: string
+  let index: SessionIndex
+
+  const THREAD = '0199aaaa-0000-7000-8000-00000000000a'
+  const HEAD = '0199aaaa-0000-7000-8000-00000000000c'
+  const FORK_THREAD = '0199aaaa-0000-7000-8000-00000000000d'
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'harness-trajectory-codex-'))
+    await mkdir(join(dir, 'codex', '2026', '09', '14'), { recursive: true })
+  })
+
+  afterEach(async () => {
+    index?.stop()
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  const codexDir = () => join(dir, 'codex', '2026', '09', '14')
+  const rolloutPath = (name: string) => join(codexDir(), `${name}.jsonl`)
+
+  async function startIndex(): Promise<SessionIndex> {
+    index = new SessionIndex({ roots: [{ kind: 'codex', dir: join(dir, 'codex') }], watch: false })
+    await index.start()
+    return index
+  }
+
+  /** All `lines` payloads of a replay, flattened in order. */
+  async function replayLines(idx: SessionIndex, id: string): Promise<unknown[]> {
+    const records: unknown[] = []
+    await idx.readAll('codex', id, event => {
+      if (event.type === 'lines') for (const line of event.lines) records.push(JSON.parse(line))
+    })
+    return records
+  }
+
+  const textOf = (record: unknown) =>
+    (record as { payload?: { content?: { text?: string }[] } }).payload?.content?.[0]?.text
+  /** Message texts only — `session_meta` lines carry no content. */
+  const texts = (records: readonly unknown[]) => records.map(textOf).filter(text => text !== undefined)
+
+  it('lists a .jsonl.zst rollout and replays its decoded records', async () => {
+    if (!zstdSupported()) return
+    const body = jsonl([codexMeta(THREAD, 0), codexUser('Cold prompt', 10)])
+    await writeFile(`${rolloutPath(`rollout-2026-09-14T10-00-00-${THREAD}`)}.zst`, zlib.zstdCompressSync(Buffer.from(body)))
+    await startIndex()
+    const session = index.get('codex', THREAD)
+    expect(session).toMatchObject({ title: 'Cold prompt', promptCount: 1 })
+    expect(texts(await replayLines(index, THREAD))).toEqual(['Cold prompt'])
+  })
+
+  it('prefers the plain file over a .zst twin — one session, not two', async () => {
+    if (!zstdSupported()) return
+    const name = `rollout-2026-09-14T10-00-00-${THREAD}`
+    await writeFile(`${rolloutPath(name)}.zst`, zlib.zstdCompressSync(Buffer.from(jsonl([codexMeta(THREAD, 0), codexUser('Compressed', 10)]))))
+    await writeFile(rolloutPath(name), jsonl([codexMeta(THREAD, 0), codexUser('Plain', 10)]))
+    await startIndex()
+    expect(index.list().filter(session => session.kind === 'codex')).toHaveLength(1)
+    expect(texts(await replayLines(index, THREAD))).toEqual(['Plain'])
+  })
+
+  it('rebuilds a reverted thread from history_base and hides the superseded file', async () => {
+    const baseName = `rollout-2026-09-14T09-00-00-${THREAD}`
+    const headName = `rollout-2026-09-14T10-00-00-${THREAD}_${HEAD}`
+    const baseLines = [JSON.stringify(codexMeta(THREAD, 0)), JSON.stringify(codexUser('Kept one', 10)), JSON.stringify(codexUser('Kept two', 20)), JSON.stringify(codexUser('Rolled back', 30))]
+    const cut = Buffer.byteLength(`${baseLines.slice(0, 3).join('\n')}\n`)
+    await writeFile(rolloutPath(baseName), `${baseLines.join('\n')}\n`)
+    // `history_base.thread_id` references the base *rollout* id — the
+    // single-UUID base file's rollout id is that UUID itself.
+    await writeFile(rolloutPath(headName), jsonl([
+      codexMeta(THREAD, 40, undefined, { history_base: { thread_id: THREAD, end_ordinal_exclusive: 3, end_byte_offset: cut } }),
+      codexUser('After revert', 50),
+    ]))
+    await startIndex()
+    // One session; the superseded rollout never lists on its own.
+    expect(index.list().filter(session => session.kind === 'codex')).toHaveLength(1)
+    expect(texts(await replayLines(index, THREAD))).toEqual(['Kept one', 'Kept two', 'After revert'])
+  })
+
+  it('lets a forked thread inherit another thread’s prefix without hiding the base session', async () => {
+    const baseName = `rollout-2026-09-14T09-00-00-${THREAD}`
+    const forkName = `rollout-2026-09-14T10-00-00-${FORK_THREAD}_${HEAD}`
+    const baseLines = [JSON.stringify(codexMeta(THREAD, 0)), JSON.stringify(codexUser('Shared history', 10))]
+    const cut = Buffer.byteLength(`${baseLines.join('\n')}\n`)
+    await writeFile(rolloutPath(baseName), `${baseLines.join('\n')}\n`)
+    await writeFile(rolloutPath(forkName), jsonl([
+      codexMeta(FORK_THREAD, 40, undefined, { history_base: { thread_id: THREAD, end_ordinal_exclusive: 2, end_byte_offset: cut } }),
+      codexUser('Fork prompt', 50),
+    ]))
+    await startIndex()
+    expect(index.list().filter(session => session.kind === 'codex').map(session => session.id).sort())
+      .toEqual([FORK_THREAD, THREAD].sort())
+    expect(texts(await replayLines(index, FORK_THREAD))).toEqual(['Shared history', 'Fork prompt'])
+  })
+
+  it('re-resolves a base that appears after the head consumed', async () => {
+    const baseName = `rollout-2026-09-14T09-00-00-${THREAD}`
+    const headName = `rollout-2026-09-14T10-00-00-${THREAD}_${HEAD}`
+    const baseLines = [JSON.stringify(codexMeta(THREAD, 0)), JSON.stringify(codexUser('Late base', 10))]
+    const cut = Buffer.byteLength(`${baseLines.join('\n')}\n`)
+    const headPath = rolloutPath(headName)
+    await writeFile(headPath, jsonl([
+      codexMeta(THREAD, 40, undefined, { history_base: { thread_id: THREAD, end_ordinal_exclusive: 2, end_byte_offset: cut } }),
+      codexUser('After revert', 50),
+    ]))
+    await startIndex()
+    expect(texts(await replayLines(index, THREAD))).toEqual(['After revert'])
+    // The base lands later; registering it re-reads the head with the prefix.
+    const basePath = rolloutPath(baseName)
+    await writeFile(basePath, `${baseLines.join('\n')}\n`)
+    await index.refreshPath(basePath)
+    expect(texts(await replayLines(index, THREAD))).toEqual(['Late base', 'After revert'])
+    expect(index.list().filter(session => session.kind === 'codex')).toHaveLength(1)
+  })
+
+  it('migrates an entry when Codex materializes a .zst back to .jsonl', async () => {
+    if (!zstdSupported()) return
+    const name = `rollout-2026-09-14T10-00-00-${THREAD}`
+    const body = jsonl([codexMeta(THREAD, 0), codexUser('Cold prompt', 10)])
+    const compressedPath = `${rolloutPath(name)}.zst`
+    await writeFile(compressedPath, zlib.zstdCompressSync(Buffer.from(body)))
+    await startIndex()
+    expect(texts(await replayLines(index, THREAD))).toEqual(['Cold prompt'])
+    // Codex deletes the archive and resumes appending on the plain file.
+    await rm(compressedPath)
+    const plainPath = rolloutPath(name)
+    await writeFile(plainPath, `${body}${JSON.stringify(codexUser('Resumed', 20))}\n`)
+    await index.refreshPath(plainPath)
+    expect(texts(await replayLines(index, THREAD))).toEqual(['Cold prompt', 'Resumed'])
+  })
+
+  it('resets an open session when a live revert replaces the head', async () => {
+    // Revert: a NEW rollout file branches off the still-on-disk old head, so
+    // the demote lands while a viewer is already subscribed.
+    const oldHead = `rollout-2026-09-14T10-00-00-${THREAD}_${HEAD}`
+    const oldLines = [codexMeta(THREAD, 0), codexUser('v1', 10)]
+    await writeFile(rolloutPath(oldHead), jsonl(oldLines))
+    await startIndex()
+    const events: SessionLiveEvent[] = []
+    const unsubscribe = index.subscribe('codex', THREAD, event => events.push(event))
+    const newHead = `rollout-2026-09-14T11-00-00-${THREAD}_0199aaaa-0000-7000-8000-00000000000e`
+    await writeFile(rolloutPath(newHead), jsonl([
+      codexMeta(THREAD, 40, undefined, {
+        history_base: { thread_id: HEAD, end_ordinal_exclusive: 2, end_byte_offset: Buffer.byteLength(jsonl(oldLines)) },
+      }),
+      codexUser('v2', 50),
+    ]))
+    await index.refreshPath(rolloutPath(newHead))
+    unsubscribe()
+    expect(events.some(event => event.type === 'file' && event.file.id === THREAD && event.reset === true))
+      .toBe(true)
+    expect(texts(await replayLines(index, THREAD))).toEqual(['v1', 'v2'])
+    expect(index.list().filter(session => session.kind === 'codex')).toHaveLength(1)
+  })
+
+  it('resets the open child file event when a live revert replaces the child head', async () => {
+    const CHILD = '0199aaaa-0000-7000-8000-00000000000f'
+    const oldChild = `rollout-2026-09-14T10-30-00-${CHILD}_0199aaaa-0000-7000-8000-000000000010`
+    const childLines = [codexMeta(CHILD, 30, THREAD), codexUser('child v1', 40)]
+    await writeFile(rolloutPath(`rollout-2026-09-14T10-00-00-${THREAD}`), jsonl([
+      codexMeta(THREAD, 0), codexUser('parent', 10),
+    ]))
+    await writeFile(rolloutPath(oldChild), jsonl(childLines))
+    await startIndex()
+    const events: SessionLiveEvent[] = []
+    const unsubscribe = index.subscribe('codex', THREAD, event => events.push(event))
+    const newChild = `rollout-2026-09-14T11-30-00-${CHILD}_0199aaaa-0000-7000-8000-000000000011`
+    await writeFile(rolloutPath(newChild), jsonl([
+      codexMeta(CHILD, 50, THREAD, {
+        history_base: {
+          thread_id: '0199aaaa-0000-7000-8000-000000000010',
+          end_ordinal_exclusive: 2,
+          end_byte_offset: Buffer.byteLength(jsonl(childLines)),
+        },
+      }),
+      codexUser('child v2', 60),
+    ]))
+    await index.refreshPath(rolloutPath(newChild))
+    unsubscribe()
+    // A follow-up `file` event without `reset` can trail this one (the child
+    // listing stamp), so assert the reset itself arrived rather than the tail.
+    expect(events.some(event => event.type === 'file' && event.file.id === CHILD && event.reset === true))
+      .toBe(true)
+    // The reverted child still surfaces as the parent's child transcript.
+    expect(index.hasChild('codex', THREAD, CHILD)).toBe(true)
+  })
+
+  it('indexes child-owned ordinals with a missing base and preserves physical search anchors', async () => {
+    const store = new SearchStore({ path: ':memory:' })
+    const search = new SearchIndexer({ store, extract: extractSearchDocs, maxAgeDays: 0 })
+    const childPath = rolloutPath(`rollout-2026-09-14T10-00-00-${FORK_THREAD}`)
+    const ordinal = (record: object, value: number) => ({ ...record, ordinal: value })
+    try {
+      await writeFile(rolloutPath(`rollout-2026-09-14T09-00-00-${THREAD}`), jsonl([codexMeta(THREAD, 0)]))
+      await writeFile(childPath, jsonl([
+        ordinal(codexMeta(FORK_THREAD, 10, THREAD, {
+          subagent_history_start_ordinal: 11,
+          history_base: { thread_id: HEAD, end_byte_offset: 100, end_ordinal_exclusive: 10 },
+        }), 10),
+        ordinal(codexUser('own child prompt', 11), 11),
+      ]))
+      index = new SessionIndex({ roots: [{ kind: 'codex', dir: join(dir, 'codex') }], watch: false, search })
+      await index.start()
+      search.flush()
+      expect(index.get('codex', THREAD)?.children[0]).toMatchObject({ file: { agent: { description: 'own child prompt' } } })
+      const rows = store.db.prepare('select line, text from docs').all() as { line: number; text: Uint8Array }[]
+      expect(rows.map(row => [row.line, unpackText(row.text)])).toEqual([[1, 'own child prompt']])
+    } finally {
+      index?.stop()
+      search.stop()
+      store.close()
+    }
+  })
+
+  it('rebuilds listing and search when a missing base appears across a restart', async () => {
+    const listingPath = join(dir, 'listing.sqlite')
+    const searchPath = join(dir, 'search.sqlite')
+    const baseName = `rollout-2026-09-14T09-00-00-${THREAD}`
+    const headName = `rollout-2026-09-14T10-00-00-${THREAD}_${HEAD}`
+    const baseLines = [JSON.stringify(codexMeta(THREAD, 0)), JSON.stringify(codexUser('inherited needle', 10))]
+    const cut = Buffer.byteLength(`${baseLines.join('\n')}\n`)
+    const headPath = rolloutPath(headName)
+    await writeFile(headPath, jsonl([
+      codexMeta(THREAD, 40, undefined, { history_base: { thread_id: THREAD, end_ordinal_exclusive: 2, end_byte_offset: cut } }),
+      codexUser('head needle', 50),
+    ]))
+    const boot = async () => {
+      const store = new SearchStore({ path: searchPath })
+      const indexer = new SearchIndexer({ store, flushDelayMs: 1, extract: extractSearchDocs })
+      index = new SessionIndex({
+        roots: [{ kind: 'codex', dir: join(dir, 'codex') }],
+        watch: false,
+        listing: new ListingCache({ path: listingPath }),
+        search: indexer,
+      })
+      await index.start()
+      indexer.flush()
+      return { store, indexer }
+    }
+    // First boot: the base is missing, so the head indexes alone.
+    let { store, indexer } = await boot()
+    expect(texts(await replayLines(index, THREAD))).toEqual(['head needle'])
+    index.stop()
+    indexer.stop()
+    store.close()
+    // The base lands while the server is down; the next boot re-reads the
+    // whole logical stream — the stored `w` (waiting bases) footprint entry
+    // invalidates both the listing row and the indexed lines.
+    await writeFile(rolloutPath(baseName), `${baseLines.join('\n')}\n`)
+    ;({ store, indexer } = await boot())
+    expect(texts(await replayLines(index, THREAD))).toEqual(['inherited needle', 'head needle'])
+    const rows = store.db.prepare(
+      `select docs.line as line, docs.text as text
+       from docs join files on docs.file = files.id
+       where files.path = ? order by docs.line`,
+    ).all(headPath) as { line: number, text: Uint8Array }[]
+    // Lines count the logical stream — the two `session_meta` records take
+    // indexes 0 and 2, so the indexed docs land on 1 and 3.
+    expect(rows.map(row => [row.line, unpackText(row.text)]))
+      .toEqual([[1, 'inherited needle'], [3, 'head needle']])
+    index.stop()
+    indexer.stop()
+    store.close()
   })
 })
 

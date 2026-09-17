@@ -99,14 +99,60 @@ const SESSION: string[] = [
   }),
 ]
 
-function fold(lines: readonly string[]): Snapshot {
-  const synth = createCodexSynthesizer(MAIN)
+function fold(lines: readonly string[], file: SessionFileRef = MAIN): Snapshot {
+  const synth = createCodexSynthesizer(file)
   let state = createTimelineState()
   for (const l of lines) {
     for (const event of synth.push(l)) state = applyTimeline(state, event, DEFAULT_BOUNDS)
   }
   return buildTimelineView(state, DEFAULT_BOUNDS)
 }
+
+describe('Codex inherited content and host bookkeeping', () => {
+  it('keeps inherited model content without importing parent activity', () => {
+    const view = fold([
+      line(0, 'session_meta', { id: 'parent', base_instructions: { text: 'parent-only system' } }),
+      line(1, 'response_item', { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'inherited prompt' }] }),
+      line(2, 'response_item', { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'inherited answer' }] }),
+      line(3, 'response_item', { type: 'function_call', call_id: 'parent-call', name: 'exec', arguments: '{"command":"ls"}' }),
+      line(4, 'response_item', { type: 'function_call_output', call_id: 'parent-call', output: 'inherited output' }),
+      line(5, 'token_usage_record', { usage: { input_tokens: 9000, output_tokens: 1000 } }),
+      line(10, 'session_meta', { id: 'child', subagent_history_start_ordinal: 11 }),
+      line(11, 'response_item', { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'own prompt' }] }),
+    ], { ...MAIN, id: 'child', historyStartOrdinal: 11 })
+    expect(view.nodes.map(node => node.text).join(' ')).toContain('inherited prompt')
+    expect(view.current.assistant).toBeGreaterThan(0)
+    expect(view.current.tool).toBeGreaterThan(0)
+    expect(view.current.system).toBe(0)
+    expect(view.humanInputs).toBe(1)
+    expect(view.requests).toHaveLength(0)
+    // Surface tool count includes the retained output; execution totals do not.
+    expect(view.toolCalls).toBe(1)
+    expect(view.timing?.toolCalls ?? 0).toBe(0)
+    expect(view.fileOps).toEqual([])
+  })
+
+  it('displays verified answers without adding context tokens or human inputs', () => {
+    const view = fold([line(1, 'retained_context', {
+      type: 'verified_answer', turn_id: 't', call_id: 'q',
+      questions: [{ question: 'Which database?', answer: 'sqlite' }],
+    })])
+    expect(view.current.total).toBe(0)
+    expect(view.humanInputs).toBe(0)
+    expect(view.events.some(event => event.kind === 'inject' && event.detail?.includes('sqlite'))).toBe(true)
+  })
+
+  it('repeated rollback removes surviving turns even after new input', () => {
+    const user = (s: number, text: string) => line(s, 'response_item', { type: 'message', role: 'user', content: [{ type: 'input_text', text }] })
+    const done = (s: number) => line(s, 'event_msg', { type: 'task_complete' })
+    const rollback = (s: number) => line(s, 'event_msg', { type: 'thread_rolled_back', num_turns: 1 })
+    const view = fold([user(1, 'first prompt'), done(2), user(3, 'second prompt'), done(4),
+      rollback(5), user(6, 'third prompt'), done(7), rollback(8), rollback(9)])
+    expect(view.current.user).toBe(0)
+    expect(view.current.total).toBe(0)
+    expect(view.humanInputs).toBe(3)
+  })
+})
 
 describe('codex synthesizer → fold', () => {
   it('books one request per settled model response, with turn/step and usage', () => {
@@ -148,7 +194,7 @@ describe('codex synthesizer → fold', () => {
     const view = fold(SESSION.slice(0, -1))
     expect(view.humanInputs).toBe(1)
     const injects = view.events.filter(e => e.kind === 'inject')
-    expect(injects.map(e => e.name)).toContain('environment_context')
+    expect(injects.map(e => e.name)).toContain('environment-context')
     expect(view.current.inject).toBeGreaterThan(0)
     expect(view.current.user).toBeGreaterThan(0)
   })
@@ -236,6 +282,50 @@ describe('codex synthesizer → fold', () => {
     expect(view.fileOps?.map(op => op.kind)).toEqual(['write', 'read'])
     const seqs = view.fileOps?.map(op => op.seq) ?? []
     expect(seqs).toEqual([...seqs].sort((a, b) => a - b))
+  })
+
+  it('pairs a self-contained web_search_call with its result in the fold', () => {
+    // The result must find its `tool/call` already armed: emitted before it,
+    // not at group close — otherwise the call stays pending and the fold
+    // counts neither the pairing nor the tool name.
+    const view = fold([
+      ...SESSION.slice(0, -1),
+      line(11, 'response_item', {
+        type: 'web_search_call', id: 'ws-1', status: 'completed',
+        action: { type: 'search', query: 'codex rollout format' },
+      }),
+      line(12, 'token_usage_record', {
+        thread_id: 'thread-1', turn_id: 'turn-2', response_id: 'resp_4',
+        usage: { input_tokens: 100, output_tokens: 10, total_tokens: 110 },
+      }),
+    ])
+    // exec's call plus the web search: both settled and named.
+    expect(view.timing?.toolCalls).toBe(2)
+    expect(view.toolCalls).toBe(2)
+    expect(view.nodes.some(node => node.tool === 'web_search')).toBe(true)
+  })
+
+  it('books the remote compaction response\'s own usage as a separate request', () => {
+    const view = fold([
+      ...SESSION.slice(0, -1),
+      // Remote compaction's usage-only answer: settles no open response.
+      line(11, 'token_usage_record', {
+        thread_id: 'thread-1', turn_id: 'turn-1', response_id: 'resp_compact',
+        usage: { input_tokens: 100, output_tokens: 20, total_tokens: 120 },
+      }),
+      line(12, 'compacted', {
+        message: '', compaction_response_id: 'resp_compact',
+        replacement_history: [], window_id: 'win-2',
+        latest_token_usage_record: { usage: { input_tokens: 5000 } },
+      }),
+    ])
+    expect(view.requests).toHaveLength(3)
+    // The last ordinary request keeps ITS usage; the compaction's own cost is
+    // booked on a usage-only record, not folded into its predecessor.
+    expect(view.requests[1]?.prompt).toBe(5_000)
+    expect(view.requests[1]?.output).toBe(80)
+    expect(view.requests[2]?.prompt).toBe(100)
+    expect(view.requests[2]?.output).toBe(20)
   })
 
   it('logs a model switch as a fold event', () => {

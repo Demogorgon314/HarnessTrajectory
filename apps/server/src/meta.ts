@@ -6,7 +6,7 @@
 
 import {
   agentMentions, asArray, asNumber, asString, classifyInjectedUser, devinMessageClass, grokMessageClass,
-  isCodexHumanPrompt, isRecord, kimiMessageClass, kimiTitleText, parseDevinLine, parseGrokLine,
+  codexHumanPromptText, isRecord, kimiMessageClass, kimiTitleText, parseDevinLine, parseGrokLine,
   parseJsonLine, parseTime, titleFrom, type AgentFileMeta, type HarnessKind,
 } from '@harness-trajectory/core'
 
@@ -15,6 +15,24 @@ export interface FileHead {
   id: string | null
   /** Parent transcript id when this file is a subagent/child thread. */
   parentId: string | null
+  /**
+   * Codex paginated history: an exclusive prefix position inside another
+   * rollout that this file's effective history starts from. `threadId` is
+   * the BASE file's rollout id despite the field name (the rollout id is the
+   * last UUID of its filename; `HistoryPosition` predates the rename).
+   */
+  historyBase?: {
+    rolloutId: string
+    endOrdinalExclusive: number | null
+    endByteOffset: number | null
+  } | null
+  /**
+   * Codex child threads only: `session_meta.subagent_history_start_ordinal`.
+   * Logical-stream ordinals below it are the PARENT's history materialized
+   * into the file (thread_history_materialization.rs), not the child's own
+   * activity — listing, search, and replay all skip them.
+   */
+  historyStartOrdinal?: number | null
 }
 
 export interface MetaState {
@@ -57,7 +75,7 @@ export interface MetaScanner {
  * Bump when any scanner's logic changes: cached listing states from an older
  * version are discarded and the transcripts they covered are re-read.
  */
-export const META_SCANNER_VERSION = 1
+export const META_SCANNER_VERSION = 3
 
 /**
  * Serialized scanner payload for the listing cache: the public `state` plus
@@ -262,13 +280,28 @@ function claudeMetaScanner(): MetaScanner {
 
 function codexMetaScanner(): MetaScanner {
   const state = emptyMeta()
+  // A child thread's own records begin at `subagent_history_start_ordinal`;
+  // below it the file carries the parent's inherited history, which must not
+  // count toward the child's title or prompt tally.
+  let historyStartOrdinal: number | undefined
   return {
     state,
+    save() { return { historyStartOrdinal } },
+    load(saved) {
+      if (isRecord(saved)) historyStartOrdinal = asNumber(saved['historyStartOrdinal'])
+    },
     push(line) {
       const record = parseJsonLine(line)
       if (!isRecord(record)) return
-      noteTime(state, record['timestamp'])
       const payload = record['payload']
+      if (record['type'] === 'session_meta' && isRecord(payload)) {
+        const raw = payload['subagent_history_start_ordinal']
+        historyStartOrdinal ??= asNumber(raw) ?? (typeof raw === 'string' ? asNumber(Number(raw)) : undefined)
+      } else if (historyStartOrdinal !== undefined) {
+        const ordinal = asNumber(record['ordinal'])
+        if (ordinal !== undefined && ordinal < historyStartOrdinal) return
+      }
+      noteTime(state, record['timestamp'])
       if (!isRecord(payload)) return
       switch (record['type']) {
         case 'session_meta':
@@ -280,12 +313,10 @@ function codexMetaScanner(): MetaScanner {
           break
         case 'response_item':
           if (payload['type'] === 'message' && payload['role'] === 'user') {
-            const text = (asArray(payload['content']) ?? [])
-              .flatMap(item => (isRecord(item) && item['type'] === 'input_text' ? [asString(item['text']) ?? ''] : []))
-              .join('\n')
-            if (text.trim() !== '' && isCodexHumanPrompt(text)) {
+            const text = codexHumanPromptText(payload)
+            if (text !== null) {
               state.promptCount += 1
-              if (state.title === null) state.title = titleFrom(text)
+              if (state.title === null && text.trim() !== '') state.title = titleFrom(text)
             }
           }
           break
@@ -578,9 +609,19 @@ export function readHead(kind: HarnessKind, firstLine: string): FileHead {
   if (kind === 'codex') {
     const payload = record['payload']
     if (record['type'] === 'session_meta' && isRecord(payload)) {
+      const base = isRecord(payload['history_base']) ? payload['history_base'] : null
+      // Persisted as a stringified number (`"24"`) in some builds.
+      const rawStart = payload['subagent_history_start_ordinal']
+      const startOrdinal = asNumber(rawStart) ?? (typeof rawStart === 'string' ? asNumber(Number(rawStart)) : undefined)
       return {
         id: asString(payload['id']) ?? asString(payload['session_id']) ?? null,
         parentId: asString(payload['parent_thread_id']) ?? null,
+        ...(startOrdinal === undefined ? {} : { historyStartOrdinal: startOrdinal }),
+        historyBase: base === null ? null : {
+          rolloutId: asString(base['thread_id']) ?? '',
+          endOrdinalExclusive: asNumber(base['end_ordinal_exclusive']) ?? null,
+          endByteOffset: asNumber(base['end_byte_offset']) ?? null,
+        },
       }
     }
     return { id: null, parentId: null }

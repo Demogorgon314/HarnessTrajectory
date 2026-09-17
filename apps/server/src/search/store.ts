@@ -35,7 +35,7 @@ import { deflateSync, inflateSync } from 'node:zlib'
 import type { HarnessKind, SearchRole } from '@harness-trajectory/core'
 
 /** Bumped whenever the schema below changes; a mismatch drops and rebuilds. */
-export const SEARCH_SCHEMA_VERSION = 3
+export const SEARCH_SCHEMA_VERSION = 6
 
 /** Identity of one indexed transcript, as the SSE route addresses it. */
 export interface SearchFileKey {

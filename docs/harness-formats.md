@@ -11,7 +11,95 @@ cost includes its subagents. Subagent files bind through `.meta.json`.
 
 ## Codex
 
-Children are top-level rollouts with `parent_thread_id`.
+Rollouts live under `~/.codex/sessions/<yyyy>/<mm>/<dd>/` (archived ones under
+`~/.codex/archived_sessions/`) as `rollout-<timestamp>-<threadId>[_<rolloutId>].jsonl`;
+the second UUID appears on reverts and forks, and the rollout id is always the LAST UUID in
+the basename. Cold files are zstd-compressed in place to `.jsonl.zst` (one zstd frame over the
+whole file) and materialize back to `.jsonl` on the next append, so discovery, replay, tailing,
+and search must accept both spellings and never double-count the pair. Offsets in
+`history_base` are DECODED bytes — `readLines` slices compressed files after decompressing.
+
+### Logical history
+
+A thread is not one file. Revert keeps the thread id, writes a new rollout id, and records
+`session_meta.history_base = { thread_id: <BASE ROLLOUT id>, end_byte_offset }` pointing at a
+finite prefix of an earlier file; fork does the same across threads, and one file can be the
+base of several. `codex-rollouts.ts` owns this bookkeeping: it indexes rollouts by id, demotes
+a superseded same-thread file to base duty, and replays `readLines(base, 0, '', end)` before
+the fork's own records. A live demote clears the session's file membership first, so the
+replacement head's `file` event carries `reset: true` — an open view must refold, not append.
+The listing cache stores the resolved file set per session (`footprint`) so restarts reopen
+bases too; a footprint mismatch — including a base that was still missing at save time — drops
+the file's indexed search rows and re-reads the whole logical stream, because the base shifts
+every later line's index. The legacy `thread_rolled_back` event drops the
+last N surviving user turns — context maintains the effective turn stack and emits a
+`compaction/prune` over those turns' nodes plus a zero-token marker; repeated rollbacks
+continue from the surviving history, and markers never become user turns;
+the core adapter records a `turn-error` node.
+
+### Turn and response lifecycle
+
+`task_started`/`task_complete` carry `turn_id` and delimit turns; extra user input inside an
+open turn is steering, not a new turn. A `token_usage_record` settles the response it closes
+(`response_id`); `token_count` events only update context occupancy — old rollouts have no
+usage record, so `info.last_token_usage` is the non-authoritative fallback, never
+double-counted. `turn_aborted` ends the open turn as an error. A usage record with no open
+response — remote compaction writes one — is buffered by `response_id` until the `compacted`
+record's `compaction_response_id` claims it; it must never retroactively rewrite the previous
+response's usage.
+
+### Input classification
+
+`codexUserItems` classifies each content item of a user message: the structural
+`internal_chat_message_metadata_passthrough.content_item_kinds` annotation decides when
+present; otherwise the known injected fragments are matched by their exact start/end markers
+(`<environment_context>`, `<user_instructions>`, `# AGENTS.md instructions`, guardian relays,
+skill catalogs, …). Anything else — including XML-shaped prompts like `<question>…` — is human.
+All four layers (adapter, synth, meta, search) share this classifier.
+
+### Children and retained context
+
+Children are top-level rollouts with `parent_thread_id`; `session_meta.source.subagent` names
+them. A child's own `task_complete` ends its run but not its life — only a later
+`task_started` reopens it; late statistics or state records update the finished run without
+spawning a new one. `subagent_history_start_ordinal` marks where its own records begin
+(inherited parent history before it is not the child's activity); the boundary travels on
+`SessionFileRef` so it applies equally when the child is viewed standalone, through the
+parent, in listing metadata, and in the search index. Ownership uses the record's durable
+`ordinal`, never the SSE/search line index (a missing base or ordinal gap separates them).
+Only the owning thread's header supplies child identity. Context preserves inherited
+model-visible messages using replay events, without importing the parent's requests,
+human-input counts, tool execution timing, or file activity. Compaction arrives as a top-level
+`compacted` record: `replacement_history` is a full ResponseItem list — user/developer
+messages, retained `agent_message` relays, and encrypted `compaction` items that carry no
+readable text — and alone decides the model-visible surface. `retained_context.user_messages`
+is host-side review evidence, shown on the summary event but never re-added to the surface;
+`latest_token_usage_record.usage.input_tokens` — never the cumulative thread total — is the
+shadowed context size.
+
+### Durable items
+
+The rollout policy persists more than messages and shell calls: `web_search_call` and
+`image_generation_call` are self-contained (result embedded, no output record follows; the
+synthesizer emits `tool/call` before `tool/result` so fold pairing settles immediately),
+`item_completed` bookkeeping that lands after a call settled is attributed by exact call id —
+first against open calls, then already-settled ones — before any lone-open-call fallback,
+`tool_search_call`/`tool_search_output` pair by `call_id` and carry discovered schemas in
+`tools`, `agent_message` items and top-level `inter_agent_communication` records are agent
+relays (never human prompts), `configuration_update` records reasoning-effort changes,
+`thread_settings_applied` snapshots can switch the model, `thread_goal_updated` carries the
+objective, and `retained_context` holds host-only `verified_answer` Q&A, displayed as
+content-free notices whose text does not enter model context or token estimates. Search indexes the relays,
+goal, and discovered tool names; encrypted compaction replays and `event_msg` mirrors of
+response items stay unindexed.
+
+### Dynamic tools
+
+`session_meta.dynamic_tools` is a heterogeneous list: canonical `{"type":"function", …}` and
+`{"type":"namespace", name, tools:[…]}` entries plus legacy flat `{name, inputSchema,
+namespace?, exposeToContext?}` specs. `normalizeDynamicTools` flattens them, maps
+`exposeToContext: false` to `deferLoading: true`, and keeps `namespace` on each emitted spec.
+Calls resolve as `namespace.name` for non-`functions` namespaces.
 
 ## Kimi
 

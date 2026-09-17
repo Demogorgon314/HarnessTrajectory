@@ -19,7 +19,7 @@
  */
 
 import type { SessionFileRef } from '@harness-trajectory/core'
-import { asArray, asNumber, asString, isCodexHumanPrompt, isRecord, parseJsonLine, parseTime } from '@harness-trajectory/core'
+import { asArray, asNumber, asString, codexUserItems, isRecord, parseJsonLine, parseTime } from '@harness-trajectory/core'
 import type { ContentBlock, MessageSource, StreamRecord, TimelineEvent } from '../fold/event.ts'
 import type { FileOpInput } from '../fold/fold.ts'
 import type { AgentSpawn, EventSynthesizer, SynthMeta } from './types.ts'
@@ -40,7 +40,7 @@ const EMPTY_CHILDREN: ReadonlyMap<string, AgentSpawn> = new Map()
 const SETTLED_CALLS_MAX = 64
 
 /** Response-item types that open a tool call. */
-const CALL_TYPES = new Set(['function_call', 'custom_tool_call', 'local_shell_call'])
+const CALL_TYPES = new Set(['function_call', 'custom_tool_call', 'local_shell_call', 'tool_search_call'])
 /** Response-item types that settle a tool call. */
 const OUTPUT_TYPES = new Set(['function_call_output', 'custom_tool_call_output', 'local_shell_call_output'])
 
@@ -54,12 +54,19 @@ interface OpenGroup {
   lastTime: number
   /** Earliest `item_completed.started_at_ms` of a Reasoning/AgentMessage item seen while open. */
   firstTokenAt?: number
+  /**
+   * `token_count`'s `last_token_usage` — the only usage signal in rollouts
+   * that predate `token_usage_record`. A later authoritative record wins.
+   */
+  fallbackUsage?: Record<string, number> | undefined
 }
 
 /** A tool call awaiting its output. */
 interface OpenCall {
   callId: string
   name: string
+  /** Raw arguments — the late item's command is matched against them. */
+  args: string
 }
 
 /** A tool call whose `tool/result` already folded (the target of a late `tool/ops`). */
@@ -68,10 +75,19 @@ interface SettledCall {
   /** The `tool/result` event's own seq — the fold files late ops under it. */
   resultSeq: number
   name: string
+  /** Raw arguments — a late item's command is matched against them. */
+  args: string
 }
 
 class CodexSynthesizer implements EventSynthesizer {
   readonly kind = 'codex' as const
+
+  constructor(private readonly file: SessionFileRef) {
+    // A child file's lineage replays the base's inherited records BEFORE the
+    // head's `session_meta` line arrives, so the boundary must be known from
+    // the ref up front — `onSessionMeta` still confirms it from the stream.
+    this.historyStartOrdinal = file.historyStartOrdinal
+  }
 
   private seq = 0
   private lastTime = 0
@@ -87,6 +103,8 @@ class CodexSynthesizer implements EventSynthesizer {
 
   // ---- turn / step ----------------------------------------------------------
   private turn = 0
+  /** Display ids of user turns still present after any prior rollback. */
+  private readonly activeTurns: number[] = []
   private step = 0
   private turnOpen = false
   private stepOpen = false
@@ -97,6 +115,13 @@ class CodexSynthesizer implements EventSynthesizer {
   private group: OpenGroup | null = null
   /** Tool calls of the current step still waiting for their output. */
   private awaitingResults = 0
+  /** Self-contained calls (web_search/image_generation) whose result already folded. */
+  private readonly earlySettled = new Set<string>()
+  /**
+   * `token_usage_record`s that settled no open response — remote compaction's
+   * usage-only answer — keyed by `response_id` for `compaction_response_id`.
+   */
+  private readonly unclaimedUsage = new Map<string, Record<string, number>>()
 
   // ---- header ---------------------------------------------------------------
   private systemText: string | undefined
@@ -105,7 +130,12 @@ class CodexSynthesizer implements EventSynthesizer {
   private headerPending = false
 
   // ---- tool pairing ---------------------------------------------------------
-  private openCall: OpenCall | null = null
+  /**
+   * Calls awaiting their output. Codex streams parallel calls' items and
+   * completions interleaved, so a single "open call" slot would file a late
+   * CommandExecution/FileChange under whichever call opened LAST.
+   */
+  private readonly openCalls = new Map<string, OpenCall>()
   private readonly pendingOps = new Map<string, FileOpInput[]>()
   private readonly failedCalls = new Set<string>()
   /** Recently settled calls, oldest first, capped at SETTLED_CALLS_MAX. */
@@ -122,14 +152,21 @@ class CodexSynthesizer implements EventSynthesizer {
   private ambiguousLateOps = 0
 
   // ---- surface bookkeeping --------------------------------------------------
-  /** Seqs of every live surface node (user/tool/assistant), for the compaction claim. */
-  private liveSeqs: number[] = []
-  private threadTotalTokens = 0
+  /** Live surface nodes (user/tool/assistant) with the turn each was emitted under. */
+  private liveSeqs: { seq: number; turn: number }[] = []
+  /** Context occupancy of the latest response (its `input_tokens`), for the compaction claim. */
+  private lastContextTokens: number | undefined
 
   // ---- injections -----------------------------------------------------------
   private developerInstructions: string | undefined
   private sawDeveloperMessage = false
   private readonly worldStateSized = new Set<string>()
+  /**
+   * A child thread's `session_meta.subagent_history_start_ordinal`: records
+   * below it are the parent's history materialized into the file, not the
+   * child's own activity (thread_history_materialization.rs).
+   */
+  private historyStartOrdinal: number | undefined
 
   push(line: string): readonly TimelineEvent[] {
     const out: TimelineEvent[] = []
@@ -141,6 +178,15 @@ class CodexSynthesizer implements EventSynthesizer {
       const time = parseTime(record['timestamp']) ?? this.lastTime
       if (time > this.lastTime) this.lastTime = time
       const payload = isRecord(record['payload']) ? record['payload'] : {}
+      if (type === 'session_meta' && this.historyStartOrdinal !== undefined
+        && asString(payload['id']) !== this.file.id) return out
+      if (type !== 'session_meta' && this.historyStartOrdinal !== undefined) {
+        const ordinal = asNumber(record['ordinal'])
+        if (ordinal !== undefined && ordinal < this.historyStartOrdinal) {
+          this.onInheritedRecord(type, payload, time, out)
+          return out
+        }
+      }
       switch (type) {
         case 'session_meta': this.onSessionMeta(payload, time); break
         case 'turn_context': this.onTurnContext(payload, time, out); break
@@ -149,6 +195,10 @@ class CodexSynthesizer implements EventSynthesizer {
         case 'token_usage_record': this.onTokenUsage(payload, time, out); break
         case 'compacted': this.onCompacted(payload, time, out); break
         case 'world_state': this.onWorldState(payload, time, out); break
+        case 'inter_agent_communication':
+          this.onAgentMessage(interAgentText(payload), agentRoute(payload), time, out)
+          break
+        case 'retained_context': this.onRetainedContext(payload, time, out); break
         default: break
       }
     } catch {
@@ -202,7 +252,7 @@ class CodexSynthesizer implements EventSynthesizer {
     surfaceOp?: unknown,
   ): number {
     const seq = this.emit(out, type, time, data, surfaceOp)
-    this.liveSeqs.push(seq)
+    this.liveSeqs.push({ seq, turn: this.turn })
     return seq
   }
 
@@ -210,26 +260,80 @@ class CodexSynthesizer implements EventSynthesizer {
   // session_meta / header
   // ---------------------------------------------------------------------------
 
+  /** Inherited model content is replayed without adopting the parent's activity. */
+  private onInheritedRecord(type: string, payload: Record<string, unknown>, time: number, out: TimelineEvent[]): void {
+    if (type === 'compacted') {
+      this.onCompacted(payload, time, out)
+      return
+    }
+    if (type !== 'response_item' && type !== 'inter_agent_communication') return
+    const itemType = asString(payload['type'])
+    let eventType = 'user/message'
+    let content: ContentBlock[] = []
+    let source: MessageSource = { kind: 'inherited', form: 'context' }
+    if (type === 'inter_agent_communication' || itemType === 'agent_message') {
+      const text = type === 'inter_agent_communication' ? interAgentText(payload) : agentMessageText(payload)
+      content = [{ type: 'text', text }]
+      source = { kind: 'agent-message', form: 'relay' }
+    } else if (itemType === 'message') {
+      const role = asString(payload['role'])
+      content = contentBlocksOf(asArray(payload['content']) ?? [])
+      if (role === 'assistant') eventType = 'assistant/message'
+      else if (role === 'user') {
+        // Preserve human versus injected content categories without counting
+        // either as a new input; mixed messages use the shared classifier.
+        for (const part of codexUserItems(payload)) {
+          const source: MessageSource = part.human
+            ? { kind: 'user' } : { kind: part.label ?? 'context', form: 'context' }
+          this.emitSurface(out, 'user/message', time, {
+            content: contentBlocksOf([part.item]), source, replay: true,
+          })
+        }
+        return
+      }
+      else if (role !== 'developer') return
+    } else if (itemType === 'reasoning') {
+      eventType = 'assistant/message'
+      content = [{ type: 'reasoning', text: (asArray(payload['summary']) ?? [])
+        .flatMap(item => isRecord(item) ? [asString(item['text']) ?? ''] : []).join('\n\n') }]
+    } else if (itemType !== undefined && (CALL_TYPES.has(itemType) || itemType === 'web_search_call' || itemType === 'image_generation_call')) {
+      eventType = 'assistant/message'
+      const { name, args } = toolCallContent(payload, itemType)
+      content = [{ type: 'tool-call', name, arguments: args }]
+      if (itemType === 'image_generation_call' && asString(payload['result'])) {
+        content.push({ type: 'image' })
+      }
+    } else if (itemType !== undefined && (OUTPUT_TYPES.has(itemType) || itemType === 'tool_search_output')) {
+      eventType = 'tool/result'
+      const tools = itemType === 'tool_search_output' ? asArray(payload['tools']) : undefined
+      content = toolOutputContent(payload['output'], tools)
+    } else return
+    // No call ids, tool/call events, usage, timing or human-input bookkeeping
+    // are imported. These are copies on the child's initial model surface.
+    this.emitSurface(out, eventType, time, eventType === 'user/message'
+      ? { content, source, replay: true }
+      : { message: { content }, replay: true })
+  }
+
   private onSessionMeta(payload: Record<string, unknown>, _time: number): void {
     this.version = asString(payload['cli_version']) ?? this.version
+    // Persisted as a stringified number (`"24"`) in current rollouts.
+    const rawStart = payload['subagent_history_start_ordinal']
+    const start = asNumber(rawStart) ?? (typeof rawStart === 'string' ? asNumber(Number(rawStart)) : undefined)
+    if (start !== undefined) this.historyStartOrdinal = start
     const provider = asString(payload['model_provider'])
     if (provider !== undefined && provider !== '') this.provider = provider
     const instructions = payload['base_instructions']
     const text = isRecord(instructions) ? asString(instructions['text']) : asString(instructions)
     if (text !== undefined && text !== '') this.systemText = text
-    // `dynamic_tools` is an array of GROUPS, each with its own `tools` array
-    // (verified: 2 of 82 rollouts carry it; every other session records no
-    // tool schemas at all, which is what makes the fold's "not recorded"
-    // Tool Schemas state the normal Codex case).
-    const groups = asArray(payload['dynamic_tools'])
-    if (groups !== undefined) {
-      const tools: unknown[] = []
-      for (const group of groups) {
-        if (!isRecord(group)) continue
-        for (const tool of asArray(group['tools']) ?? []) tools.push(tool)
-      }
-      if (tools.length > 0) this.tools = tools
-    }
+    // `dynamic_tools` holds the session's dynamic tool specs. Canonical wire
+    // shape (protocol/dynamic_tools.rs): each entry is `{"type":"function"}`
+    // or `{"type":"namespace", tools: [{"type":"function"}]}`; a legacy flat
+    // `{name, inputSchema, namespace?}` list also occurs. Normalized here to
+    // one flat list of function specs, each stamped with its `namespace` so
+    // same-named tools in different namespaces stay distinct.
+    const dynamicTools = normalizeDynamicTools(asArray(payload['dynamic_tools']))
+    if (dynamicTools.length > 0) this.tools = dynamicTools
     // A subagent / guardian thread has no human prompt of its own (verified:
     // the first message of all 13 sampled child rollouts is a `developer` one),
     // so the Agent Network would show it unlabelled. `session_meta.source`
@@ -271,29 +375,33 @@ class CodexSynthesizer implements EventSynthesizer {
     })
   }
 
+  /**
+   * Register a model sighting. The first one flushes the deferred opening
+   * header; a later DIFFERENT model is a `reason:'change'` header whose
+   * `system`/`tools` are repeated because the fold clears header-sourced
+   * fields a sparse header doesn't carry.
+   */
+  private noteModel(model: string, time: number, out: TimelineEvent[]): void {
+    if (this.headerPending) {
+      this.model = model
+      this.flushHeader(out, time)
+      return
+    }
+    if (this.model === model) return
+    this.model = model
+    this.emit(out, 'request/header', time, {
+      header: {
+        ...(this.systemText === undefined ? {} : { system: this.systemText }),
+        tools: this.tools,
+        config: { model, provider: this.provider },
+      },
+      reason: 'change',
+    })
+  }
+
   private onTurnContext(payload: Record<string, unknown>, time: number, out: TimelineEvent[]): void {
     const model = asString(payload['model'])
-    if (model !== undefined && model !== '') {
-      if (this.headerPending) {
-        this.model = model
-        this.flushHeader(out, time)
-      } else if (this.model !== model) {
-        this.model = model
-        // A model switch has no dedicated durable event: it is a header that
-        // differs from the previous one. `header.system` is REPEATED here (the
-        // design sketch said to omit it) because the fold clears its
-        // header-sourced system prompt when a later header carries none —
-        // omitting it would silently zero the System Prompt figure.
-        this.emit(out, 'request/header', time, {
-          header: {
-            ...(this.systemText === undefined ? {} : { system: this.systemText }),
-            tools: this.tools,
-            config: { model, provider: this.provider },
-          },
-          reason: 'change',
-        })
-      }
-    }
+    if (model !== undefined && model !== '') this.noteModel(model, time, out)
     const mode = payload['collaboration_mode']
     const settings = isRecord(mode) ? mode['settings'] : undefined
     const instructions = isRecord(settings) ? asString(settings['developer_instructions']) : undefined
@@ -334,16 +442,79 @@ class CodexSynthesizer implements EventSynthesizer {
       }
       case 'token_count': {
         const info = payload['info']
-        if (isRecord(info)) this.applyContextWindow(out, asNumber(info['model_context_window']), time)
+        if (isRecord(info)) {
+          this.applyContextWindow(out, asNumber(info['model_context_window']), time)
+          // Old rollouts record no `token_usage_record`; `last_token_usage` is
+          // their only per-response accounting. The record mirrors the response
+          // that just streamed, so it prices the open group — later sightings
+          // describe newer partial responses and replace the earlier figure.
+          const usage = usageOf(info['last_token_usage'])
+          if (usage !== undefined && this.group !== null) {
+            this.group.fallbackUsage = usage
+            this.lastContextTokens = contextTokensOf(info['last_token_usage']) ?? this.lastContextTokens
+          }
+        }
         return
       }
       case 'item_completed': {
         this.onItemCompleted(payload, time, out)
         return
       }
+      case 'thread_rolled_back': {
+        this.onThreadRolledBack(payload, time, out)
+        return
+      }
+      case 'thread_settings_applied': {
+        // Durable settings snapshot; a model switch inside it is the same
+        // attribution change `turn_context` drives.
+        const settings = payload['thread_settings']
+        if (!isRecord(settings)) return
+        const model = asString(settings['model'])
+        if (model !== undefined && model !== '') this.noteModel(model, time, out)
+        return
+      }
+      case 'thread_goal_updated': {
+        const goal = payload['goal']
+        const objective = isRecord(goal) ? asString(goal['objective']) : undefined
+        if (objective === undefined || objective === '') return
+        this.emitSurface(out, 'user/message', time, {
+          content: [{ type: 'text', text: objective }],
+          source: { kind: 'thread-goal', form: 'notice' } satisfies MessageSource,
+        })
+        this.lastInputTime = time
+        return
+      }
       default:
         return
     }
+  }
+
+  /**
+   * `thread_rolled_back` is a legacy marker that drops the LAST N user turns
+   * from model context (thread_rollout_truncation.rs). The fold equivalent is
+   * a `compaction/prune` claim covering the surface nodes of those turns,
+   * consumed by a marker node that replaces them. Turn-0 nodes (pre-turn
+   * injections like base instructions) are never user turns — always kept.
+   */
+  private onThreadRolledBack(payload: Record<string, unknown>, time: number, out: TimelineEvent[]): void {
+    const numTurns = asNumber(payload['num_turns']) ?? 0
+    if (numTurns <= 0) return
+    this.closeGroup(out, time, undefined)
+    this.closeStep(out, time)
+    this.turnOpen = false
+    const removed = new Set(this.activeTurns.splice(Math.max(0, this.activeTurns.length - Math.floor(numTurns))))
+    const shadowed = this.liveSeqs
+      .filter(entry => removed.has(entry.turn))
+      .map(entry => entry.seq)
+    this.liveSeqs = this.liveSeqs.filter(entry => !removed.has(entry.turn))
+    this.emit(out, 'compaction/prune', time, { shadowedSeqs: shadowed })
+    this.emit(out, 'user/message', time, {
+      content: [],
+      source: { kind: 'rollback', form: 'notice', summary: `Rolled back ${numTurns} turn${numTurns === 1 ? '' : 's'}` } satisfies MessageSource,
+    }, shadowed.length === 0
+      ? undefined
+      : { op: 'replace', startSeq: Math.min(...shadowed), endSeq: Math.max(...shadowed) })
+    this.lastInputTime = time
   }
 
   private applyContextWindow(out: TimelineEvent[], window: number | undefined, time: number): void {
@@ -392,13 +563,70 @@ class CodexSynthesizer implements EventSynthesizer {
     if (kind !== 'CommandExecution' && kind !== 'FileChange') return
     const ops = kind === 'CommandExecution' ? opsOfCommand(item) : opsOfFileChange(item)
     const failed = asString(item['status']) === 'failed'
-    const call = this.openCall
-    if (call !== null) {
-      if (failed) this.failedCalls.add(call.callId)
-      this.bufferOps(call.callId, ops)
+    const attrib = this.attributeItem(item)
+    if (attrib !== undefined && 'open' in attrib) {
+      if (failed) this.failedCalls.add(attrib.open.callId)
+      this.bufferOps(attrib.open.callId, ops)
+      return
+    }
+    if (attrib !== undefined) {
+      this.emitLateOps(payload, ops, failed, attrib.settled, time, out)
+      return
+    }
+    if (this.openCalls.size > 0) {
+      // Several calls in flight and no verifiable link: keep the activity
+      // visible as its own unpaired result instead of filing it under the
+      // wrong call.
+      this.emitSurface(out, 'tool/result', time, {
+        message: {
+          content: [{ type: 'text', text: itemLabel(item) }],
+        },
+        ...(failed ? { error: true } : {}),
+        ...(ops.length === 0 ? {} : { fileOps: ops }),
+      })
       return
     }
     this.lateOps(payload, item, ops, failed, time, out)
+  }
+
+  /**
+   * The call an `item_completed` Command/FileChange belongs to, when one can
+   * be proven — across BOTH pending and settled calls, since a late item
+   * routinely lands after its own result folded. Order: exact item id (the
+   * McpToolCall shape, where item id IS the call id) → unique command-content
+   * match → the lone-open call when nothing has settled since it opened (a
+   * just-folded result can still own the item, so "only one call remains"
+   * alone proves nothing). `undefined` when the pairing is ambiguous.
+   */
+  private attributeItem(
+    item: Record<string, unknown>,
+  ): { open: OpenCall } | { settled: SettledCall } | undefined {
+    const itemId = asString(item['id'])
+    if (itemId !== undefined) {
+      const open = this.openCalls.get(itemId)
+      if (open !== undefined) return { open }
+      const settled = this.settledCalls.get(itemId)
+      if (settled !== undefined) return { settled }
+    }
+    const command = commandOf(item)
+    if (command !== undefined) {
+      let matched: { open: OpenCall } | { settled: SettledCall } | undefined
+      for (const call of this.openCalls.values()) {
+        if (!call.args.includes(command)) continue
+        if (matched !== undefined) return undefined
+        matched = { open: call }
+      }
+      for (const call of this.settledCalls.values()) {
+        if (!call.args.includes(command)) continue
+        if (matched !== undefined) return undefined
+        matched = { settled: call }
+      }
+      if (matched !== undefined) return matched
+    }
+    if (this.openCalls.size === 1 && this.settledSinceOpen === 0) {
+      return { open: this.openCalls.values().next().value! }
+    }
+    return undefined
   }
 
   /**
@@ -417,7 +645,7 @@ class CodexSynthesizer implements EventSynthesizer {
     time: number,
     out: TimelineEvent[],
   ): void {
-    if (ops.length === 0) return
+    if (ops.length === 0 && !failed) return
     const itemId = asString(item['id'])
     const exact = itemId === undefined ? undefined : this.settledCalls.get(itemId)
     const target = exact ?? (this.settledSinceOpen === 1 ? this.lastSettled : null)
@@ -425,6 +653,17 @@ class CodexSynthesizer implements EventSynthesizer {
       this.ambiguousLateOps += 1
       return
     }
+    this.emitLateOps(payload, ops, failed, target, time, out)
+  }
+
+  private emitLateOps(
+    payload: Record<string, unknown>,
+    ops: FileOpInput[],
+    failed: boolean,
+    target: SettledCall,
+    time: number,
+    out: TimelineEvent[],
+  ): void {
     // `completed_at_ms` is epoch MILLISECONDS (the record `timestamp` is ISO).
     const at = parseTime(payload['completed_at_ms']) ?? time
     this.emit(out, 'tool/ops', at, {
@@ -487,8 +726,37 @@ class CodexSynthesizer implements EventSynthesizer {
       this.onToolOutput(payload, time, out)
       return
     }
-    // `response_item.type === 'compaction'` is the encrypted summary item; the
-    // `compacted` record carries the readable structure, so this one is ignored.
+    if (type === 'tool_search_output') {
+      // `tool_search_output` carries `tools` (the discovered schemas), not `output`.
+      this.onToolOutput(payload, time, out, asArray(payload['tools']))
+      return
+    }
+    if (type === 'web_search_call' || type === 'image_generation_call') {
+      this.onSelfContainedCall(payload, type, time, out)
+      return
+    }
+    if (type === 'agent_message') {
+      this.onAgentMessage(agentMessageText(payload), agentRoute(payload), time, out)
+      return
+    }
+    if (type === 'configuration_update') {
+      // A durable input control (today: reasoning effort). Not priced — the
+      // fold has no effort figure — but visible as an inject marker.
+      const reasoning = payload['reasoning']
+      const effort = isRecord(reasoning) ? asString(reasoning['effort']) : undefined
+      if (effort !== undefined && effort !== '') {
+        this.emitSurface(out, 'user/message', time, {
+          content: [{ type: 'text', text: `Reasoning effort set to ${effort}` }],
+          source: { kind: 'configuration-update', form: 'notice' } satisfies MessageSource,
+        })
+        this.lastInputTime = time
+      }
+      return
+    }
+    // `compaction`/`context_compaction` items are the encrypted summary; the
+    // `compacted` record carries the readable structure, so these are ignored.
+    // `additional_tools`/`compaction_trigger` are request controls the rollout
+    // policy never persists.
   }
 
   private onMessage(payload: Record<string, unknown>, time: number, out: TimelineEvent[]): void {
@@ -515,17 +783,30 @@ class CodexSynthesizer implements EventSynthesizer {
       this.lastInputTime = time
       return
     }
-    const hasImage = content.some(block => block.type === 'image')
-    const text = textOf(content)
-    const injected = hasImage ? null : injectedKindOf(text)
-    if (injected !== null) {
+    // Per-item classification (core's `codexUserItems`): a message can mix
+    // injected fragments with a real prompt. Context items emit as context
+    // sources; human items — and media, which is never a contextual fragment —
+    // form the user's message.
+    const classified = codexUserItems(payload)
+    const contextParts = classified.filter(item => !item.human)
+    const humanParts = classified.filter(item => item.human)
+    if (humanParts.length === 0) {
+      if (contextParts.length === 0) return
+      const first = contextParts[0]
       this.emitSurface(out, 'user/message', time, {
         content,
-        source: { kind: injected, form: 'context' } satisfies MessageSource,
+        source: { kind: first?.label ?? 'context', form: 'context' } satisfies MessageSource,
       })
       this.lastInputTime = time
       return
     }
+    for (const part of contextParts) {
+      this.emitSurface(out, 'user/message', time, {
+        content: contentBlocksOf([part.item]),
+        source: { kind: part.label ?? 'context', form: 'context' } satisfies MessageSource,
+      })
+    }
+    const humanContent = contentBlocksOf(humanParts.map(part => part.item))
     // A human prompt. `task_started` already opened the turn (verified: 920 of
     // 921 user messages follow their turn's `task_started`); the increment here
     // only covers a transcript that starts mid-turn.
@@ -535,9 +816,11 @@ class CodexSynthesizer implements EventSynthesizer {
       this.turnOpen = true
       this.openStep(out, time)
     }
+    const text = humanParts.map(part => part.text).filter(part => part !== '').join('\n')
+    if (this.activeTurns.at(-1) !== this.turn) this.activeTurns.push(this.turn)
     if (this.label === undefined && text.trim() !== '') this.label = labelOf(text)
     this.emitSurface(out, 'user/message', time, {
-      content,
+      content: humanContent,
       source: { kind: 'user' } satisfies MessageSource,
     })
     this.lastInputTime = time
@@ -546,36 +829,35 @@ class CodexSynthesizer implements EventSynthesizer {
   private onToolCall(payload: Record<string, unknown>, type: string, time: number, out: TimelineEvent[]): void {
     const callId = asString(payload['call_id']) ?? asString(payload['id'])
     if (callId === undefined) return
-    const name = type === 'local_shell_call' ? 'local_shell' : (asString(payload['name']) ?? 'tool')
-    // `custom_tool_call` carries `input` (a JSON string), `function_call`
-    // carries `arguments`; `local_shell_call` carries a structured `action`.
-    const args = asString(payload['input'])
-      ?? asString(payload['arguments'])
-      ?? jsonOrUndefined(payload['action'] ?? payload['input'] ?? payload['arguments'])
-      ?? ''
+    const { name, args } = toolCallContent(payload, type)
     this.appendBlock(out, { type: 'tool-call', name, arguments: args, callId }, time)
-    this.openCall = { callId, name }
+    this.openCalls.set(callId, { callId, name, args })
     // In-band items now belong to THIS call; the late-pairing candidate count
     // restarts from here.
     this.settledSinceOpen = 0
   }
 
-  private onToolOutput(payload: Record<string, unknown>, time: number, out: TimelineEvent[]): void {
+  private onToolOutput(
+    payload: Record<string, unknown>,
+    time: number,
+    out: TimelineEvent[],
+    /** Structured result for outputs that carry no `output` field (tool_search's `tools`). */
+    itemsOverride?: readonly unknown[],
+  ): void {
     const callId = asString(payload['call_id'])
     if (callId === undefined) return
     // The output settles the model response if no `token_usage_record` did.
     this.closeGroup(out, time, undefined)
-    const raw = payload['output']
-    const content = typeof raw === 'string'
-      ? [{ type: 'text' as const, text: raw }]
-      : contentBlocksOf(asArray(raw) ?? [])
-    // Codex records no error flag on the output itself; the paired
-    // `item_completed.item.status === 'failed'` is the only signal, and it
-    // lands before the output in the common ordering.
+    const content = toolOutputContent(payload['output'], itemsOverride)
+    // Codex records no error flag on `function_call_output` itself; the paired
+    // `item_completed.item.status === 'failed'` is the usual signal, while
+    // `tool_search_output` carries a terminal `status` of its own.
+    const status = asString(payload['status'])
     const isError = this.failedCalls.delete(callId)
+      || status === 'failed' || status === 'error' || status === 'incomplete'
     const ops = this.pendingOps.get(callId)
     this.pendingOps.delete(callId)
-    const name = this.openCall?.callId === callId ? this.openCall.name : undefined
+    const open = this.openCalls.get(callId)
     const resultSeq = this.emitSurface(out, 'tool/result', time, {
       message: {
         content: [{ type: 'tool-result', toolCallId: callId, isError, content }],
@@ -584,11 +866,102 @@ class CodexSynthesizer implements EventSynthesizer {
       ...(isError ? { error: true } : {}),
       ...(ops === undefined || ops.length === 0 ? {} : { fileOps: ops }),
     })
-    this.rememberSettled({ callId, resultSeq, name: name ?? '' })
-    if (this.openCall?.callId === callId) this.openCall = null
+    this.rememberSettled({ callId, resultSeq, name: open?.name ?? '', args: open?.args ?? '' })
+    this.openCalls.delete(callId)
     this.lastInputTime = time
     if (this.awaitingResults > 0) this.awaitingResults -= 1
     if (this.awaitingResults === 0) this.closeStep(out, time)
+  }
+
+  /**
+   * `web_search_call` and `image_generation_call` are self-contained durable
+   * items: one record carries the call AND its terminal `status`, with no
+   * separate output item. The call joins the open group as a `tool-call`
+   * block, while its `tool/call` + `tool/result` events emit immediately —
+   * unlike ordinary calls, whose outputs arrive after the group closes and
+   * whose call events can therefore wait for it.
+   */
+  private onSelfContainedCall(
+    payload: Record<string, unknown>,
+    type: 'web_search_call' | 'image_generation_call',
+    time: number,
+    out: TimelineEvent[],
+  ): void {
+    const callId = asString(payload['id'])
+    if (callId === undefined) return
+    const isImage = type === 'image_generation_call'
+    const { name, args } = toolCallContent(payload, type)
+    this.appendBlock(out, { type: 'tool-call', name, arguments: args, callId }, time)
+    // Call event BEFORE the result: the fold names a `tool/result` only from
+    // a `tool/call` it has already seen, and the group's close-time emission
+    // would land after it.
+    this.emit(out, 'tool/call', time, {
+      callId,
+      name,
+      ...(args === '' ? {} : { arguments: args }),
+    })
+    const status = asString(payload['status'])
+    const failed = status === 'failed' || status === 'error' || status === 'incomplete'
+    // Image results are base64 payloads — an `image` block lets the fold price
+    // them without inflating text; web search yields no readable output.
+    const result = isImage ? asString(payload['result']) : undefined
+    const content: ContentBlock[] = result === undefined || result === ''
+      ? []
+      : [{ type: 'image' }]
+    const resultSeq = this.emitSurface(out, 'tool/result', time, {
+      message: {
+        content: [{ type: 'tool-result', toolCallId: callId, isError: failed, content }],
+        source: { callId },
+      },
+      ...(failed ? { error: true } : {}),
+    })
+    // Its result already folded: the group-close call event must not leave the
+    // step waiting on an output that will never arrive.
+    this.earlySettled.add(callId)
+    this.rememberSettled({ callId, resultSeq, name, args })
+    this.lastInputTime = time
+  }
+
+  /**
+   * Agent-to-agent traffic — `agent_message` response items and the top-level
+   * `inter_agent_communication` record — is model-visible context, not human
+   * input. The source names both endpoints so it cannot masquerade as a
+   * person, and so the Agent Network can tell relayed text apart.
+   */
+  private onAgentMessage(text: string, route: string, time: number, out: TimelineEvent[]): void {
+    if (text === '') return
+    this.closeGroup(out, time, undefined)
+    this.emitSurface(out, 'user/message', time, {
+      content: [{ type: 'text', text }],
+      source: {
+        kind: 'agent-message',
+        form: 'relay',
+        ...(route === '' ? {} : { name: route }),
+      } satisfies MessageSource,
+    })
+    this.lastInputTime = time
+  }
+
+  /**
+   * `retained_context` checkpoints host-held facts — today only
+   * `verified_answer`, the user's accepted `request_user_input` replies
+   * (history/retained_context.rs). Model-invisible to Codex but user-authored,
+   * so they surface as a zero-token notice, outside model content.
+   */
+  private onRetainedContext(payload: Record<string, unknown>, time: number, out: TimelineEvent[]): void {
+    if (asString(payload['type']) !== 'verified_answer') return
+    const lines = (asArray(payload['questions']) ?? [])
+      .flatMap(entry => {
+        if (!isRecord(entry)) return []
+        const question = asString(entry['question']) ?? ''
+        const answer = asString(entry['answer']) ?? ''
+        return question === '' && answer === '' ? [] : [`Q: ${question}\nA: ${answer}`]
+      })
+    if (lines.length === 0) return
+    this.emit(out, 'user/message', time, {
+      content: [],
+      source: { kind: 'verified-answer', form: 'notice', summary: lines.join('\n\n') } satisfies MessageSource,
+    })
   }
 
   // ---------------------------------------------------------------------------
@@ -639,9 +1012,10 @@ class CodexSynthesizer implements EventSynthesizer {
     const completed = Math.max(group.lastTime, time)
     this.step += 1
     const stream = buildStream(group, completed)
+    const priced = usage ?? group.fallbackUsage
     this.emitSurface(out, 'assistant/message', completed, {
       message: { content: group.blocks },
-      ...(usage === undefined ? {} : { usage }),
+      ...(priced === undefined ? {} : { usage: priced }),
       turn: this.turn,
       step: this.step,
       ...(stream.length === 0 ? {} : { stream }),
@@ -649,12 +1023,16 @@ class CodexSynthesizer implements EventSynthesizer {
     let calls = 0
     for (const block of group.blocks) {
       if (block.type !== 'tool-call' || block.callId === undefined) continue
-      calls += 1
+      // A self-contained call emitted `tool/call` + `tool/result` inline (the
+      // fold pairs a result only with a call it has already seen); it waits
+      // on no output.
+      if (this.earlySettled.delete(block.callId)) continue
       this.emit(out, 'tool/call', completed, {
         callId: block.callId,
         name: block.name ?? 'tool',
         ...(block.arguments === undefined ? {} : { arguments: block.arguments }),
       })
+      calls += 1
     }
     this.awaitingResults = calls
     // A response with no tool call ends its step here; otherwise the step ends
@@ -663,12 +1041,23 @@ class CodexSynthesizer implements EventSynthesizer {
   }
 
   private onTokenUsage(payload: Record<string, unknown>, time: number, out: TimelineEvent[]): void {
-    const thread = payload['thread_token_usage']
-    if (isRecord(thread)) {
-      const total = asNumber(thread['total_tokens'])
-      if (total !== undefined) this.threadTotalTokens = total
+    this.lastContextTokens = contextTokensOf(payload['usage']) ?? this.lastContextTokens
+    if (this.group !== null) {
+      this.closeGroup(out, time, usageOf(payload['usage']))
+      return
     }
-    this.closeGroup(out, time, usageOf(payload['usage']))
+    // No open response: a usage-only answer — remote compaction runs one —
+    // must not be booked onto the previous turn. Buffer it for the
+    // `compacted` record that names it through `compaction_response_id`.
+    const usage = usageOf(payload['usage'])
+    if (usage === undefined) return
+    const responseId = asString(payload['response_id']) ?? ''
+    this.unclaimedUsage.delete(responseId)
+    this.unclaimedUsage.set(responseId, usage)
+    if (this.unclaimedUsage.size > 32) {
+      const oldest = this.unclaimedUsage.keys().next().value
+      if (oldest !== undefined) this.unclaimedUsage.delete(oldest)
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -693,21 +1082,57 @@ class CodexSynthesizer implements EventSynthesizer {
   // ---------------------------------------------------------------------------
 
   /**
-   * EVIDENCE (79 compactions): `replacement_history` is the retained history —
-   * `message` items (roles user/developer) followed by ONE `compaction` item
-   * whose summary is `encrypted_content` (unreadable; `payload.message` is the
-   * empty string in every sample). None of those ids is ever re-emitted as a
-   * later `response_item`, so no dedupe is needed.
+   * A `compacted` record rebuilds the model's context. `replacement_history`
+   * is authoritative for what the model keeps: message items, the retained
+   * `agent_message`s `is_retained_for_remote_compaction_v2` admits
+   * (non-progress, non-completion), plus ONE `compaction` /
+   * `context_compaction` summary item (encrypted; `payload.message` is the
+   * plaintext-summary path, empty in every sampled build).
+   * `retained_context.user_messages` is host-review evidence — "retained
+   * outside model summarization for delegated review" — never part of the
+   * model's post-compaction context, so it annotates the summary event rather
+   * than joining the surface. `shadowedTokenCount` is the PRE-COMPACTION
+   * context occupancy (the last response's `input_tokens` via
+   * `latest_token_usage_record`), never the cumulative
+   * `thread_token_usage.total_tokens`, which counts consumption.
    */
   private onCompacted(payload: Record<string, unknown>, time: number, out: TimelineEvent[]): void {
     this.closeGroup(out, time, undefined)
-    const shadowed = this.liveSeqs
+    // The remote compaction ran a usage-only response of its own; its
+    // `token_usage_record` was buffered under `response_id` and is claimed
+    // here through `compaction_response_id`. Emitting it as an empty
+    // assistant message books the cost (a zero-token node, then shadowed)
+    // instead of overwriting the previous turn's usage or dropping it.
+    const responseId = asString(payload['compaction_response_id'])
+    let usage = responseId === undefined ? undefined : this.unclaimedUsage.get(responseId)
+    if (usage === undefined && this.unclaimedUsage.size === 1) {
+      usage = this.unclaimedUsage.values().next().value
+      this.unclaimedUsage.clear()
+    } else if (responseId !== undefined) {
+      this.unclaimedUsage.delete(responseId)
+    }
+    if (usage !== undefined) {
+      this.emitSurface(out, 'assistant/message', time, {
+        message: { content: [] },
+        usage,
+        turn: this.turn,
+        step: this.step,
+      })
+    }
+    const shadowed = this.liveSeqs.map(entry => entry.seq)
     this.liveSeqs = []
     const latest = payload['latest_token_usage_record']
-    const thread = isRecord(latest) ? latest['thread_token_usage'] : undefined
-    const shadowedTokenCount = (isRecord(thread) ? asNumber(thread['total_tokens']) : undefined)
-      ?? this.threadTotalTokens
-    this.emit(out, 'compaction/summary', time, { shadowedSeqs: [...shadowed], shadowedTokenCount })
+    const shadowedTokenCount = (isRecord(latest) ? contextTokensOf(latest['usage']) : undefined)
+      ?? this.lastContextTokens
+    const retained = payload['retained_context']
+    const evidence = (isRecord(retained) ? asArray(retained['user_messages']) ?? [] : [])
+      .flatMap(entry => (isRecord(entry) ? [asString(entry['text']) ?? ''] : []))
+      .filter(text => text !== '')
+    this.emit(out, 'compaction/summary', time, {
+      shadowedSeqs: shadowed,
+      ...(shadowedTokenCount === undefined ? {} : { shadowedTokenCount }),
+      ...(evidence.length === 0 ? {} : { retained: evidence }),
+    })
     const windowId = asString(payload['window_id'])
     // The shadow claim the fold just armed is consumed by the NEXT surface
     // event: the first replacement must carry the replace op or the shadowed
@@ -720,38 +1145,64 @@ class CodexSynthesizer implements EventSynthesizer {
       this.emitSurface(out, 'user/message', time, { content, source }, first ? op : undefined)
       first = false
     }
+    const compactionSource = (): MessageSource => ({
+      kind: 'plugin',
+      form: 'compaction',
+      plugin: 'compaction',
+      ...(windowId === undefined ? {} : { compactionId: windowId }),
+    })
+    // The plaintext summary path (`payload.message`, or a retained message
+    // carrying the SUMMARY_PREFIX marker) renders as the compaction node.
+    const message = asString(payload['message'])
+    let summaryEmitted = false
+    const emitSummary = (text: string | undefined): void => {
+      if (summaryEmitted) return
+      summaryEmitted = true
+      emitReplacement(
+        text === undefined || text === '' ? [] : [{ type: 'text', text }],
+        compactionSource(),
+      )
+    }
     for (const entry of asArray(payload['replacement_history']) ?? []) {
       if (!isRecord(entry)) continue
-      if (asString(entry['type']) === 'compaction') {
-        // The summary itself: encrypted, so it is recorded as an empty-content
-        // node that still carries the compaction identity for the UI.
-        emitReplacement([], {
-          kind: 'plugin',
-          form: 'compaction',
-          plugin: 'compaction',
-          ...(windowId === undefined ? {} : { compactionId: windowId }),
-        })
+      const type = asString(entry['type'])
+      if (type === 'compaction' || type === 'context_compaction') {
+        emitSummary(message)
         continue
       }
+      if (type === 'agent_message') {
+        // Codex keeps non-progress agent messages through remote compaction;
+        // they stay model-visible under their relay identity.
+        const text = agentMessageText(entry)
+        const route = agentRoute(entry)
+        emitReplacement(
+          text === '' ? [] : [{ type: 'text', text }],
+          { kind: 'agent-message', form: 'relay', ...(route === '' ? {} : { name: route }) },
+        )
+        continue
+      }
+      if (type !== 'message') continue
       const role = asString(entry['role'])
       if (role !== 'user' && role !== 'developer') continue
+      const content = contentBlocksOf(asArray(entry['content']) ?? [])
+      const text = textOf(content)
+      if (isSummaryMessage(text)) {
+        emitSummary(text)
+        continue
+      }
       // Retained history keeps its own text but NOT the human-input identity:
       // re-counting it as a prompt would inflate the session's prompt tally.
-      emitReplacement(contentBlocksOf(asArray(entry['content']) ?? []), {
+      emitReplacement(content, {
         kind: 'compaction-retained',
         form: 'compaction',
         ...(role === 'developer' ? { name: 'developer' } : {}),
       })
     }
+    if (!summaryEmitted && message !== undefined && message !== '') emitSummary(message)
     if (first && op !== undefined) {
       // No readable replacement: still claim the range so the shadowed nodes
       // leave the live surface instead of lingering at full price.
-      emitReplacement([], {
-        kind: 'plugin',
-        form: 'compaction',
-        plugin: 'compaction',
-        ...(windowId === undefined ? {} : { compactionId: windowId }),
-      })
+      emitReplacement([], compactionSource())
     }
   }
 
@@ -897,27 +1348,29 @@ function textOf(blocks: readonly ContentBlock[]): string {
   return blocks.filter(block => block.type === 'text').map(block => block.text ?? '').join('\n')
 }
 
+/**
+ * Tokens occupying the context window for one response — its `input_tokens`
+ * (the whole prompt, cached half included). What a compaction shadows is the
+ * context that was live when it ran, so this — not a cumulative thread total —
+ * is the figure `shadowedTokenCount` reports.
+ */
+function contextTokensOf(usage: unknown): number | undefined {
+  if (!isRecord(usage)) return undefined
+  const input = asNumber(usage['input_tokens'])
+  if (input !== undefined) return input
+  return asNumber(usage['total_tokens'])
+}
+
+/** `core/src/compact.rs`'s plaintext summary marker (templates/compact/summary_prefix.md). */
+const SUMMARY_PREFIX = 'Another language model started to solve this problem'
+
+function isSummaryMessage(text: string): boolean {
+  return text.startsWith(SUMMARY_PREFIX)
+}
+
 function labelOf(text: string): string {
   const line = text.trim().split('\n', 1)[0] ?? ''
   return line.length > LABEL_MAX ? `${line.slice(0, LABEL_MAX - 1)}…` : line
-}
-
-/**
- * The injection label for a user-role message, or null when it is a person's
- * prompt. `isCodexHumanPrompt` (core's Codex adapter) owns the human/non-human
- * decision outright, so the trajectory view and the context view can never
- * disagree about what counts as a prompt; this function only NAMES what core
- * already rejected, using core's own labels (`classifyUserText`).
- */
-function injectedKindOf(text: string): string | null {
-  if (isCodexHumanPrompt(text)) return null
-  const trimmed = text.trimStart()
-  const tag = /^<([A-Za-z_][\w-]*)/.exec(trimmed)
-  if (tag !== null) return tag[1] ?? 'context'
-  if (/^#\s*AGENTS\.md\b/.test(trimmed)) return 'agents-md'
-  if (/^The following is the Codex agent history/.test(trimmed)) return 'history'
-  if (/^Here is a list of /.test(trimmed)) return 'catalog'
-  return 'context'
 }
 
 /**
@@ -1026,6 +1479,29 @@ function subagentLabelOf(payload: Record<string, unknown>): string | undefined {
   return asString(payload['parent_thread_id']) === undefined ? undefined : 'subagent'
 }
 
+/**
+ * The command a CommandExecution item ran: `command` is argv, and the shell's
+ * `-c` argument (or the bare argv) is what a call's raw arguments contain.
+ */
+function commandOf(item: Record<string, unknown>): string | undefined {
+  const argv = (asArray(item['command']) ?? []).filter((part): part is string => typeof part === 'string')
+  if (argv.length === 0) return undefined
+  const dashC = argv.findIndex(part => part === '-c' || part === '-lc' || part === '-cl')
+  return argv[dashC + 1] ?? argv[argv.length - 1]
+}
+
+/** Human-readable label for an unattributed file-activity item. */
+function itemLabel(item: Record<string, unknown>): string {
+  const command = commandOf(item)
+  if (command !== undefined) return command
+  const changes = item['changes']
+  if (isRecord(changes)) {
+    const paths = Object.keys(changes)
+    if (paths.length > 0) return paths.join(', ')
+  }
+  return asString(item['type']) ?? 'activity'
+}
+
 function jsonOrUndefined(value: unknown): string | undefined {
   if (value === undefined) return undefined
   try {
@@ -1035,6 +1511,98 @@ function jsonOrUndefined(value: unknown): string | undefined {
   }
 }
 
-export function createCodexSynthesizer(_file: SessionFileRef): EventSynthesizer {
-  return new CodexSynthesizer()
+/**
+ * `session_meta.dynamic_tools` → one flat list of function specs. Canonical
+ * entries (protocol/dynamic_tools.rs `DynamicToolSpec`) are
+ * `{"type":"function", name, description, inputSchema, deferLoading?}` or
+ * `{"type":"namespace", name, description, tools:[…functions…]}`; the legacy
+ * shape is a flat `{name, description, inputSchema, namespace?, deferLoading?/
+ * exposeToContext?}` list. Every emitted spec keeps its `namespace` (owning
+ * namespace name, or the legacy entry's own) so identity survives flattening.
+ */
+function normalizeDynamicTools(specs: readonly unknown[] | undefined): Record<string, unknown>[] {
+  const tools: Record<string, unknown>[] = []
+  for (const spec of specs ?? []) {
+    if (!isRecord(spec)) continue
+    const type = asString(spec['type'])
+    if (type === 'function') {
+      tools.push(spec)
+      continue
+    }
+    if (type === 'namespace') {
+      const namespace = asString(spec['name'])
+      for (const tool of asArray(spec['tools']) ?? []) {
+        if (!isRecord(tool)) continue
+        tools.push(namespace === undefined ? tool : { ...tool, namespace })
+      }
+      continue
+    }
+    // Legacy flat entry: `{name, inputSchema, namespace?, exposeToContext?}` —
+    // `type` absent. `exposeToContext: false` maps to `deferLoading: true`
+    // (normalize_dynamic_tool_specs).
+    if (asString(spec['name']) === undefined) continue
+    const normalized: Record<string, unknown> = { type: 'function', ...spec }
+    const namespace = asString(normalized['namespace'])
+    delete normalized['namespace']
+    delete normalized['exposeToContext']
+    if (normalized['deferLoading'] === undefined && spec['exposeToContext'] === false) {
+      normalized['deferLoading'] = true
+    }
+    if (namespace !== undefined) normalized['namespace'] = namespace
+    tools.push(normalized)
+  }
+  return tools
+}
+
+/** Readable text of an `agent_message` item: `input_text` parts joined; encrypted parts drop out. */
+function agentMessageText(payload: Record<string, unknown>): string {
+  return (asArray(payload['content']) ?? [])
+    .flatMap(item => (isRecord(item) && asString(item['type']) === 'input_text'
+      ? [asString(item['text']) ?? '']
+      : []))
+    .filter(text => text !== '')
+    .join('\n')
+}
+
+/** `author → recipient` of an agent-communication payload (AgentPath strings on the wire). */
+function agentRoute(payload: Record<string, unknown>): string {
+  const author = asString(payload['author'])
+  const recipient = asString(payload['recipient'])
+  if (author === undefined && recipient === undefined) return ''
+  return `${author ?? '?'} → ${recipient ?? '?'}`
+}
+
+/** `inter_agent_communication` carries a plain-string `content` (or only `encrypted_content`). */
+function interAgentText(payload: Record<string, unknown>): string {
+  return asString(payload['content']) ?? ''
+}
+
+/** Wire decoding shared by new activity and inherited model-context replay. */
+function toolCallContent(payload: Record<string, unknown>, type: string): { name: string; args: string } {
+  if (type === 'image_generation_call') {
+    return { name: 'image_generation', args: jsonOrUndefined({ prompt: asString(payload['revised_prompt']) ?? '' }) ?? '' }
+  }
+  if (type === 'web_search_call') {
+    return { name: 'web_search', args: jsonOrUndefined(payload['action']) ?? '' }
+  }
+  let name = asString(payload['name']) ?? 'tool'
+  if (type === 'local_shell_call') name = 'local_shell'
+  if (type === 'tool_search_call') name = 'tool_search'
+  const namespace = asString(payload['namespace'])
+  if (namespace !== undefined && namespace !== '' && namespace !== 'functions') name = `${namespace}.${name}`
+  // Custom calls use input, function calls use arguments, and local shell
+  // uses a structured action. Keep the same readable representation in replay.
+  const args = asString(payload['input']) ?? asString(payload['arguments'])
+    ?? jsonOrUndefined(payload['action'] ?? payload['input'] ?? payload['arguments']) ?? ''
+  return { name, args }
+}
+
+function toolOutputContent(output: unknown, tools?: readonly unknown[]): ContentBlock[] {
+  if (tools !== undefined) return [{ type: 'text', text: jsonOrUndefined(tools) ?? '' }]
+  if (typeof output === 'string') return [{ type: 'text', text: output }]
+  return contentBlocksOf(asArray(output) ?? [])
+}
+
+export function createCodexSynthesizer(file: SessionFileRef): EventSynthesizer {
+  return new CodexSynthesizer(file)
 }

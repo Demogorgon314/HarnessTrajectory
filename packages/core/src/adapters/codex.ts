@@ -28,7 +28,7 @@ interface OpenStep {
   usage: TokenUsage | undefined
 }
 
-/** A subagent thread nested under one synthetic tool call in the parent ledger. */
+/** A subagent thread nested under one synthetic tool call per run in the parent ledger. */
 interface ChildThread {
   callId: string
   fileId: string
@@ -39,7 +39,12 @@ interface ChildThread {
   lastTime: number
   toolCalls: number
   lastAgentMessage: string | null
+  /** A run boundary passed (its `task_complete`/`turn_aborted`); new activity reopens it. */
   completed: boolean
+  /** Count of runs: the nth run's ledger call is `subagent:<fileId>#<n>`. */
+  runs: number
+  /** `session_meta.subagent_history_start_ordinal`: records below it are the PARENT's inherited history, not the child's own activity. */
+  historyStartOrdinal: number | undefined
 }
 
 interface SystemPrompt {
@@ -56,42 +61,195 @@ const DATA_URL = /^data:([^;,]+);base64,(.+)$/s
 
 /**
  * Codex writes non-human context as user-role messages (environment snapshots,
- * internal context, skill catalogs, compaction replays). Those start with an
- * XML-ish tag or a known preamble; everything else is a human prompt.
+ * internal context, skill catalogs, guardian review prompts). Classification
+ * ports `core/src/context/contextual_user_message.rs`: the persisted
+ * `internal_chat_message_metadata_passthrough.content_item_kinds` annotation
+ * wins; legacy records fall back to each fragment's exact start/end markers —
+ * never "any XML tag", or real prompts like `<question>…</question>` would be
+ * mistaken for injected context.
  */
-/** Whether a Codex user-role message is a person's prompt rather than injected context. */
+
+type ContextForm = 'instructions' | 'catalog' | 'snapshot' | 'notice' | 'relay'
+
+interface ContextMarker {
+  readonly start: string
+  readonly end: string
+  readonly label: string
+  readonly form: ContextForm
+}
+
+/**
+ * Marked fragments — each `ContextualUserFragment`'s `type_markers()`
+ * (context-fragments/src/fragment.rs, core/src/context/*). `matches_marked_text`
+ * is a case-insensitive starts/ends check on the trimmed text; a fragment with
+ * an empty marker never matches by text, so unmarked kinds only classify via
+ * `content_item_kinds`.
+ */
+const CONTEXT_MARKERS: readonly ContextMarker[] = [
+  { start: '# AGENTS.md instructions', end: '</INSTRUCTIONS>', label: 'agents-md', form: 'instructions' },
+  { start: '<environment_context>', end: '</environment_context>', label: 'environment-context', form: 'snapshot' },
+  { start: '<skill>', end: '</skill>', label: 'skill', form: 'catalog' },
+  { start: '<user_shell_command>', end: '</user_shell_command>', label: 'user-shell-command', form: 'notice' },
+  { start: '<turn_aborted>', end: '</turn_aborted>', label: 'turn-aborted', form: 'notice' },
+  { start: '<subagent_notification>', end: '</subagent_notification>', label: 'subagent-notification', form: 'relay' },
+  { start: '<recommended_plugins>', end: '</recommended_plugins>', label: 'recommended-plugins', form: 'catalog' },
+  { start: '<goal_context>', end: '</goal_context>', label: 'internal-context', form: 'snapshot' },
+]
+
+/** `matches_marked_text`: trim, then ASCII-insensitive prefix + suffix. */
+function matchesMarkedText(start: string, end: string, text: string): boolean {
+  if (start === '' || end === '') return false
+  const trimmed = text.trim()
+  const head = trimmed.slice(0, start.length)
+  const tail = trimmed.slice(Math.max(0, trimmed.length - end.length))
+  return head.toLowerCase() === start.toLowerCase() && tail.toLowerCase() === end.toLowerCase()
+}
+
+// `<codex_internal_context source="[a-z][a-z0-9_]*">…</codex_internal_context>`
+// (internal_model_context.rs) — the source attribute is part of the marker.
+const INTERNAL_CONTEXT = /^<codex_internal_context source="[a-z][a-z0-9_]*">/
+// `<external_KEY>…</external_KEY>` — the closing tag must name the same key
+// (context-fragments/src/additional_context.rs).
+const EXTERNAL_CONTEXT = /^<external_([A-Za-z0-9_-]+)>/
+// `<hook_prompt hook_run_id="…">…</hook_prompt>`
+// (protocol/src/items.rs `parse_hook_prompt_fragment`).
+const HOOK_PROMPT = /^<hook_prompt\b[^>]*\bhook_run_id="[^"]+"/
+
+/** Unmarked fragments matched by exact prefixes (legacy warnings + guardian relay). */
+const CONTEXT_PREFIXES: readonly { prefix: string; end?: string; label: string; form: ContextForm }[] = [
+  { prefix: 'Warning: apply_patch was requested via ', end: 'Use the apply_patch tool instead of exec_command.', label: 'warning', form: 'notice' },
+  { prefix: 'Warning: Your account was flagged for potentially high-risk cyber activity', label: 'warning', form: 'notice' },
+  { prefix: 'Warning: The maximum number of unified exec processes you can keep open is', label: 'warning', form: 'notice' },
+  // Guardian review prompts are assembled from fixed fragments
+  // (guardian-context/src/composition.rs, guardian-context/src/profile.rs).
+  { prefix: 'The following is the Codex agent history', label: 'guardian-history', form: 'relay' },
+  { prefix: 'The Codex agent has requested the following', label: 'guardian-action', form: 'relay' },
+  { prefix: 'Assess the exact planned action below', label: 'guardian-action', form: 'relay' },
+  { prefix: 'Planned action JSON:', label: 'guardian-action', form: 'relay' },
+  { prefix: 'Reviewed Codex session id:', label: 'guardian-session', form: 'relay' },
+  { prefix: 'Some conversation entries were omitted.', label: 'guardian-transcript', form: 'relay' },
+]
+
+/** Guardian transcript sentinels — whole-line markers like `>>> TRANSCRIPT START`. */
+const GUARDIAN_SENTINEL = /^>>> (?:TRANSCRIPT (?:DELTA )?(?:START|END)|APPROVAL REQUEST (?:START|END))\s*$/
+/** Guardian transcript entries — `[1] user: …`, `[94] tool exec result: …`. */
+const GUARDIAN_ENTRY = /^\[\d+\] (?:user|assistant|tool)\b/
+
+/**
+ * The text-level fallback: does one `input_text` item look like an injected
+ * fragment? Mirrors `is_standard_contextual_user_text` plus the legacy
+ * warnings; anything unmatched is a person's prompt.
+ */
+function classifyUserText(text: string): UserMessageClass {
+  const trimmed = text.trim()
+  for (const marker of CONTEXT_MARKERS) {
+    if (matchesMarkedText(marker.start, marker.end, trimmed)) {
+      return { kind: 'context', label: marker.label, form: marker.form }
+    }
+  }
+  if (INTERNAL_CONTEXT.test(trimmed) && trimmed.endsWith('</codex_internal_context>')) {
+    return { kind: 'context', label: 'internal-context', form: 'snapshot' }
+  }
+  const external = EXTERNAL_CONTEXT.exec(trimmed)
+  if (external !== null && trimmed.endsWith(`</external_${external[1]}>`)) {
+    return { kind: 'context', label: 'external-context', form: 'notice' }
+  }
+  if (HOOK_PROMPT.test(trimmed) && trimmed.endsWith('</hook_prompt>')) {
+    return { kind: 'context', label: 'hook-prompt', form: 'notice' }
+  }
+  for (const { prefix, end, label, form } of CONTEXT_PREFIXES) {
+    if (trimmed.startsWith(prefix) && (end === undefined || trimmed.endsWith(end))) {
+      return { kind: 'context', label, form }
+    }
+  }
+  if (GUARDIAN_SENTINEL.test(trimmed) || GUARDIAN_ENTRY.test(trimmed)) {
+    return { kind: 'context', label: 'guardian-transcript', form: 'relay' }
+  }
+  return { kind: 'human' }
+}
+
+/** Whether a single Codex `input_text` item is a person's prompt rather than injected context. */
 export function isCodexHumanPrompt(text: string): boolean {
   return classifyUserText(text).kind === 'human'
 }
 
-function classifyUserText(text: string): UserMessageClass {
-  const trimmed = text.trimStart()
-  const tag = /^<([A-Za-z_][\w-]*)/.exec(trimmed)
-  if (tag !== null) {
-    const name = tag[1] ?? ''
-    if (name === 'image') return { kind: 'human' }
-    const lower = name.toLowerCase()
-    const form = lower.includes('instruction')
-      ? 'instructions'
-      : lower.includes('plugin') || lower.includes('skill')
-        ? 'catalog'
-        : lower.includes('context') || lower.includes('date') || lower.includes('cwd')
-          ? 'snapshot'
-          : 'notice'
-    return { kind: 'context', label: name, form }
+/** One content item of a user-role message with its provenance classification. */
+export interface CodexUserItem {
+  /** The raw `content[]` element. */
+  readonly item: Record<string, unknown>
+  /** `input_text` text; `''` for media items. */
+  readonly text: string
+  /** Person-authored input, versus an injected context fragment. */
+  readonly human: boolean
+  /** Injected-fragment label — the marker name or `content_item_kinds` value. */
+  readonly label?: string
+  readonly form?: 'instructions' | 'catalog' | 'snapshot' | 'notice' | 'relay'
+}
+
+/**
+ * `content_item_kinds` values Codex counts as user-authored
+ * (`is_user_authorization_message`): `user.*` items, plus the empty/unknown
+ * kinds and media-preparation placeholders that replace real user input.
+ */
+function isUserContentKind(kind: string): boolean {
+  return kind.startsWith('user.')
+    || kind === ''
+    || kind === 'unknown'
+    || kind === 'images.preparation_error'
+    || kind === 'images.unsupported'
+    || kind === 'audio.unsupported'
+}
+
+function contextItem(item: Record<string, unknown>, text: string, label: string): CodexUserItem {
+  return { item, text, human: false, label, form: 'notice' }
+}
+
+/**
+ * Classify every content item of a user-role `message` payload, in order. The
+ * persisted `content_item_kinds` annotation classifies by position when it
+ * covers every content item; otherwise each `input_text` item falls back to
+ * its text markers (the legacy un-annotated format). Items that are not
+ * `input_text` are never contextual fragments — media is user input unless an
+ * annotation says otherwise.
+ */
+export function codexUserItems(payload: Record<string, unknown>): CodexUserItem[] {
+  const content = asArray(payload['content']) ?? []
+  const meta = payload['internal_chat_message_metadata_passthrough']
+  const kinds = isRecord(meta) ? asArray(meta['content_item_kinds']) : undefined
+  const annotated = kinds !== undefined && kinds.length > 0 && kinds.length === content.length
+  const items: CodexUserItem[] = []
+  for (let i = 0; i < content.length; i += 1) {
+    const item = content[i]
+    if (!isRecord(item)) continue
+    const text = asString(item['text']) ?? ''
+    if (annotated) {
+      const kind = asString(kinds[i]) ?? ''
+      items.push(isUserContentKind(kind)
+        ? { item, text, human: true }
+        : contextItem(item, text, kind === '' ? 'context' : kind))
+      continue
+    }
+    if (asString(item['type']) !== 'input_text') {
+      items.push({ item, text, human: true })
+      continue
+    }
+    const cls = classifyUserText(text)
+    items.push(cls.kind === 'human'
+      ? { item, text, human: true }
+      : { item, text, human: false, label: cls.label, form: cls.form })
   }
-  // Project instructions ride a plain Markdown preamble, not a tag (52 of 82
-  // local rollouts open a turn with one).
-  if (/^#\s*AGENTS\.md\b/.test(trimmed)) {
-    return { kind: 'context', label: 'agents-md', form: 'instructions' }
-  }
-  if (/^The following is the Codex agent history/.test(trimmed)) {
-    return { kind: 'context', label: 'history', form: 'relay' }
-  }
-  if (/^Here is a list of /.test(trimmed)) {
-    return { kind: 'context', label: 'catalog', form: 'catalog' }
-  }
-  return { kind: 'human' }
+  return items
+}
+
+/**
+ * The joined text of a user message's human items — its countable, searchable
+ * prompt — or null when the message carries none. An image-only message counts
+ * as human input but contributes no text.
+ */
+export function codexHumanPromptText(payload: Record<string, unknown>): string | null {
+  const human = codexUserItems(payload).filter(item => item.human)
+  if (human.length === 0) return null
+  return human.map(item => item.text).filter(text => text !== '').join('\n')
 }
 
 function mapUsage(value: unknown): TokenUsage | undefined {
@@ -141,13 +299,35 @@ class CodexParser implements SessionParser {
   readonly images = new DataUrlImageStore()
 
   private readonly assembler = new TrajectoryAssembler()
+  /** Display turn of the records currently streaming in. */
   private turn = 0
   private step = 0
   /** `task_started` opened a turn whose human prompt has not arrived yet. */
   private turnOpenPending = false
+  /**
+   * A `task_started` turn is still awaiting its `task_complete`/`turn_aborted`:
+   * input landing inside it is steering, not a new turn (core/session/turn.rs).
+   */
+  private turnActive = false
+  /** Monotonic counter new turns draw their display number from. */
+  private turnCounter = 0
+  /** Persisted `turn_id` → display turn, so annotated records join their turn. */
+  private readonly turnByTurnId = new Map<string, number>()
   private lastInputTime: number | null = null
   private lastTime = 0
   private open: OpenStep | null = null
+  /**
+   * `token_usage_record`s that arrived with no open step — usage-only
+   * responses such as remote compaction — keyed by `response_id` so the
+   * `compacted` record's `compaction_response_id` can claim them.
+   */
+  private readonly unclaimedUsage = new Map<string, TokenUsage>()
+  /**
+   * A child thread served standalone keeps its own copy of
+   * `subagent_history_start_ordinal` (or gets it early through
+   * `SessionFileRef`): records below it are the parent's materialized history.
+   */
+  private historyStartOrdinal: number | undefined
   private readonly lastRequestSeqByTurn = new Map<number, number>()
   private readonly turnSeqs = new Map<number, number[]>()
   private readonly children = new Map<string, ChildThread>()
@@ -175,8 +355,19 @@ class CodexParser implements SessionParser {
     if (type === undefined) return
     const payload = isRecord(record['payload']) ? record['payload'] : {}
     if (file.role === 'child') {
-      this.handleChild(file, type, payload, time)
+      this.handleChild(file, type, payload, time, asNumber(record['ordinal']))
       return
+    }
+    // A child thread opened standalone parses its file as `main`; records
+    // below `subagent_history_start_ordinal` are the parent's materialized
+    // history, not this thread's activity. `session_meta` itself always
+    // parses — it is where the boundary arrives — and the `SessionFileRef`
+    // hint covers lineage-base records replayed ahead of it.
+    const boundary = file.historyStartOrdinal ?? this.historyStartOrdinal
+    if (type === 'session_meta' && boundary !== undefined && asString(payload['id']) !== file.id) return
+    if (type !== 'session_meta' && boundary !== undefined) {
+      const ordinal = asNumber(record['ordinal'])
+      if (ordinal !== undefined && ordinal < boundary) return
     }
     switch (type) {
       case 'session_meta':
@@ -191,11 +382,40 @@ class CodexParser implements SessionParser {
       case 'response_item':
         this.handleResponseItem(payload, time)
         return
-      case 'token_usage_record':
-        this.attachUsage(mapUsage(payload['usage']), true)
+      case 'token_usage_record': {
+        const usage = mapUsage(payload['usage'])
+        if (this.open !== null) {
+          // The record closes a COMPLETED model response (its `response_id`
+          // names it): without a boundary, a continued turn (`end_turn=false`)
+          // folds the next response into this step and overwrites its usage.
+          this.attachUsage(usage, true)
+          this.closeOpenStep('complete')
+        } else if (usage !== undefined) {
+          // Usage with no open step belongs to a usage-only response — a
+          // remote compaction's, claimed later by `compaction_response_id` —
+          // or outlived its step. Attaching it to the previous request would
+          // overwrite that request's own usage, so it waits here instead.
+          const responseId = asString(payload['response_id']) ?? ''
+          this.unclaimedUsage.delete(responseId)
+          this.unclaimedUsage.set(responseId, usage)
+          if (this.unclaimedUsage.size > 32) {
+            const oldest = this.unclaimedUsage.keys().next().value
+            if (oldest !== undefined) this.unclaimedUsage.delete(oldest)
+          }
+        }
         return
+      }
       case 'compacted':
-        this.handleCompaction(asString(payload['message']) ?? '', time)
+        this.handleCompaction(payload, time)
+        return
+      case 'inter_agent_communication':
+        this.handleAgentRelay(interAgentText(payload), agentRoute(payload), time)
+        return
+      case 'world_state':
+        this.handleWorldState(payload, time)
+        return
+      case 'retained_context':
+        this.handleRetainedContext(payload, time)
         return
       default:
         return
@@ -243,6 +463,10 @@ class CodexParser implements SessionParser {
   private handleSessionMeta(payload: Record<string, unknown>, time: number): void {
     this.startedAt ??= parseTime(payload['timestamp']) ?? time
     this.cwd ??= asString(payload['cwd']) ?? null
+    // Persisted as a stringified number (`"24"`) in some builds.
+    const rawStart = payload['subagent_history_start_ordinal']
+    this.historyStartOrdinal ??= asNumber(rawStart)
+      ?? (typeof rawStart === 'string' ? asNumber(Number(rawStart)) : undefined)
     const provider = asString(payload['model_provider'])
     if (provider !== undefined && provider !== '') this.provider = provider
     const instructions = payload['base_instructions']
@@ -264,25 +488,21 @@ class CodexParser implements SessionParser {
     switch (asString(payload['type'])) {
       case 'task_started': {
         this.closeOpenStep('complete')
-        this.completeStaleChildren(time)
-        this.turn += 1
-        this.step = 0
-        this.turnOpenPending = true
+        this.openTurn(asString(payload['turn_id']))
         this.lastInputTime = parseTime(payload['started_at']) ?? time
         return
       }
       case 'task_complete': {
         this.closeOpenStep('complete')
-        this.completeStaleChildren(time)
-        this.closeTurn(this.turn)
+        this.closeTurn(this.resolveTurn(asString(payload['turn_id'])))
+        this.turnActive = false
         this.turnOpenPending = false
         return
       }
       case 'turn_aborted': {
         const reason = asString(payload['reason'])
         this.closeOpenStep('error', reason === undefined ? 'Turn aborted' : `Turn aborted (${reason})`)
-        this.completeStaleChildren(time)
-        const turn = Math.max(1, this.turn)
+        const turn = this.resolveTurn(asString(payload['turn_id']))
         const seq = this.assembler.seq.next()
         this.assembler.pushNode({
           kind: 'turn-error',
@@ -294,13 +514,62 @@ class CodexParser implements SessionParser {
           code: 'turn_aborted',
         })
         this.locate(seq, turn)
-        this.closeTurn(this.turn)
+        this.closeTurn(turn)
+        this.turnActive = false
         this.turnOpenPending = false
         return
       }
       case 'token_count': {
         const info = payload['info']
         if (isRecord(info)) this.attachUsage(mapUsage(info['last_token_usage']), false)
+        return
+      }
+      case 'thread_rolled_back': {
+        // Legacy marker: the last N user turns were dropped from model context
+        // (thread_rollout_truncation.rs). The records stay in the ledger; the
+        // marker says Codex no longer counts them as live context.
+        const numTurns = asNumber(payload['num_turns']) ?? 0
+        if (numTurns <= 0) return
+        this.closeOpenStep('complete')
+        const turn = Math.max(1, this.turn)
+        const seq = this.assembler.seq.next()
+        this.assembler.pushNode({
+          kind: 'turn-error',
+          seq,
+          time,
+          turn,
+          step: this.step,
+          message: `Rolled back ${numTurns} turn${numTurns === 1 ? '' : 's'}`,
+          code: 'thread_rolled_back',
+        })
+        this.locate(seq, turn)
+        return
+      }
+      case 'thread_settings_applied': {
+        // Durable settings snapshot: model/effort/cwd may change mid-thread and
+        // attribute every request after this record.
+        const settings = payload['thread_settings']
+        if (!isRecord(settings)) return
+        const model = asString(settings['model'])
+        if (model !== undefined && model !== '') this.model = model
+        const provider = asString(settings['model_provider_id'])
+        if (provider !== undefined && provider !== '') this.provider = provider
+        const effort = asString(settings['reasoning_effort'])
+        if (effort !== undefined && effort !== '') this.effort = effort
+        const cwd = asString(settings['cwd'])
+        if (cwd !== undefined && cwd !== '') this.cwd = cwd
+        return
+      }
+      case 'thread_goal_updated': {
+        const goal = payload['goal']
+        const objective = isRecord(goal) ? asString(goal['objective']) : undefined
+        if (objective === undefined || objective === '') return
+        this.pushContext(
+          [{ type: 'text', text: objective }],
+          'thread-goal',
+          'notice',
+          time,
+        )
         return
       }
       default:
@@ -322,6 +591,7 @@ class CodexParser implements SessionParser {
       case 'custom_tool_call':
       case 'function_call':
       case 'local_shell_call':
+      case 'tool_search_call':
         this.handleToolCall(payload, time, undefined)
         return
       case 'custom_tool_call_output':
@@ -331,8 +601,28 @@ class CodexParser implements SessionParser {
         this.handleToolOutput(payload, time)
         this.lastInputTime = time
         return
+      case 'tool_search_output': {
+        this.closeOpenStep('complete')
+        // `tool_search_output` carries `tools` (the discovered schemas), not `output`.
+        this.handleToolOutput(payload, time, asArray(payload['tools']))
+        this.lastInputTime = time
+        return
+      }
+      case 'web_search_call':
+        this.handleWebSearch(payload, time)
+        return
+      case 'image_generation_call':
+        this.handleImageGeneration(payload, time)
+        return
+      case 'agent_message':
+        this.handleAgentRelay(agentMessageText(payload), agentRoute(payload), time)
+        return
+      case 'configuration_update':
+        this.handleConfigurationUpdate(payload, time)
+        return
       case 'compaction':
-        this.handleCompaction('', time)
+      case 'context_compaction':
+        this.handleCompaction(payload, time)
         return
       default:
         return
@@ -350,30 +640,59 @@ class CodexParser implements SessionParser {
       }
       return
     }
-    const content = this.contentBlocks(items)
     if (role === 'developer') {
-      this.pushContext(content, 'developer', 'instructions', time)
+      this.pushContext(this.contentBlocks(items), 'developer', 'instructions', time)
       return
     }
     if (role !== 'user') return
-    const hasImage = content.some(block => block.type === 'image')
-    const classified = hasImage ? { kind: 'human' as const } : classifyUserText(textOf(content))
-    if (classified.kind === 'context') {
-      this.pushContext(content, classified.label, classified.form, time)
+    // Per-item classification (codex `is_contextual_user_fragment`): injected
+    // fragments render as context nodes; human items — and media, which is
+    // never a contextual fragment — form the user node. Blocks are built per
+    // part: `contentBlocks` registers images, so re-blocking `items` here would
+    // add them twice.
+    const classified = codexUserItems(payload)
+    const contextParts = classified.filter(item => !item.human)
+    const humanParts = classified.filter(item => item.human)
+    if (humanParts.length === 0) {
+      if (contextParts.length === 0) return
+      const first = contextParts[0]
+      this.pushContext(
+        this.contentBlocks(contextParts.map(part => part.item)),
+        first?.label ?? 'context',
+        first?.form ?? 'notice',
+        time,
+      )
       return
     }
+    for (const part of contextParts) {
+      this.pushContext(this.contentBlocks([part.item]), part.label ?? 'context', part.form ?? 'notice', time)
+    }
+    const humanContent = this.contentBlocks(humanParts.map(part => part.item))
     this.closeOpenStep('complete')
     if (!this.turnOpenPending) {
-      this.completeStaleChildren(time)
-      this.turn += 1
-      this.step = 0
+      const turnId = recordTurnId(payload)
+      const mapped = turnId === undefined ? undefined : this.turnByTurnId.get(turnId)
+      if (mapped !== undefined) {
+        // Annotated input joins the turn its `turn_id` names — steering lands
+        // mid-turn, after the turn's first prompt was already counted.
+        this.turn = mapped
+      } else if (this.turnActive) {
+        // Un-annotated input inside an open turn: steering too (the turn's
+        // `task_complete` has not been written yet).
+        if (turnId !== undefined) this.turnByTurnId.set(turnId, this.turn)
+      } else {
+        this.turnCounter += 1
+        this.turn = this.turnCounter
+        if (turnId !== undefined) this.turnByTurnId.set(turnId, this.turn)
+        this.step = 0
+      }
     }
     this.turnOpenPending = false
     this.promptCount += 1
-    const text = textOf(content)
+    const text = humanParts.map(part => part.text).filter(part => part !== '').join('\n')
     if (this.title === null && text.trim() !== '') this.title = titleFrom(text)
     const seq = this.assembler.seq.next()
-    this.assembler.pushNode({ kind: 'user', seq, time, content, source: { kind: 'user' } })
+    this.assembler.pushNode({ kind: 'user', seq, time, content: humanContent, source: { kind: 'user' } })
     this.locate(seq, this.turn)
     this.lastInputTime = time
   }
@@ -383,6 +702,8 @@ class CodexParser implements SessionParser {
     label: string,
     form: 'instructions' | 'catalog' | 'snapshot' | 'notice' | 'relay',
     time: number,
+    /** Optional endpoint/route detail (e.g. an agent-message's `author → recipient`). */
+    name?: string,
   ): void {
     const seq = this.assembler.seq.next()
     this.assembler.pushNode({
@@ -390,7 +711,7 @@ class CodexParser implements SessionParser {
       seq,
       time,
       content,
-      source: { kind: 'plugin', plugin: label },
+      source: { kind: 'plugin', plugin: label, ...(name === undefined ? {} : { name }) },
       provenance: { role: 'inject', label },
       form,
     })
@@ -406,9 +727,20 @@ class CodexParser implements SessionParser {
     const callId = asString(payload['call_id']) ?? asString(payload['id'])
     if (callId === undefined) return
     const type = asString(payload['type'])
-    const name = type === 'local_shell_call'
+    const bare = type === 'local_shell_call'
       ? 'local_shell'
-      : (asString(payload['name']) ?? 'tool')
+      : type === 'tool_search_call'
+        // A tool-search call names no tool; Codex's qualified id is
+        // `tool_search.tool_search_tool` (core/tools/tool_namespaces_info.rs).
+        ? 'tool_search'
+        : (asString(payload['name']) ?? 'tool')
+    // `namespace` distinguishes same-named functions across dynamic-tool
+    // namespaces (protocol `ToolName` displays as `namespace.name`; the
+    // default `functions` namespace stays unqualified).
+    const namespace = asString(payload['namespace'])
+    const name = namespace === undefined || namespace === '' || namespace === 'functions'
+      ? bare
+      : `${namespace}.${bare}`
     const argsRaw = type === 'local_shell_call'
       ? JSON.stringify(payload['action'] ?? null)
       : (asString(payload['input']) ?? asString(payload['arguments'])
@@ -432,13 +764,20 @@ class CodexParser implements SessionParser {
     this.assembler.touch()
   }
 
-  private handleToolOutput(payload: Record<string, unknown>, time: number): void {
+  private handleToolOutput(
+    payload: Record<string, unknown>,
+    time: number,
+    /** Structured result for outputs that carry no `output` field (tool_search's `tools`). */
+    itemsOverride?: readonly unknown[],
+  ): void {
     const callId = asString(payload['call_id'])
     if (callId === undefined) return
     const output = payload['output']
-    const content = typeof output === 'string'
-      ? [{ type: 'text' as const, text: output }]
-      : this.contentBlocks(asArray(output) ?? [])
+    const content: ContentBlock[] = itemsOverride !== undefined
+      ? [{ type: 'text', text: stringifyRaw(itemsOverride) ?? '' }]
+      : typeof output === 'string'
+        ? [{ type: 'text', text: output }]
+        : this.contentBlocks(asArray(output) ?? [])
     const text = textOf(content)
     const seq = this.assembler.seq.next()
     const { node, topLevel } = this.assembler.tools.complete(callId, {
@@ -455,8 +794,174 @@ class CodexParser implements SessionParser {
     }
   }
 
-  private handleCompaction(message: string, time: number): void {
+  /**
+   * `web_search_call` is self-contained: the Responses API writes one durable
+   * item whose `action` and terminal `status` describe the whole call, so the
+   * ledger call completes on arrival instead of waiting for an output item.
+   */
+  private handleWebSearch(payload: Record<string, unknown>, time: number): void {
+    const callId = asString(payload['id'])
+    if (callId === undefined) return
+    const argsRaw = stringifyRaw(payload['action']) ?? ''
+    this.appendBlock({ kind: 'tool-call', callId, name: 'web_search', argsRaw }, time)
+    this.assembler.tools.start({
+      callId,
+      name: 'web_search',
+      argsRaw,
+      turn: Math.max(1, this.turn),
+      step: this.open?.step ?? this.step,
+      time,
+      subCalls: [],
+    })
+    const status = asString(payload['status'])
+    this.completeSelfContained(callId, [], status, time)
+  }
+
+  /**
+   * `image_generation_call` likewise arrives complete: `result` is the
+   * base64 image itself (empty when generation failed), `revised_prompt`
+   * the prompt the backend actually used.
+   */
+  private handleImageGeneration(payload: Record<string, unknown>, time: number): void {
+    const callId = asString(payload['id'])
+    if (callId === undefined) return
+    const prompt = asString(payload['revised_prompt']) ?? ''
+    this.appendBlock(
+      { kind: 'tool-call', callId, name: 'image_generation', argsRaw: stringifyRaw({ prompt }) ?? '' },
+      time,
+    )
+    this.assembler.tools.start({
+      callId,
+      name: 'image_generation',
+      argsRaw: prompt,
+      turn: Math.max(1, this.turn),
+      step: this.open?.step ?? this.step,
+      time,
+      subCalls: [],
+    })
+    const result = asString(payload['result'])
+    const content: ContentBlock[] = result === undefined || result === ''
+      ? []
+      : [{ type: 'image', attachment: this.images.add(result, 'image/png') }]
+    this.completeSelfContained(callId, content, asString(payload['status']), time)
+  }
+
+  /** Settle a self-contained call (web search / image generation carry no output item). */
+  private completeSelfContained(
+    callId: string,
+    content: readonly ContentBlock[],
+    status: string | undefined,
+    time: number,
+  ): void {
+    const seq = this.assembler.seq.next()
+    const { node, topLevel } = this.assembler.tools.complete(callId, {
+      seq,
+      time,
+      content,
+      isError: status === 'failed' || status === 'error' || status === 'incomplete',
+    })
+    if (topLevel) {
+      this.assembler.pushNode(node)
+      this.locate(seq, Math.max(1, this.turn))
+    } else {
+      this.assembler.touch()
+    }
+  }
+
+  /**
+   * Agent-to-agent traffic (`agent_message` response items and the top-level
+   * `inter_agent_communication` record) is model-visible context, not human
+   * input: it renders as a relay context node naming both endpoints.
+   */
+  private handleAgentRelay(text: string, route: string, time: number): void {
+    if (text === '') return
+    this.pushContext(
+      [{ type: 'text', text }],
+      'agent-message',
+      'relay',
+      time,
+      route === '' ? undefined : route,
+    )
+  }
+
+  /**
+   * `configuration_update` is a durable input control — today it only carries
+   * the reasoning effort the backend should apply from this point on
+   * (protocol `ConfigurationReasoning`). Update attribution for later steps.
+   */
+  private handleConfigurationUpdate(payload: Record<string, unknown>, time: number): void {
+    const reasoning = payload['reasoning']
+    const effort = isRecord(reasoning) ? asString(reasoning['effort']) : undefined
+    if (effort === undefined || effort === '') return
+    if (effort === this.effort) return
+    this.effort = effort
+    this.pushContext(
+      [{ type: 'text', text: `Reasoning effort set to ${effort}` }],
+      'configuration-update',
+      'notice',
+      time,
+    )
+  }
+
+  /**
+   * `world_state` is a durable snapshot of the standing instructions Codex
+   * folds into every request (agents_md, host skills, git state…). Its text is
+   * already sized by the injections it mirrors, so the trajectory keeps only a
+   * marker naming the snapshot's sections.
+   */
+  private handleWorldState(payload: Record<string, unknown>, time: number): void {
+    const state = payload['state']
+    if (!isRecord(state)) return
+    const keys = Object.keys(state).filter(key => key !== '')
+    if (keys.length === 0) return
+    const scope = payload['full'] === false ? 'patch' : 'snapshot'
+    this.pushContext(
+      [{ type: 'text', text: `World state ${scope}: ${keys.join(', ')}` }],
+      'world-state',
+      'snapshot',
+      time,
+    )
+  }
+
+  /**
+   * `retained_context` checkpoints host-held facts — today only
+   * `verified_answer`, the user's accepted `request_user_input` replies
+   * (history/retained_context.rs). Model-invisible to Codex, but they are
+   * user-authored answers, so the ledger shows them as a relay notice.
+   */
+  private handleRetainedContext(payload: Record<string, unknown>, time: number): void {
+    if (asString(payload['type']) !== 'verified_answer') return
+    const lines = (asArray(payload['questions']) ?? [])
+      .flatMap(entry => {
+        if (!isRecord(entry)) return []
+        const question = asString(entry['question']) ?? ''
+        const answer = asString(entry['answer']) ?? ''
+        return question === '' && answer === '' ? [] : [`Q: ${question}\nA: ${answer}`]
+      })
+    if (lines.length === 0) return
+    this.pushContext(
+      [{ type: 'text', text: lines.join('\n\n') }],
+      'verified-answer',
+      'relay',
+      time,
+    )
+  }
+
+  private handleCompaction(payload: Record<string, unknown>, time: number): void {
     this.closeOpenStep('complete')
+    const message = asString(payload['message']) ?? ''
+    // A remote compaction's own response writes a `token_usage_record` like
+    // any other but produces no step; it was buffered on arrival and is
+    // claimed here by `compaction_response_id` (a single outstanding buffer
+    // entry is claimed unconditionally — nothing else could own it).
+    const responseId = asString(payload['compaction_response_id'])
+    let usage = responseId === undefined ? undefined : this.unclaimedUsage.get(responseId)
+    if (usage === undefined && this.unclaimedUsage.size === 1) {
+      usage = this.unclaimedUsage.values().next().value
+      this.unclaimedUsage.clear()
+    } else if (responseId !== undefined) {
+      this.unclaimedUsage.delete(responseId)
+    }
     const seq = this.assembler.seq.next()
     const summary = message.trim() === '' ? null : message
     this.assembler.pushNode({
@@ -477,6 +982,7 @@ class CodexParser implements SessionParser {
       completedAt: time,
       status: 'complete',
       resultSeq: seq,
+      ...(usage === undefined ? {} : { usage }),
       ...(summary === null ? {} : { summary: [{ type: 'text', text: summary }] }),
       ...(this.model === null ? {} : {
         provenance: { provider: this.provider, model: this.model },
@@ -629,6 +1135,30 @@ class CodexParser implements SessionParser {
     this.turnSeqs.set(turn, seqs)
   }
 
+  /** Open the turn `task_started` names, reusing an id the stream already mapped. */
+  private openTurn(turnId: string | undefined): void {
+    const mapped = turnId === undefined ? undefined : this.turnByTurnId.get(turnId)
+    if (mapped !== undefined) {
+      this.turn = mapped
+    } else {
+      this.turnCounter += 1
+      this.turn = this.turnCounter
+      if (turnId !== undefined) this.turnByTurnId.set(turnId, this.turn)
+    }
+    this.step = 0
+    this.turnActive = true
+    this.turnOpenPending = true
+  }
+
+  /** The display turn a completion event names — its own mapping, else the open one. */
+  private resolveTurn(turnId: string | undefined): number {
+    if (turnId !== undefined) {
+      const mapped = this.turnByTurnId.get(turnId)
+      if (mapped !== undefined) return mapped
+    }
+    return Math.max(1, this.turn)
+  }
+
   private closeTurn(turn: number): void {
     for (const seq of this.turnSeqs.get(turn) ?? []) {
       this.assembler.locations.set(seq, { kind: 'turn', turn: { turn, status: 'closed' } })
@@ -683,32 +1213,53 @@ class CodexParser implements SessionParser {
     type: string,
     payload: Record<string, unknown>,
     time: number,
+    ordinal: number | undefined,
   ): void {
+    // Lineage bases replay before the owning header. Neither their identity
+    // nor their activity belongs to this child run.
+    if (type === 'session_meta' && asString(payload['id']) !== file.id) return
+    const boundary = file.historyStartOrdinal ?? this.children.get(file.id)?.historyStartOrdinal
+    if (type !== 'session_meta' && boundary !== undefined && ordinal !== undefined && ordinal < boundary) return
     let child = this.children.get(file.id)
     if (child === undefined) {
       const label = type === 'session_meta' ? subagentLabel(payload) : 'subagent'
-      const threadId = (type === 'session_meta' ? asString(payload['id']) : undefined) ?? file.id
-      const callId = `subagent:${file.id}`
+      const threadId = file.id
       child = {
-        callId, fileId: file.id, threadId, label, startedAt: time, endedAt: null, lastTime: time, toolCalls: 0,
-        lastAgentMessage: null, completed: false,
+        callId: `subagent:${file.id}`, fileId: file.id, threadId, label, startedAt: time,
+        endedAt: null, lastTime: time, toolCalls: 0, lastAgentMessage: null,
+        completed: false, runs: 0, historyStartOrdinal: file.historyStartOrdinal,
       }
       this.children.set(file.id, child)
-      const name = `subagent:${label}`
-      const argsRaw = JSON.stringify({ threadId, source: label })
-      this.assembler.tools.start({
-        callId,
-        name,
-        argsRaw,
-        turn: Math.max(1, this.turn),
-        step: this.step,
-        time,
-        subCalls: [],
-      })
-      this.attachSyntheticCall(callId, name, argsRaw)
-      this.assembler.touch()
+      this.openChildRun(child, time)
     }
-    if (child.completed) return
+    if (type === 'session_meta') {
+      // Persisted as a stringified number (`"24"`) in current rollouts.
+      const raw = payload['subagent_history_start_ordinal']
+      const start = asNumber(raw) ?? (typeof raw === 'string' ? asNumber(Number(raw)) : undefined)
+      if (start !== undefined) child.historyStartOrdinal = start
+      return
+    }
+    // Records below `subagent_history_start_ordinal` are the parent's history
+    // inherited into the child's file — materialized for the model, not the
+    // child's own activity (thread_history_materialization.rs).
+    if (ordinal !== undefined && child.historyStartOrdinal !== undefined
+      && ordinal < child.historyStartOrdinal) {
+      return
+    }
+    if (child.completed) {
+      // A completed run resumes only when a NEW turn begins (`task_started`)
+      // — Codex resumes an existing agent with new input
+      // (core/agent/control.rs). Records that arrive between runs are late
+      // bookkeeping (`token_count`, `item_completed` mirrors); they update
+      // the finished run's stats rather than spawning `…#2`.
+      if (type !== 'event_msg' || asString(payload['type']) !== 'task_started') {
+        child.lastTime = Math.max(child.lastTime, time)
+        return
+      }
+      child.completed = false
+      child.endedAt = null
+      this.openChildRun(child, time)
+    }
     child.lastTime = Math.max(child.lastTime, time)
     if (type === 'response_item') {
       switch (asString(payload['type'])) {
@@ -724,13 +1275,23 @@ class CodexParser implements SessionParser {
         case 'custom_tool_call':
         case 'function_call':
         case 'local_shell_call':
+        case 'tool_search_call':
           child.toolCalls += 1
           this.handleToolCall(payload, time, child.callId)
+          return
+        case 'web_search_call':
+        case 'image_generation_call':
+          // Self-contained calls carry no output item; count them without
+          // nesting (their ids never join the child's ledger call).
+          child.toolCalls += 1
           return
         case 'custom_tool_call_output':
         case 'function_call_output':
         case 'local_shell_call_output':
           this.handleToolOutput(payload, time)
+          return
+        case 'tool_search_output':
+          this.handleToolOutput(payload, time, asArray(payload['tools']))
           return
         default:
           return
@@ -746,6 +1307,25 @@ class CodexParser implements SessionParser {
         this.completeChild(child, time)
       }
     }
+  }
+
+  /** Open a ledger call for the child's current run (its `runs`th). */
+  private openChildRun(child: ChildThread, time: number): void {
+    child.runs += 1
+    child.callId = child.runs === 1 ? `subagent:${child.fileId}` : `subagent:${child.fileId}#${child.runs}`
+    const name = `subagent:${child.label}`
+    const argsRaw = JSON.stringify({ threadId: child.threadId, source: child.label })
+    this.assembler.tools.start({
+      callId: child.callId,
+      name,
+      argsRaw,
+      turn: Math.max(1, this.turn),
+      step: this.step,
+      time,
+      subCalls: [],
+    })
+    this.attachSyntheticCall(child.callId, name, argsRaw)
+    this.assembler.touch()
   }
 
   /** A child's report is an input to the parent: it ends the open step like a tool output. */
@@ -796,11 +1376,44 @@ class CodexParser implements SessionParser {
     }
   }
 
-  /** A turn boundary in the parent closes children that never reported completion. */
-  private completeStaleChildren(time: number): void {
-    for (const child of this.children.values()) {
-      if (!child.completed) this.completeChild(child, time)
-    }
+}
+
+/** The `turn_id` a response item carries in its passthrough metadata, when annotated. */
+function recordTurnId(payload: Record<string, unknown>): string | undefined {
+  const meta = payload['internal_chat_message_metadata_passthrough']
+  return isRecord(meta) ? asString(meta['turn_id']) : undefined
+}
+
+/** Readable text of an `agent_message` item: `input_text` parts joined; encrypted parts drop out. */
+function agentMessageText(payload: Record<string, unknown>): string {
+  return (asArray(payload['content']) ?? [])
+    .flatMap(item => (isRecord(item) && asString(item['type']) === 'input_text'
+      ? [asString(item['text']) ?? '']
+      : []))
+    .filter(text => text !== '')
+    .join('\n')
+}
+
+/** `author → recipient` of an agent-communication payload (AgentPath strings on the wire). */
+function agentRoute(payload: Record<string, unknown>): string {
+  const author = asString(payload['author'])
+  const recipient = asString(payload['recipient'])
+  if (author === undefined && recipient === undefined) return ''
+  return `${author ?? '?'} → ${recipient ?? '?'}`
+}
+
+/** `inter_agent_communication` carries a plain-string `content` (or only `encrypted_content`). */
+function interAgentText(payload: Record<string, unknown>): string {
+  return asString(payload['content']) ?? ''
+}
+
+function stringifyRaw(value: unknown): string | undefined {
+  if (value === undefined) return undefined
+  if (typeof value === 'string') return value
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return undefined
   }
 }
 

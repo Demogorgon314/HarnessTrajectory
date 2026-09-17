@@ -28,7 +28,7 @@ import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
 /** Bumped whenever the schema below changes; a mismatch drops and rebuilds. */
-export const LISTING_CACHE_VERSION = 1
+export const LISTING_CACHE_VERSION = 2
 
 /** What the index persists for one consumed transcript. */
 export interface ListingRow {
@@ -46,6 +46,12 @@ export interface ListingRow {
   sidecarMtimeMs: number | null
   /** `serializeMeta()` output; null when the file carried no scanner. */
   state: string | null
+  /**
+   * JSON fingerprint of the parts of the entry's stream that are not the
+   * head file itself: the head's physical (on-disk) size plus each Codex
+   * lineage base's resolved path/size/mtime. `null` for single-file streams.
+   */
+  footprint: string | null
 }
 
 const SCHEMA = `
@@ -58,7 +64,8 @@ create table files (
   lines           integer not null,
   scanner_version integer not null,
   sidecar_mtime   real,
-  state           text
+  state           text,
+  footprint       text
 );
 `
 
@@ -98,6 +105,7 @@ export class ListingCache {
     if (row === undefined) return undefined
     const sidecar = row['sidecar_mtime']
     const state = row['state']
+    const footprint = row['footprint']
     return {
       size: asInt(row['size']),
       mtimeMs: asInt(row['mtime_ms']),
@@ -107,6 +115,7 @@ export class ListingCache {
       scannerVersion: asInt(row['scanner_version'], -1),
       sidecarMtimeMs: typeof sidecar === 'number' || typeof sidecar === 'bigint' ? Number(sidecar) : null,
       state: typeof state === 'string' ? state : null,
+      footprint: typeof footprint === 'string' ? footprint : null,
     }
   }
 
@@ -114,8 +123,8 @@ export class ListingCache {
   save(path: string, row: ListingRow): void {
     try {
       this.db.prepare(`
-        insert into files (path, size, mtime_ms, consumed_bytes, rest, lines, scanner_version, sidecar_mtime, state)
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        insert into files (path, size, mtime_ms, consumed_bytes, rest, lines, scanner_version, sidecar_mtime, state, footprint)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         on conflict(path) do update set
           size = excluded.size,
           mtime_ms = excluded.mtime_ms,
@@ -124,10 +133,11 @@ export class ListingCache {
           lines = excluded.lines,
           scanner_version = excluded.scanner_version,
           sidecar_mtime = excluded.sidecar_mtime,
-          state = excluded.state
+          state = excluded.state,
+          footprint = excluded.footprint
       `).run(
         path, row.size, row.mtimeMs, row.consumedBytes, row.rest, row.lines,
-        row.scannerVersion, row.sidecarMtimeMs, row.state,
+        row.scannerVersion, row.sidecarMtimeMs, row.state, row.footprint,
       )
     } catch {
       // A locked or full database only costs the next start a re-read.

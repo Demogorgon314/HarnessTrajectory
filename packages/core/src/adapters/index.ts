@@ -6,7 +6,10 @@ import { createGrokParser } from './grok.ts'
 import { createKimiParser } from './kimi.ts'
 
 export { createClaudeParser, classifyInjectedUser } from './claude.ts'
-export { createCodexParser, isCodexHumanPrompt } from './codex.ts'
+export {
+  createCodexParser, isCodexHumanPrompt, codexUserItems, codexHumanPromptText,
+  type CodexUserItem,
+} from './codex.ts'
 export {
   agentMentions, createKimiParser, kimiMessageClass, kimiTitleText,
   type KimiAgentMention, type KimiMessageClass,
