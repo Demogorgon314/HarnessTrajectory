@@ -1,6 +1,6 @@
 {
   "name": "@demogorgon314/harness-trajectory",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local viewer for Claude Code, Codex, Kimi Code and Grok Build session transcripts",
   "type": "module",
   "license": "MIT",
