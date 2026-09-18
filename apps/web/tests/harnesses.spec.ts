@@ -17,4 +17,12 @@ describe('harness registry', () => {
       .toBe(`cd /work/project && devin -r smoggy-gold`)
     expect(meta.resumeCommand({ id: 'smoggy-gold', cwd: null })).toBe('devin -r smoggy-gold')
   })
+
+  test('pi resumes through `pi --session` in the session directory', () => {
+    const meta = harnessMeta('pi')
+    expect(meta.label).toBe('Pi')
+    expect(meta.resumeCommand({ id: 'abc123', cwd: '/work/project' }))
+      .toBe(`cd /work/project && pi --session abc123`)
+    expect(meta.resumeCommand({ id: 'abc123', cwd: null })).toBe('pi --session abc123')
+  })
 })

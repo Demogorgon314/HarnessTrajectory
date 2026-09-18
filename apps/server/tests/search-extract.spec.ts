@@ -5,7 +5,7 @@ import { MAX_DOC_CHARS, extractSearchDocs, type SearchDocDraft } from '../src/se
 const T0 = Date.parse('2026-09-14T10:00:00.000Z')
 const iso = (offsetMs: number) => new Date(T0 + offsetMs).toISOString()
 
-function docs(kind: 'claude' | 'codex' | 'kimi' | 'grok' | 'devin', record: unknown): SearchDocDraft[] {
+function docs(kind: 'claude' | 'codex' | 'kimi' | 'grok' | 'devin' | 'pi', record: unknown): SearchDocDraft[] {
   return extractSearchDocs(kind, JSON.stringify(record))
 }
 
@@ -480,6 +480,61 @@ describe('extractSearchDocs — Devin CLI', () => {
     expect(docs('devin', devinMsg({ role: 'system', content: 'You are Devin.' }))).toEqual([])
     for (const line of ['', '{ nope', 'null', '{"t":"devin.msg"}']) {
       expect(extractSearchDocs('devin', line)).toEqual([])
+    }
+  })
+})
+
+describe('extractSearchDocs — pi', () => {
+  const entry = (offset: number, id: string, type: string, rest: Record<string, unknown> = {}): unknown =>
+    ({ type, id, parentId: null, timestamp: iso(offset), ...rest })
+
+  const message = (offset: number, id: string, message: Record<string, unknown>): unknown =>
+    entry(offset, id, 'message', { message: { timestamp: T0 + offset, ...message } })
+
+  it('indexes a human prompt, assistant text/thinking, and a tool call', () => {
+    expect(docs('pi', message(0, 'e1', {
+      role: 'user', content: [{ type: 'text', text: 'Wire up the pi adapter' }],
+    }))).toEqual([{ role: 'human', text: 'Wire up the pi adapter', timeMs: T0 }])
+
+    expect(pairs(docs('pi', message(1000, 'e2', {
+      role: 'assistant',
+      content: [
+        { type: 'thinking', thinking: 'Plan the work first.' },
+        { type: 'text', text: 'Starting with the parser.' },
+        { type: 'toolCall', id: 'c1', name: 'edit', arguments: { path: 'a.ts', oldText: 'x', newText: 'y' } },
+      ],
+    })))).toEqual([
+      'other: Plan the work first.',
+      'assistant: Starting with the parser.',
+      'tool: edit\npath: a.ts\noldText: x\nnewText: y',
+    ])
+  })
+
+  it('indexes a bashExecution command but never its output', () => {
+    expect(pairs(docs('pi', message(2000, 'e3', {
+      role: 'bashExecution', command: 'pnpm test', output: 'very long output', exitCode: 0,
+    })))).toEqual(['tool: bash\ncommand: pnpm test'])
+  })
+
+  it('indexes custom_message and custom-role content as other, skipping toolResult and bookkeeping', () => {
+    expect(docs('pi', entry(3000, 'e4', 'custom_message', { customType: 'hook', content: 'injected note' })))
+      .toEqual([{ role: 'other', text: 'injected note', timeMs: T0 + 3000 }])
+    expect(docs('pi', message(3001, 'e5', { role: 'custom', customType: 'hook', content: 'hook text' })))
+      .toEqual([{ role: 'other', text: 'hook text', timeMs: T0 + 3001 }])
+    expect(docs('pi', message(4000, 'e6', {
+      role: 'toolResult', toolCallId: 'c1', content: [{ type: 'text', text: 'result body' }],
+    }))).toEqual([])
+    for (const record of [
+      entry(5000, 'e7', 'compaction', { summary: 'summary', firstKeptEntryId: 'e1' }),
+      entry(5001, 'e8', 'branch_summary', { fromId: 'e1', summary: 'branch' }),
+      entry(5002, 'e9', 'session_info', { name: 'title' }),
+      entry(5003, 'ea', 'custom', { customType: 'shadow-mind-event', data: {} }),
+      entry(5004, 'eb', 'label', { targetId: 'e1', label: 'note' }),
+      entry(5005, 'ec', 'model_change', { provider: 'openai', modelId: 'm' }),
+      message(5006, 'ed', { role: 'system', content: 'system prompt' }),
+      { type: 'session', version: 3, id: 's', timestamp: iso(5007), cwd: '/work' },
+    ]) {
+      expect(docs('pi', record), JSON.stringify(record)).toEqual([])
     }
   })
 })

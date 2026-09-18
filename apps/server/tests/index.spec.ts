@@ -208,6 +208,23 @@ describe('classifyPath', () => {
     expect(classifyPath('grok', root, '/r/%2Fwork%2Fgrok/prompt_history.jsonl')).toBeNull()
     expect(classifyPath('grok', root, `${dir}/terminal/updates.jsonl`)).toBeNull()
   })
+
+  it('recognizes pi sessions by the encoded-cwd directory and a first-underscore id split', () => {
+    const root = '/r'
+    expect(classifyPath('pi', root, '/r/--work-project--/2026-09-14T10-00-00-000Z_abc123.jsonl'))
+      .toEqual({ id: 'abc123', role: 'main' })
+    // A custom session id may itself contain underscores: everything after the FIRST one stays.
+    expect(classifyPath('pi', root, '/r/--work-project--/2026-09-14T10-00-00-000Z_my_custom_id.jsonl'))
+      .toEqual({ id: 'my_custom_id', role: 'main' })
+    // A fork is a file of its own, not a child.
+    expect(classifyPath('pi', root, '/r/--work-project--/2026-09-14T11-00-00-000Z_fork-of-abc.jsonl'))
+      .toEqual({ id: 'fork-of-abc', role: 'main' })
+    // Wrong depth or a non-JSONL/unrelated name is not a transcript.
+    expect(classifyPath('pi', root, '/r/--work-project--/nested/2026-09-14T10-00-00-000Z_x.jsonl')).toBeNull()
+    expect(classifyPath('pi', root, '/r/2026-09-14T10-00-00-000Z_x.jsonl')).toBeNull()
+    expect(classifyPath('pi', root, '/r/--work-project--/notes.md')).toBeNull()
+    expect(classifyPath('pi', root, '/r/--work-project--/state.json')).toBeNull()
+  })
 })
 
 describe('defaultRoots', () => {
@@ -217,12 +234,14 @@ describe('defaultRoots', () => {
       CODEX_HOME: join('/h', '.codex'),
       KIMI_CODE_HOME: join('/h', '.kimi-code'),
       GROK_HOME: join('/h', '.grok'),
+      PI_CODING_AGENT_DIR: join('/h', '.pi', 'agent'),
     })).toEqual([
       { kind: 'claude', dir: join('/h', '.claude', 'projects') },
       { kind: 'codex', dir: join('/h', '.codex', 'sessions') },
       { kind: 'codex', dir: join('/h', '.codex', 'archived_sessions') },
       { kind: 'kimi', dir: join('/h', '.kimi-code', 'sessions') },
       { kind: 'grok', dir: join('/h', '.grok', 'sessions') },
+      { kind: 'pi', dir: join('/h', '.pi', 'agent', 'sessions') },
     ])
     expect(defaultRoots({
       HARNESS_TRAJECTORY_CLAUDE_ROOT: join('/roots', 'c'),
@@ -230,10 +249,11 @@ describe('defaultRoots', () => {
       HARNESS_TRAJECTORY_CODEX_ARCHIVED_ROOT: join('/roots', 'xa'),
       HARNESS_TRAJECTORY_KIMI_ROOT: join('/roots', 'k'),
       HARNESS_TRAJECTORY_GROK_ROOT: join('/roots', 'g'),
+      HARNESS_TRAJECTORY_PI_ROOT: join('/roots', 'p'),
     }).map(root => root.dir))
-      .toEqual([join('/roots', 'c'), join('/roots', 'x'), join('/roots', 'xa'), join('/roots', 'k'), join('/roots', 'g')])
+      .toEqual([join('/roots', 'c'), join('/roots', 'x'), join('/roots', 'xa'), join('/roots', 'k'), join('/roots', 'g'), join('/roots', 'p')])
     // An empty `GROK_HOME` is not an override: grok itself falls back to the home default.
-    expect(defaultRoots({ GROK_HOME: '' }).at(-1)?.dir.endsWith(join('.grok', 'sessions'))).toBe(true)
+    expect(defaultRoots({ GROK_HOME: '' }).find(root => root.kind === 'grok')?.dir.endsWith(join('.grok', 'sessions'))).toBe(true)
   })
 })
 
@@ -295,6 +315,16 @@ describe('chronological merge', () => {
     // The sidecar the server prepends carries the same second-granular envelope.
     expect(lineTime(JSON.stringify({ timestamp: 0, method: GROK_SIDECAR_METHOD, params: { sessionId: GROK_MAIN } }))).toBe(0)
   })
+
+  it('reads a pi entry-level ISO timestamp and never the nested message milliseconds', () => {
+    const line = JSON.stringify({
+      type: 'message', id: 'e1', parentId: null, timestamp: iso(2000),
+      message: { role: 'user', content: 'hi', timestamp: T0 + 9000 },
+    })
+    // The entry stamp precedes `message` in pi's key order, so the first
+    // `"timestamp"` match is the ISO one.
+    expect(lineTime(line)).toBe(T0 + 2000)
+  })
 })
 
 describe('meta scanners', () => {
@@ -345,6 +375,31 @@ describe('meta scanners', () => {
     expect(scanner.state).toMatchObject({
       title: 'Port the viewer to Kimi', cwd: '/work/kimi', model: 'k3',
       promptCount: 2, startedAt: T0, lastTime: T0 + 40,
+    })
+  })
+
+  it('summarizes a pi transcript: header cwd, first model, session_info title, human prompts', () => {
+    const scanner = createMetaScanner('pi')
+    const piEntry = (offset: number, id: string, type: string, rest: Record<string, unknown> = {}) =>
+      ({ type, id, parentId: null, timestamp: iso(offset), ...rest })
+    const lines = [
+      { type: 'session', version: 3, id: 'pi-1', timestamp: iso(0), cwd: '/work/pi' },
+      piEntry(10, 'e1', 'model_change', { provider: 'openai', modelId: 'pi-k3' }),
+      piEntry(20, 'e2', 'message', { message: { role: 'user', content: 'Build the pi adapter', timestamp: T0 + 20 } }),
+      piEntry(30, 'e3', 'message', {
+        message: { role: 'assistant', content: [{ type: 'text', text: 'ok' }], model: 'pi-other', timestamp: T0 + 30 },
+      }),
+      piEntry(40, 'e4', 'custom', { customType: 'shadow-mind-event', data: {} }),
+      piEntry(50, 'e5', 'message', {
+        message: { role: 'bashExecution', command: 'ls', output: 'x', timestamp: T0 + 50 },
+      }),
+      piEntry(60, 'e6', 'session_info', { name: 'Pi session name' }),
+      piEntry(70, 'e7', 'message', { message: { role: 'user', content: 'second prompt', timestamp: T0 + 70 } }),
+    ]
+    for (const line of jsonl(lines).split('\n')) scanner.push(line)
+    expect(scanner.state).toMatchObject({
+      title: 'Build the pi adapter', aiTitle: 'Pi session name', cwd: '/work/pi',
+      model: 'pi-k3', promptCount: 2, startedAt: T0, lastTime: T0 + 70,
     })
   })
 
@@ -547,11 +602,29 @@ describe('SessionIndex', () => {
       kimi('runtime.set_binding', 15, { runtimeId: 'rt-2' }, 'sub-1'),
       kimi('profile.bind', 16, { profileName: 'explore', modelAlias: 'kimi-code/k3' }, 'sub-1'),
     ]))
+    const piSession = join(dir, 'pi', '--work-pi--')
+    await mkdir(piSession, { recursive: true })
+    await writeFile(join(piSession, '2026-09-14T10-00-00-000Z_pi-session-1.jsonl'), jsonl([
+      { type: 'session', version: 3, id: 'pi-session-1', timestamp: iso(0), cwd: '/work/pi' },
+      { type: 'model_change', id: 'e1', parentId: null, timestamp: iso(10), provider: 'openai', modelId: 'pi-k3' },
+      {
+        type: 'message', id: 'e2', parentId: 'e1', timestamp: iso(20),
+        message: { role: 'user', content: 'Add pi support', timestamp: T0 + 20 },
+      },
+      {
+        type: 'message', id: 'e3', parentId: 'e2', timestamp: iso(30),
+        message: {
+          role: 'assistant', content: [{ type: 'text', text: 'done' }], provider: 'openai', model: 'pi-k3',
+          usage: { input: 1, output: 1 }, stopReason: 'stop', timestamp: T0 + 30,
+        },
+      },
+    ]))
     index = new SessionIndex({
       roots: [
         { kind: 'claude', dir: join(dir, 'claude') },
         { kind: 'codex', dir: join(dir, 'codex') },
         { kind: 'kimi', dir: join(dir, 'kimi') },
+        { kind: 'pi', dir: join(dir, 'pi') },
       ],
       watch: false,
       now: () => T0 + 60_000,
@@ -567,7 +640,7 @@ describe('SessionIndex', () => {
   it('lists main sessions with metadata and attaches children by parent id', () => {
     const sessions = index.list()
     expect(sessions.map(session => `${session.kind}:${session.id}`).sort())
-      .toEqual(['claude:main-1', 'codex:parent-thread', 'kimi:session_k1'])
+      .toEqual(['claude:main-1', 'codex:parent-thread', 'kimi:session_k1', 'pi:pi-session-1'])
     const claude = index.get('claude', 'main-1')
     expect(claude).toMatchObject({ title: 'Hello there', cwd: '/work/project', childCount: 1, promptCount: 1 })
     expect(claude?.files.map(file => file.role)).toEqual(['main', 'child'])
@@ -599,6 +672,15 @@ describe('SessionIndex', () => {
     await appendFile(mainPath, jsonl([kimiUser('One more thing', 5000)]))
     await index.refreshPath(mainPath)
     expect(index.get('kimi', 'session_k1')).toMatchObject({ title: 'Renamed by the user', promptCount: 2 })
+  })
+
+  it('indexes a pi session by first-underscore id with header cwd, first model, and prompt count', () => {
+    const session = index.get('pi', 'pi-session-1')
+    expect(session).toMatchObject({
+      id: 'pi-session-1', kind: 'pi', title: 'Add pi support', cwd: '/work/pi',
+      model: 'pi-k3', startedAt: T0, promptCount: 1, childCount: 0,
+    })
+    expect(session?.files.map(file => file.role)).toEqual(['main'])
   })
 
   it('stamps a Kimi child with the parent Agent description so the subagent view has a title', async () => {

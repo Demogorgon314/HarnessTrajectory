@@ -410,6 +410,57 @@ s poll is the correctness path). The `sessions` row's title/cwd/model re-seed th
 in place on change — never re-created, or promptCount and the mid-dedup set would reset.
 `stop()` is idempotent and `start()` re-runs cleanly on the same instance.
 
+## Pi
+
+Verified against pi 0.85.1 (`packages/coding-agent/src/core/session-manager.ts`,
+`docs/session-format.md`, and nine local transcripts).
+
+- Sessions live in `<agentDir>/sessions/--<encoded-cwd>--/<iso-ts>_<session-id>.jsonl`
+  where agentDir is `$PI_CODING_AGENT_DIR` else `~/.pi/agent` and the cwd encoding
+  strips the leading `/` and maps `/`, `\`, `:` to `-`. The timestamp part of the
+  filename contains no `_`, so the id is everything after the FIRST `_` (custom ids
+  may contain `_`). One file per session; no subagents. A fork/clone writes a NEW
+  independent file whose header carries `parentSession` — treated as its own main
+  session, never a child.
+- Line 1 is a `{type:'session'}` header (version, id, ISO `timestamp`, `cwd`,
+  `parentSession?`) with no tree fields. Every other entry is
+  `{type, id (8 hex), parentId: string|null, timestamp: ISO}`. TIMESTAMP TRAP: the
+  entry `timestamp` is ISO; a nested `message.timestamp` is epoch MILLISECONDS. Only
+  the entry stamp is used.
+- The context is the parentId path from the latest entry to the root. The Trajectory
+  shows file order; the Context restores the surface checkpoint saved at the parent
+  entry (a `/tree` branch appends an entry whose parentId is earlier, pruning the
+  abandoned suffix; `parentId: null` restarts an empty context).
+- `compaction` entries carry `summary`, `firstKeptEntryId`, `tokensBefore`, optional
+  `systemMessage`, and `usage`. The summary is placed BEFORE the kept range (file
+  order keeps the retained entries first — the suffix-preserving case). An unknown
+  `firstKeptEntryId` keeps nothing. `branch_summary` entries ({fromId, summary})
+  inject a summary node at the branch point.
+- Roles under `message` entries: `system` (content + `sections` patches where `null`
+  deletes + `toolsAdded`/`toolsRemoved`; replayed prompt = accumulated contents then
+  section values in insertion order, nonempty joined with `\n\n`), `user` (always
+  human — pi injects nothing through this role), `assistant` (one persisted record
+  per model call: content blocks, provider/model, usage, `stopReason` ∈
+  stop|length|toolUse|error|aborted|deferred), `toolResult`, `bashExecution`
+  (`!cmd` transcripts; `excludeFromContext` = `!!` prefix), `custom`
+  (extension/hook content; normally persisted as a `custom_message` entry instead —
+  both become context nodes). `branchSummary`/`compactionSummary` roles never appear
+  as message entries.
+- Usage buckets are DISJOINT: `input` excludes `cacheRead`/`cacheWrite`,
+  `totalTokens` is their sum, `reasoning` is a subset of `output`, `cacheWrite1h` a
+  subset of `cacheWrite`. Reported cost comes from `usage.cost.total` on assistant,
+  compaction, and branch_summary records.
+- There are no turn records: EVERY user message opens a new turn (steering messages
+  are persisted identically), each assistant record is a step, and `stopReason !==
+  'toolUse'` closes the turn.
+- Sessions written before ~0.8x have no system messages at all — everything must
+  work without one. `custom` entries (`{customType, data}` extension state, e.g.
+  `shadow-mind-event` heartbeats) are NOT context. `label` entries are ignored.
+  `session_info.name` is the display title. `model_change` and
+  `thinking_level_change` update the request route/config.
+- Context window is never recorded and never inferred. Pi persists only complete
+  messages, so there is no streaming/TTFT data.
+
 ## Request-input statistics (shared)
 
 ### Incremental parser extension points

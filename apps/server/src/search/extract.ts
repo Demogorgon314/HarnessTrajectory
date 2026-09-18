@@ -4,8 +4,9 @@
  * Verified on 2026-09-14 against the transcripts on this machine: Claude Code
  * 2.1.270 (`~/.claude/projects`, main and `subagents/agent-*.jsonl`), Codex
  * 0.153.4 rollouts (`~/.codex/sessions`), Kimi Code protocol 1.5
- * (`~/.kimi-code/sessions`, `agents/<id>/wire.jsonl`) and Grok Build
- * (`~/.grok/sessions`, `<session>/updates.jsonl`).
+ * (`~/.kimi-code/sessions`, `agents/<id>/wire.jsonl`), Grok Build
+ * (`~/.grok/sessions`, `<session>/updates.jsonl`) and pi 0.85.1
+ * (`~/.pi/agent/sessions`, `<encoded-cwd>/<ts>_<id>.jsonl`).
  *
  * - **Claude**: `{type, timestamp (ISO), message:{content}}`. A human prompt is
  *   a `user` record whose `message.content` is a **string**; an array means
@@ -39,6 +40,14 @@
  *   `devin.session`/`devin.tool` sidecars and `role:'tool'` outputs are not
  *   indexed. Human vs injected is `metadata.is_user_input`, the same
  *   structural flag the adapter and meta scanner read.
+ * - **pi**: `{type, id, parentId, timestamp (ISO)}` entries under a `session`
+ *   header; nested `message.timestamp` is epoch MILLISECONDS and never read.
+ *   Every `role:'user'` message is a human prompt (`isPiHumanPrompt`, the same
+ *   classifier the adapter and meta scanner use). `toolCall` blocks carry
+ *   `arguments` as an OBJECT. `toolResult` outputs, `compaction` and
+ *   `branch_summary` summaries, `session_info`, `custom`, `label`,
+ *   `model_change`, `thinking_level_change` and `system` are not indexed;
+ *   `bashExecution` indexes only its command, never the output.
  *
  * The rules that are the same everywhere: the human/injected split reuses the
  * classifier the meta scanner and the adapters use, image blocks are skipped,
@@ -55,8 +64,8 @@
 
 import {
   asArray, asNumber, asString, classifyInjectedUser, devinMessageClass, grokMessageClass,
-  codexHumanPromptText, codexReasoningText, isRecord, kimiMessageClass, kimiTitleText,
-  parseDevinLine, parseGrokLine,
+  codexHumanPromptText, codexReasoningText, isRecord, isPiHumanPrompt, kimiMessageClass, kimiTitleText,
+  parseDevinLine, parseGrokLine, parsePiLine, piContentText,
   parseJsonLine, parseTime, GROK_SIDECAR_METHOD, type HarnessKind, type SearchRole,
 } from '@harness-trajectory/core'
 
@@ -124,7 +133,7 @@ const TOOL_ARG_KEYS: readonly string[] = [
   // Grok reads use `target_file`, `list_dir` uses `target_directory`.
   'file_path', 'filePath', 'path', 'target_file', 'target_directory', 'notebook_path',
   'pattern', 'glob', 'query', 'search', 'output_mode', 'url',
-  'old_string', 'new_string', 'content', 'body', 'message', 'title', 'plan', 'todos', 'edits',
+  'old_string', 'new_string', 'oldText', 'newText', 'content', 'body', 'message', 'title', 'plan', 'todos', 'edits',
   // MCP passthrough (Grok `use_tool`, Kimi `mcp__*`) and background-task handles.
   'tool_name', 'tool_input', 'task_id', 'task_ids',
 ]
@@ -205,6 +214,7 @@ export function extractSearchDocs(kind: HarnessKind, line: string): SearchDocDra
       case 'kimi': return kimiDocs(line)
       case 'grok': return grokDocs(line)
       case 'devin': return devinDocs(line)
+      case 'pi': return piDocs(line)
     }
   } catch {
     return []
@@ -517,6 +527,63 @@ function devinDocs(line: string): SearchDocDraft[] {
     default:
       // `system` prompt segments are harness boilerplate, like codex's
       // session_meta: indexed once per session they would match everything.
+      break
+  }
+  return builder.docs
+}
+
+// -- pi -----------------------------------------------------------------------
+
+/**
+ * pi `message` entries: human prompts are `role:'user'` (every one — pi's
+ * steering messages are persisted as plain user messages), assistant content
+ * blocks split text/thinking/toolCall, `toolResult` outputs are never
+ * indexed, and `bashExecution` contributes its command only. `custom` role and
+ * `custom_message` entries are injected context; `custom` entries are
+ * extension state. Derived records (compaction, branch_summary, session_info)
+ * and bookkeeping entries are skipped.
+ */
+function piDocs(line: string): SearchDocDraft[] {
+  const entry = parsePiLine(line)
+  if (entry === null) return []
+  const builder = new DocBuilder(entry.time)
+  if (entry.type === 'custom_message') {
+    builder.add('other', piContentText(entry.record['content']))
+    return builder.docs
+  }
+  if (entry.type !== 'message') return builder.docs
+  const message = isRecord(entry.record['message']) ? entry.record['message'] : undefined
+  if (message === undefined) return builder.docs
+  switch (asString(message['role'])) {
+    case 'user':
+      if (isPiHumanPrompt(entry)) builder.add('human', piContentText(message['content']))
+      break
+    case 'assistant':
+      for (const block of asArray(message['content']) ?? []) {
+        if (!isRecord(block)) continue
+        switch (asString(block['type'])) {
+          case 'text':
+            builder.add('assistant', asString(block['text']) ?? '')
+            break
+          case 'thinking':
+            builder.add('other', asString(block['thinking']) ?? '')
+            break
+          case 'toolCall':
+            builder.add('tool', renderToolCall(asString(block['name']) ?? 'tool', block['arguments']))
+            break
+          default:
+            break
+        }
+      }
+      break
+    case 'bashExecution':
+      builder.add('tool', renderToolCall('bash', { command: message['command'] }))
+      break
+    case 'custom':
+      builder.add('other', piContentText(message['content']))
+      break
+    // `system`, `toolResult`, and anything newer: not indexed.
+    default:
       break
   }
   return builder.docs

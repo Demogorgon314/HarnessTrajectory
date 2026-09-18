@@ -6,8 +6,8 @@
 
 import {
   agentMentions, asArray, asNumber, asString, classifyInjectedUser, devinMessageClass, grokMessageClass, GrokPromptChunks,
-  codexHumanPromptText, isRecord, kimiMessageClass, kimiTitleText, parseDevinLine, parseGrokLine,
-  parseJsonLine, parseTime, titleFrom, type AgentFileMeta, type HarnessKind,
+  codexHumanPromptText, isRecord, isPiHumanPrompt, kimiMessageClass, kimiTitleText, parseDevinLine, parseGrokLine,
+  parseJsonLine, parsePiLine, parseTime, piContentText, titleFrom, type AgentFileMeta, type HarnessKind,
 } from '@harness-trajectory/core'
 
 export interface FileHead {
@@ -164,6 +164,7 @@ export function createMetaScanner(
     case 'kimi': return kimiMetaScanner()
     case 'grok': return grokMetaScanner(summary ?? null)
     case 'devin': return devinMetaScanner(summary ?? null)
+    case 'pi': return piMetaScanner()
   }
 }
 
@@ -601,13 +602,64 @@ function devinMetaScanner(session: Record<string, unknown> | null): MetaScanner 
   }
 }
 
+/**
+ * pi sessions are one JSONL of `{type, id, parentId, timestamp}` entries under
+ * `<agentDir>/sessions/<encoded-cwd>/<ts>_<sessionId>.jsonl`: every human
+ * `user` message counts as a prompt (pi's steering messages are persisted as
+ * plain user messages), the first model id — `model_change.modelId`, else the
+ * first assistant's `message.model` — is the session model, and a
+ * `session_info.name` lands on `aiTitle` like Kimi/Grok's generated titles.
+ * `parentSession` on a fork's header is lineage, not a child link.
+ */
+function piMetaScanner(): MetaScanner {
+  const state = emptyMeta()
+  return {
+    state,
+    push(line) {
+      const entry = parsePiLine(line)
+      if (entry === null) return
+      noteTime(state, entry.record['timestamp'])
+      switch (entry.type) {
+        case 'session':
+          state.cwd ??= asString(entry.record['cwd']) ?? null
+          break
+        case 'model_change':
+          state.model ??= asString(entry.record['modelId']) ?? null
+          break
+        case 'session_info': {
+          const name = asString(entry.record['name'])
+          if (name !== undefined && name !== '') state.aiTitle = name
+          break
+        }
+        case 'message': {
+          if (!isPiHumanPrompt(entry)) break
+          const message = isRecord(entry.record['message']) ? entry.record['message'] : undefined
+          state.promptCount += 1
+          const text = piContentText(message?.['content'])
+          if (state.title === null && text.trim() !== '') state.title = titleFrom(text)
+          break
+        }
+        default:
+          break
+      }
+      if (entry.type === 'message') {
+        const message = isRecord(entry.record['message']) ? entry.record['message'] : undefined
+        if (message?.['role'] === 'assistant') state.model ??= asString(message['model']) ?? null
+      }
+    },
+  }
+}
+
 /** Read identity facts from the first record of a transcript. */
 export function readHead(kind: HarnessKind, firstLine: string): FileHead {
   // Kimi identity is path-derived (`session_<id>/agents/<agentId>/wire.jsonl`); nothing to probe.
   // Grok's is too (`<encoded-cwd>/<session-id>/updates.jsonl`), and its parent link lives in the
   // parent's `subagents/<id>/meta.json`, not in the first record (GROK-FORMAT §D.4).
   // Devin's likewise (`devin://sessions/<id>` — the source derives chains, not the head).
-  if (kind === 'kimi' || kind === 'grok' || kind === 'devin') return { id: null, parentId: null }
+  // pi's too (`<encoded-cwd>/<ts>_<id>.jsonl`; `parentSession` is fork lineage, not a child link).
+  if (kind === 'kimi' || kind === 'grok' || kind === 'devin' || kind === 'pi') {
+    return { id: null, parentId: null }
+  }
   const record = parseJsonLine(firstLine)
   if (!isRecord(record)) return { id: null, parentId: null }
   if (kind === 'codex') {

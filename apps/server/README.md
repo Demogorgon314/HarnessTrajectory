@@ -1,6 +1,6 @@
 # @demogorgon314/harness-trajectory
 
-Local viewer for Claude Code, Codex, Kimi Code, and Grok Build transcripts.
+Local viewer for Claude Code, Codex, Kimi Code, Grok Build, Devin CLI, and pi transcripts.
 
 ```sh
 npx @demogorgon314/harness-trajectory@latest

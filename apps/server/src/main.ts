@@ -39,13 +39,15 @@ async function main(): Promise<void> {
     console.log(`harness-trajectory [--port N] [--host H] [--static DIR] [--no-open]
 
 Scans Claude Code (~/.claude/projects), Codex (~/.codex/sessions), Kimi Code
-(~/.kimi-code/sessions), Grok Build (~/.grok/sessions) and Devin CLI
-(~/.local/share/devin/cli/sessions.db) transcripts on this machine
+(~/.kimi-code/sessions), Grok Build (~/.grok/sessions), Devin CLI
+(~/.local/share/devin/cli/sessions.db) and pi (~/.pi/agent/sessions)
+transcripts on this machine
 and serves the trajectory viewer. Harness home overrides (CLAUDE_CONFIG_DIR /
-CODEX_HOME / KIMI_CODE_HOME / GROK_HOME) are honoured; override a root directly with
+CODEX_HOME / KIMI_CODE_HOME / GROK_HOME / PI_CODING_AGENT_DIR) are honoured;
+override a root directly with
 HARNESS_TRAJECTORY_CLAUDE_ROOT / HARNESS_TRAJECTORY_CODEX_ROOT /
 HARNESS_TRAJECTORY_KIMI_ROOT / HARNESS_TRAJECTORY_GROK_ROOT /
-HARNESS_TRAJECTORY_DEVIN_DB.
+HARNESS_TRAJECTORY_PI_ROOT / HARNESS_TRAJECTORY_DEVIN_DB.
 
 A local launch opens the UI in the default browser. Pass --no-open (or set
 HARNESS_TRAJECTORY_NO_OPEN=1) to skip. An SSH session never opens a browser.
