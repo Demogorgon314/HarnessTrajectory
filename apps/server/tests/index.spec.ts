@@ -783,6 +783,23 @@ describe('SessionIndex', () => {
     await index.refreshPath(path)
     expect(index.get('claude', 'main-2')).toMatchObject({ title: 'Late arrival' })
   })
+
+  it('skips a harness root that does not exist instead of reporting a watcher error', async () => {
+    // A machine without the harness installed has no session root; the sweep
+    // finds nothing and the watcher stays quiet.
+    const missing = new SessionIndex({
+      roots: [{ kind: 'pi', dir: join(dir, 'absent') }],
+      now: () => T0 + 60_000,
+    })
+    const errors: unknown[] = []
+    missing.on('error', error => errors.push(error))
+    await missing.start()
+    // A watcher error on a missing path arrives on a later tick.
+    await new Promise(resolve => setTimeout(resolve, 50))
+    expect(errors).toEqual([])
+    expect(missing.list()).toEqual([])
+    missing.stop()
+  })
 })
 
 describe('SessionIndex live children', () => {

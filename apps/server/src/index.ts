@@ -4,7 +4,7 @@
  */
 
 import { EventEmitter } from 'node:events'
-import { watch, type FSWatcher } from 'node:fs'
+import { existsSync, watch, type FSWatcher } from 'node:fs'
 import { readdir, stat } from 'node:fs/promises'
 import { basename, dirname, join, relative, sep } from 'node:path'
 import {
@@ -1341,6 +1341,9 @@ export class SessionIndex extends EventEmitter implements SessionSource {
   // -- watching ------------------------------------------------------------
 
   private watchRoot(root: HarnessRoot): void {
+    // A harness that never ran has no session root: nothing to scan, nothing
+    // to watch, and nothing to report (same contract as `walk`).
+    if (!existsSync(root.dir)) return
     try {
       const watcher = watch(root.dir, { recursive: true, persistent: true }, (_event, filename) => {
         if (filename === null || filename === undefined) return
@@ -1348,11 +1351,14 @@ export class SessionIndex extends EventEmitter implements SessionSource {
         if (!name.endsWith('.jsonl') && !(root.kind === 'codex' && name.endsWith('.jsonl.zst'))) return
         this.schedule(root, join(root.dir, name))
       })
-      watcher.on('error', (error) => { this.emit('error', error) })
+      watcher.on('error', (error) => {
+        // The root can still vanish between the check and the watch.
+        if (!isEnoent(error)) this.emit('error', error)
+      })
       watcher.unref()
       this.watchers.push(watcher)
     } catch (error) {
-      this.emit('error', error)
+      if (!isEnoent(error)) this.emit('error', error)
     }
   }
 
@@ -1526,6 +1532,11 @@ async function readWholeFile(path: string, end: number): Promise<string[]> {
     lines.push(...result.lines)
   }
   return lines
+}
+
+/** Missing-path fs errors: the harness simply has no root on this machine. */
+function isEnoent(error: unknown): boolean {
+  return isRecord(error) && error['code'] === 'ENOENT'
 }
 
 /** Recursively list transcript files under a directory; missing directories yield nothing. */
