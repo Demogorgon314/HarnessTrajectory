@@ -39,6 +39,7 @@ import {
   grokSummaryTitle, readGrokSidecar, readGrokSubagentMetas,
 } from './harness/grok.ts'
 import { classifyKimiPath, kimiChildDir, readKimiTitle } from './harness/kimi.ts'
+import { classifyPiPath } from './harness/pi.ts'
 import { readJsonRecord } from './harness/sidecar.ts'
 
 /** Keep the owning header even though it precedes the child's activity boundary. */
@@ -211,6 +212,8 @@ export function classifyPath(
       return classifyKimiPath(parts, basename(path, '.jsonl'))
     case 'grok':
       return classifyGrokPath(parts, basename(path, '.jsonl'))
+    case 'pi':
+      return classifyPiPath(parts, basename(path, '.jsonl'))
     default:
       return null
   }

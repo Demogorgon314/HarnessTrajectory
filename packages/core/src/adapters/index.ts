@@ -4,6 +4,7 @@ import { createCodexParser } from './codex.ts'
 import { createDevinParser } from './devin.ts'
 import { createGrokParser } from './grok.ts'
 import { createKimiParser } from './kimi.ts'
+import { createPiParser } from './pi.ts'
 
 export { createClaudeParser, classifyInjectedUser } from './claude.ts'
 export {
@@ -24,6 +25,11 @@ export {
   createDevinParser, devinMessageClass, parseDevinLine,
   type DevinMessageClass, type DevinRecord,
 } from './devin.ts'
+export {
+  createPiParser, isPiHumanPrompt, parsePiLine, piContentText, PiPromptState,
+  PiSessionTree, resolvePiContextState,
+  type PiContextState, type PiEntry,
+} from './pi.ts'
 export * from './shared.ts'
 
 /** Create the incremental parser for one harness kind. */
@@ -34,5 +40,6 @@ export function createSessionParser(kind: HarnessKind): SessionParser {
     case 'kimi': return createKimiParser()
     case 'grok': return createGrokParser()
     case 'devin': return createDevinParser()
+    case 'pi': return createPiParser()
   }
 }

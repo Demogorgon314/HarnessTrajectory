@@ -28,11 +28,11 @@ export function devinDbPath(env: NodeJS.ProcessEnv = process.env): string {
 
 /**
  * Resolve transcript roots, honouring the same overrides the harnesses use
- * (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `KIMI_CODE_HOME`, `GROK_HOME`) plus
- * explicit `HARNESS_TRAJECTORY_*` overrides.
+ * (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `KIMI_CODE_HOME`, `GROK_HOME`,
+ * `PI_CODING_AGENT_DIR`) plus explicit `HARNESS_TRAJECTORY_*` overrides.
  *
  * Defaults: `~/.claude/projects`, `~/.codex/sessions` + `~/.codex/archived_sessions`,
- * `~/.kimi-code/sessions`, `~/.grok/sessions`.
+ * `~/.kimi-code/sessions`, `~/.grok/sessions`, `~/.pi/agent/sessions`.
  */
 export function defaultRoots(env: NodeJS.ProcessEnv = process.env): HarnessRoot[] {
   const home = homedir()
@@ -43,6 +43,7 @@ export function defaultRoots(env: NodeJS.ProcessEnv = process.env): HarnessRoot[
   // resolves it (GROK-FORMAT §A.1).
   const grokEnv = env['GROK_HOME']
   const grokHome = grokEnv === undefined || grokEnv === '' ? join(home, '.grok') : grokEnv
+  const piAgentDir = env['PI_CODING_AGENT_DIR'] ?? join(home, '.pi', 'agent')
   return [
     { kind: 'claude', dir: resolve(env['HARNESS_TRAJECTORY_CLAUDE_ROOT'] ?? join(claudeConfig, 'projects')) },
     { kind: 'codex', dir: resolve(env['HARNESS_TRAJECTORY_CODEX_ROOT'] ?? join(codexHome, 'sessions')) },
@@ -52,5 +53,6 @@ export function defaultRoots(env: NodeJS.ProcessEnv = process.env): HarnessRoot[
     { kind: 'codex', dir: resolve(env['HARNESS_TRAJECTORY_CODEX_ARCHIVED_ROOT'] ?? join(codexHome, 'archived_sessions')) },
     { kind: 'kimi', dir: resolve(env['HARNESS_TRAJECTORY_KIMI_ROOT'] ?? join(kimiHome, 'sessions')) },
     { kind: 'grok', dir: resolve(env['HARNESS_TRAJECTORY_GROK_ROOT'] ?? join(grokHome, 'sessions')) },
+    { kind: 'pi', dir: resolve(env['HARNESS_TRAJECTORY_PI_ROOT'] ?? join(piAgentDir, 'sessions')) },
   ]
 }

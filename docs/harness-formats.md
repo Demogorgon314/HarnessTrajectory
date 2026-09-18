@@ -410,6 +410,72 @@ s poll is the correctness path). The `sessions` row's title/cwd/model re-seed th
 in place on change — never re-created, or promptCount and the mid-dedup set would reset.
 `stop()` is idempotent and `start()` re-runs cleanly on the same instance.
 
+## Pi
+
+Verified against pi 0.85.1 (`packages/coding-agent/src/core/session-manager.ts`,
+`docs/session-format.md`, and nine local transcripts).
+
+- Sessions live in `<agentDir>/sessions/--<encoded-cwd>--/<iso-ts>_<session-id>.jsonl`
+  where agentDir is `$PI_CODING_AGENT_DIR` else `~/.pi/agent` and the cwd encoding
+  strips the leading `/` and maps `/`, `\`, `:` to `-`. The timestamp part of the
+  filename contains no `_`, so the id is everything after the FIRST `_` (custom ids
+  may contain `_`). One file per session; no subagents. A fork/clone writes a NEW
+  independent file whose header carries `parentSession` — treated as its own main
+  session, never a child.
+- Line 1 is a `{type:'session'}` header (version, id, ISO `timestamp`, `cwd`,
+  `parentSession?`) with no tree fields. Every other entry is
+  `{type, id (8 hex), parentId: string|null, timestamp: ISO}`. TIMESTAMP TRAP: the
+  entry `timestamp` is ISO; a nested `message.timestamp` is epoch MILLISECONDS. Only
+  the entry stamp is used.
+- The entry TREE is the only source of truth for the model-visible context
+  (`PiSessionTree.contextEntries` ports pi's `buildContextEntries`; rendered
+  surfaces are never consulted). The Trajectory shows file order; the Context
+  rebuilds the surface and re-resolves the route/prompt from the parent's path
+  whenever an entry's parentId is not the previous entry (a `/tree` branch,
+  pruning the abandoned suffix; `parentId: null` restarts an empty context).
+  The Trajectory likewise re-resolves the request route/prompt at a branch so
+  nothing from an abandoned branch leaks through. `resolvePiContextState`
+  splits state the way pi's `buildSessionContext` does: the PROMPT replays
+  the compacted entry list, while the ROUTE (provider/model/thinking) reads
+  the FULL parent path (`getSessionContextSettings`) — a compaction that
+  shadows a `model_change`/`thinking_level_change` does not forget it.
+- `compaction` entries carry `summary`, `firstKeptEntryId`, `tokensBefore`, optional
+  `systemMessage`, and `usage`. The summary is placed BEFORE the kept range (file
+  order keeps the retained entries first — the suffix-preserving case). The kept
+  range is path entries from `firstKeptEntryId` up to the compaction, minus system
+  messages; an off-path `firstKeptEntryId` keeps nothing, a later compaction
+  re-keeps the path range even when the surface holds replay copies, and an
+  extension compaction may WIDEN the range — entries the surface no longer
+  holds replay their original emitted events. The optional `systemMessage` is
+  a COMPLETE prompt checkpoint (pi stores `getCurrentSystemMessage`): it
+  replaces the replayed state, never applies as a delta. `branch_summary`
+  entries ({fromId, summary}) inject a summary node at the branch point.
+- Roles under `message` entries: `system` (content + `sections` patches where `null`
+  deletes + `toolsAdded`/`toolsRemoved` — removals land FIRST, so a same-name
+  pair redefines the tool; replayed prompt = accumulated contents then
+  section values in insertion order, nonempty joined with `\n\n`), `user` (always
+  human — pi injects nothing through this role), `assistant` (one persisted record
+  per model call: content blocks, provider/model, usage, `stopReason` ∈
+  stop|length|toolUse|error|aborted|deferred), `toolResult`, `bashExecution`
+  (`!cmd` transcripts; `excludeFromContext` = `!!` prefix), `custom`
+  (extension/hook content; normally persisted as a `custom_message` entry instead —
+  both become context nodes). `branchSummary`/`compactionSummary` roles never appear
+  as message entries.
+- Usage buckets are DISJOINT: `input` excludes `cacheRead`/`cacheWrite`,
+  `totalTokens` is their sum, `reasoning` is a subset of `output`, `cacheWrite1h` a
+  subset of `cacheWrite`. Reported cost comes from `usage.cost.total` on assistant,
+  compaction, and branch_summary records.
+- There are no turn records: EVERY user message opens a new turn (steering messages
+  are persisted identically), each assistant record is a step, and `stopReason !==
+  'toolUse'` closes the turn.
+- Sessions written before ~0.8x have no system messages at all — everything must
+  work without one. `custom` entries (`{customType, data}` extension state, e.g.
+  `shadow-mind-event` heartbeats) are NOT context. `label` entries are ignored.
+  `session_info.name` is the display title. `model_change` and
+  `thinking_level_change` update the request route/config.
+- Context window is never recorded and never inferred. Pi persists only complete
+  messages, so there is no streaming/TTFT data.
+
 ## Request-input statistics (shared)
 
 ### Incremental parser extension points
