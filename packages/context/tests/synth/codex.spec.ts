@@ -1290,3 +1290,22 @@ describe('codex synthesizer', () => {
     })
   })
 })
+
+describe('codex synthesizer — readable reasoning text', () => {
+  it('renders reasoning_text content alongside the summary', () => {
+    const { events } = run([
+      sessionMeta(0),
+      taskStarted(1),
+      userMessage(2, 'hi'),
+      line(3, 'response_item', {
+        type: 'reasoning', id: 'rs-3', summary: [],
+        content: [{ type: 'reasoning_text', text: 'Visible reasoning' }, { type: 'text', text: 'Final thought' }],
+        encrypted_content: 'gAAAA',
+      }),
+      assistantMessage(4, 'done'),
+      tokenUsage(5, { input_tokens: 10, output_tokens: 5, total_tokens: 15 }),
+    ])
+    const assistant = firstOf(events, 'assistant/message')
+    expect(blocksOf(assistant)).toContainEqual({ type: 'reasoning', text: 'Visible reasoning\n\nFinal thought' })
+  })
+})

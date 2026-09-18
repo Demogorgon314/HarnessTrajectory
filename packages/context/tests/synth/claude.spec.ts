@@ -503,36 +503,47 @@ describe('claude synthesizer — attachments', () => {
 })
 
 describe('claude synthesizer — compaction', () => {
-  const boundary = (s: number, preserved: string[], extra: Rec = {}): Rec =>
+  const boundary = (s: number, opts: {
+    head?: string; tail?: string; anchor?: string; allUuids?: string[]; extra?: Rec
+  } = {}): Rec =>
     systemRecord(s, 'compact_boundary', {
       uuid: 'boundary-1',
+      parentUuid: null,
       compactMetadata: {
         trigger: 'auto',
         preTokens: 150_000,
         postTokens: 20_000,
         durationMs: 4200,
         cumulativeDroppedTokens: 90_000,
-        preservedMessages: { allUuids: preserved, uuids: preserved, anchorUuid: preserved[0] ?? '' },
-        preservedSegment: { anchorUuid: '', headUuid: '', tailUuid: '' },
-        ...(extra as Rec),
+        ...(opts.allUuids === undefined ? {} : {
+          preservedMessages: { allUuids: opts.allUuids, uuids: opts.allUuids, anchorUuid: opts.allUuids[0] ?? '' },
+        }),
+        ...(opts.head === undefined ? {} : {
+          preservedSegment: {
+            headUuid: opts.head,
+            tailUuid: opts.tail ?? opts.head,
+            anchorUuid: opts.anchor ?? 'boundary-1',
+          },
+        }),
+        ...(opts.extra ?? {}),
       },
     })
 
-  function compactionFixture(preserved: string[]): Rec[] {
+  function compactionFixture(opts: Parameters<typeof boundary>[1]): Rec[] {
     return [
-      human(0, 'hello'),
-      assistantBlock(2, { requestId: 'r1', index: 0, block: textBlock('a'), stopReason: 'end_turn' }),
-      human(4, 'again'),
-      assistantBlock(6, { requestId: 'r2', index: 0, block: textBlock('b'), stopReason: 'end_turn' }),
-      boundary(8, preserved),
-      { ...human(9, 'summary of the session'), uuid: 'summary-1', isCompactSummary: true },
+      { ...human(0, 'hello'), parentUuid: null },
+      { ...assistantBlock(2, { requestId: 'r1', index: 0, block: textBlock('a'), stopReason: 'end_turn' }), parentUuid: 'u-0' },
+      human(4, 'again', { parentUuid: 'a-2' }),
+      { ...assistantBlock(6, { requestId: 'r2', index: 0, block: textBlock('b'), stopReason: 'end_turn' }), parentUuid: 'u-4' },
+      boundary(8, opts),
+      { ...human(9, 'summary of the session'), uuid: 'summary-1', parentUuid: 'boundary-1', isCompactSummary: true },
     ]
   }
 
   it('shadows every live node whose uuid is not preserved, then replaces the range', () => {
-    const events = run(compactionFixture(['a-6']))
+    const events = run(compactionFixture({ head: 'a-6', anchor: 'boundary-1' }))
     const summary = first(events, 'compaction/summary')
-    // Live surface nodes: u-0 (seq 1), a-2 assistant (seq 4), u-4 (seq 7), a-6 assistant (seq 9).
+    // Live surface nodes: u-0 (seq 1), a-2 assistant (seq 4), u-4 (seq 6), a-6 assistant (seq 8).
     // Only a-6 is preserved, so the first three are shadowed.
     expect(data(summary).shadowedSeqs).toEqual([1, 4, 6])
     expect(data(summary).shadowedTokenCount).toBe(130_000)
@@ -549,17 +560,26 @@ describe('claude synthesizer — compaction', () => {
   })
 
   it('places compaction/summary immediately before its replacement', () => {
-    const events = run(compactionFixture([]))
+    const events = run(compactionFixture({}))
     expect(types(events).slice(-2)).toEqual(['compaction/summary', 'user/message'])
   })
 
+  it('keeps the legacy preservedMessages.allUuids contract as a fallback', () => {
+    const events = run(compactionFixture({ allUuids: ['a-6'] }))
+    const summary = first(events, 'compaction/summary')
+    expect(data(summary).shadowedSeqs).toEqual([1, 4, 6])
+    // The legacy branch keeps today's in-place order: no relocation follows.
+    expect(only(events, 'compaction/prune')).toHaveLength(0)
+    expect(events[events.length - 1]?.type).toBe('user/message')
+  })
+
   it('falls back to cumulativeDroppedTokens when pre/post do not shrink', () => {
-    const records = compactionFixture(['a-6'])
+    const records = compactionFixture({ head: 'a-6', anchor: 'boundary-1' })
     records[4] = systemRecord(8, 'compact_boundary', {
       uuid: 'boundary-1',
       compactMetadata: {
         cumulativeDroppedTokens: 4321,
-        preservedMessages: { allUuids: ['a-6'], uuids: ['a-6'], anchorUuid: 'a-6' },
+        preservedSegment: { headUuid: 'a-6', tailUuid: 'a-6', anchorUuid: 'boundary-1' },
       },
     })
     const events = run(records)
@@ -568,10 +588,166 @@ describe('claude synthesizer — compaction', () => {
 
   it('omits the surfaceOp when nothing was shadowed', () => {
     const events = run([
-      boundary(0, []),
+      boundary(0),
       { ...human(1, 'summary'), uuid: 'summary-1', isCompactSummary: true },
     ])
     expect(events[events.length - 1]?.surfaceOp).toBeUndefined()
+  })
+})
+
+describe('claude synthesizer — preserved segment ordering', () => {
+  /** u1 (discard) → u2 (keep me) → u3 (keep too), chained by parentUuid. */
+  function segmentFixture(anchor: string, boundaryExtra: Rec = {}): Rec[] {
+    return [
+      { ...human(0, 'discard'), parentUuid: null },
+      { ...human(1, 'keep me'), uuid: 'u2', parentUuid: 'u-0' },
+      { ...human(2, 'keep too'), uuid: 'u3', parentUuid: 'u2' },
+      systemRecord(3, 'compact_boundary', {
+        uuid: 'b', parentUuid: null,
+        compactMetadata: {
+          trigger: 'auto', preTokens: 1000,
+          preservedSegment: { headUuid: 'u2', tailUuid: 'u3', anchorUuid: anchor },
+          ...boundaryExtra,
+        },
+      }),
+      { ...human(4, 'summary text'), uuid: 'summary', parentUuid: 'b', isCompactSummary: true },
+      { ...human(5, 'after'), uuid: 'u4', parentUuid: 'u3' },
+    ]
+  }
+
+  const texts = (events: readonly TimelineEvent[]): unknown[] =>
+    only(events, 'user/message').map(event =>
+      (data(event).content as ContentBlock[]).map(block => block.text).join(''))
+
+  it('suffix-preserving (anchor = summary): replays the kept nodes after the summary', () => {
+    const events = run(segmentFixture('summary'))
+    // Only u-0 is shadowed by the metering event; the kept seqs are never billed.
+    expect(data(first(events, 'compaction/summary')).shadowedSeqs).toEqual([1])
+    expect(only(events, 'compaction/summary')).toHaveLength(1)
+    // The relocation is ONE prune arming the kept range, then replay copies.
+    const prunes = only(events, 'compaction/prune')
+    expect(prunes).toHaveLength(1)
+    expect(data(prunes[0]).shadowedSeqs).toEqual([2, 3])
+    expect(texts(events)).toEqual(['discard', 'keep me', 'keep too', 'summary text', 'keep me', 'keep too', 'after'])
+    const copies = only(events, 'user/message').slice(4, 6)
+    expect(copies.every(event => data(event).replay === true)).toBe(true)
+    expect(copies[0]?.surfaceOp).toEqual({ op: 'replace', startSeq: 2, endSeq: 3 })
+    // u4 chains off the kept tail: no branch restore was faked.
+    expect(events[events.length - 1]?.type).toBe('user/message')
+  })
+
+  it('prefix-preserving (anchor = boundary): kept nodes stay ahead of the summary', () => {
+    const events = run(segmentFixture('b'))
+    expect(data(first(events, 'compaction/summary')).shadowedSeqs).toEqual([1])
+    expect(only(events, 'compaction/prune')).toHaveLength(0)
+    expect(texts(events)).toEqual(['discard', 'keep me', 'keep too', 'summary text', 'after'])
+  })
+
+  it('a walk that cannot start (unknown tail) preserves nothing', () => {
+    const records = segmentFixture('summary')
+    const meta = (records[3] as Rec).compactMetadata as Rec
+    meta.preservedSegment = { headUuid: 'u2', tailUuid: 'never-seen', anchorUuid: 'summary' }
+    const events = run(records)
+    expect(data(first(events, 'compaction/summary')).shadowedSeqs).toEqual([1, 2, 3])
+    // No kept nodes means no relocation (u4's parent was shadowed, so the
+    // later compaction/prune is a genuine branch restore, as in a plain
+    // compaction with no preserved segment).
+    const copies = only(events, 'user/message').filter(event => data(event).replay === true)
+    expect(copies.map(event => (data(event).content as ContentBlock[])[0]?.text)).toEqual(['discard', 'keep me', 'keep too'])
+  })
+
+  it('a walk that breaks mid-way keeps the partial segment', () => {
+    const records = segmentFixture('b')
+    // u3's parent is missing from the transcript: the walk collects u3 only.
+    records[2] = { ...human(2, 'keep too'), uuid: 'u3', parentUuid: 'truncated' }
+    const events = run(records)
+    expect(data(first(events, 'compaction/summary')).shadowedSeqs).toEqual([1, 2])
+    expect(texts(events)).toEqual(['discard', 'keep me', 'keep too', 'summary text', 'after'])
+  })
+
+  it('a second compaction shadows replay copies by their original uuids', () => {
+    const events = run([
+      ...segmentFixture('summary'),
+      systemRecord(6, 'compact_boundary', {
+        uuid: 'b2', parentUuid: null,
+        compactMetadata: {
+          trigger: 'manual', preTokens: 500,
+          preservedSegment: { headUuid: 'u3', tailUuid: 'u3', anchorUuid: 'b2' },
+        },
+      }),
+      { ...human(7, 'second summary'), uuid: 'summary-2', parentUuid: 'b2', isCompactSummary: true },
+    ])
+    const summaries = only(events, 'compaction/summary')
+    expect(summaries).toHaveLength(2)
+    // Second boundary: live = [summary seq 5, u2 copy seq 7, u3 copy seq 8,
+    // u4 seq 9]; only u3 is preserved, so everything else is shadowed — the
+    // replay copy is matched by its ORIGINAL uuid, surviving the relocation.
+    expect(data(summaries[1]).shadowedSeqs).toEqual([5, 7, 9])
+    // Prefix-preserving (anchor = boundary): the u3 copy stays ahead.
+    expect(only(events, 'compaction/prune')).toHaveLength(1)
+    expect(data(events[events.length - 1]).content).toEqual([{ type: 'text', text: 'second summary' }])
+  })
+})
+
+describe('claude synthesizer — snip and microcompact boundaries', () => {
+  it('snip_boundary removes the listed uuids without a branch restore', () => {
+    const events = run([
+      { ...human(0, 'one'), parentUuid: null },
+      { ...human(1, 'two'), uuid: 'u2', parentUuid: 'u-0' },
+      { ...human(2, 'three'), uuid: 'u3', parentUuid: 'u2' },
+      systemRecord(3, 'snip_boundary', { uuid: 'b', parentUuid: 'u3', snipMetadata: { removedUuids: ['u2'] } }),
+      { ...human(4, 'after'), uuid: 'u4', parentUuid: 'u3' },
+    ])
+    const prunes = only(events, 'compaction/prune')
+    expect(prunes).toHaveLength(1)
+    expect(data(prunes[0]).shadowedSeqs).toEqual([2])
+    const marker = only(events, 'user/message')[3]
+    expect(data(marker).content).toEqual([])
+    expect(data(marker).source).toEqual({ kind: 'plugin', form: 'compaction', plugin: 'snip' })
+    expect(marker?.surfaceOp).toEqual({ op: 'replace', startSeq: 2, endSeq: 2 })
+    // The surviving tail keeps its pruned checkpoint: continuing is not a rewind.
+    expect(events[events.length - 1]?.type).toBe('user/message')
+  })
+
+  it('microcompact_boundary removes tool results by call id and reports tokensSaved', () => {
+    const events = run([
+      human(0, 'hello'),
+      assistantBlock(2, { requestId: 'r1', index: 0, block: toolUse('c1', 'Bash', { command: 'ls' }) }),
+      toolResult(4, { callId: 'c1' }),
+      assistantBlock(6, { requestId: 'r2', index: 0, block: textBlock('done'), stopReason: 'end_turn' }),
+      systemRecord(7, 'microcompact_boundary', {
+        uuid: 'b', parentUuid: 'a-6',
+        microcompactMetadata: { trigger: 'auto', preTokens: 2000, tokensSaved: 500, compactedToolIds: ['c1'], clearedAttachmentUUIDs: [] },
+      }),
+    ])
+    const prune = first(events, 'compaction/prune')
+    const resultSeq = first(events, 'tool/result')?.seq
+    expect(data(prune).shadowedSeqs).toEqual([resultSeq])
+    expect(data(prune).shadowedTokenCount).toBe(500)
+    expect(data(only(events, 'user/message')[1]).source).toEqual({ kind: 'plugin', form: 'compaction', plugin: 'microcompact' })
+  })
+
+  it('microcompact_boundary clears attachments by uuid', () => {
+    const events = run([
+      human(0, 'hello'),
+      { ...attachment(1, { type: 'file', filename: 'a.ts', displayPath: 'src/a.ts' }, ['file body']), uuid: 'att-1' },
+      systemRecord(2, 'microcompact_boundary', {
+        uuid: 'b', parentUuid: 'att-1',
+        microcompactMetadata: { trigger: 'auto', compactedToolIds: [], clearedAttachmentUUIDs: ['att-1'] },
+      }),
+    ])
+    expect(data(first(events, 'compaction/prune')).shadowedSeqs).toEqual([2])
+  })
+
+  it('ignores unknown system subtypes and metadata-free boundaries', () => {
+    const events = run([
+      human(0, 'hello'),
+      systemRecord(1, 'away_summary', { uuid: 's-1' }),
+      systemRecord(2, 'snip_boundary', { uuid: 's-2', snipMetadata: {} }),
+      systemRecord(3, 'something_new', { uuid: 's-3' }),
+    ])
+    expect(only(events, 'compaction/prune')).toHaveLength(0)
+    expect(only(events, 'user/message')).toHaveLength(1)
   })
 })
 

@@ -25,6 +25,30 @@ Compaction uses its explicit preserved-message selection rather than interpretin
 the boundary's `parentUuid: null` as a new empty conversation. Restoring a branch
 changes model-visible context and retains historical billing.
 
+### Compaction, snip, and microcompact
+
+`compact_boundary.compactMetadata.preservedSegment = { headUuid, tailUuid, anchorUuid }` names
+the messages kept across the compact. They are NOT re-written (dedup-skipped) and keep their
+pre-compact `parentUuid`, so the synthesizer walks tail → head through the recorded parent
+chain. `anchorUuid` fixes the model-visible order: the last summary uuid (suffix-preserving:
+reactive/session-memory compact) puts the kept span AFTER the summary — Context re-emits the
+kept nodes as replay copies behind it, never re-billing them; the boundary's own uuid
+(prefix-preserving partial compact) leaves them before it. A walk that cannot reach `headUuid`
+keeps what it did collect (upstream instead skips pruning on resume). `preservedMessages.allUuids`
+is a legacy fallback only. After a compact, every preserved uuid, the summary, and the boundary
+point at the post-summary surface so the next record's `parentUuid` (the kept tail) is not a
+branch rewind.
+
+Two more `system` records change model context and are recognised STRUCTURALLY (never by
+subtype literal — `snip_boundary` is an internal feature flag upstream): `snipMetadata.removedUuids`
+deletes those records from the live surface and every saved branch checkpoint, preserving
+each checkpoint's historical endpoint and shared prefixes. A parent inside a deleted gap
+resolves to its surviving prefix; a surviving tail continues without a rewind.
+`microcompactMetadata.compactedToolIds` /
+`clearedAttachmentUUIDs` (with `tokensSaved`) removes the matching tool results and attachments.
+Both fold as `compaction/prune` plus a contentless marker (`plugin: 'snip' | 'microcompact'`).
+Support depends on the producing build's feature flags; a boundary without these keys is a no-op.
+
 ## Codex
 
 Rollouts live under `~/.codex/sessions/<yyyy>/<mm>/<dd>/` (archived ones under
@@ -104,8 +128,16 @@ shadowed context size.
 The rollout policy persists more than messages and shell calls: `web_search_call` and
 `image_generation_call` are self-contained (result embedded, no output record follows; the
 synthesizer emits `tool/call` before `tool/result` so fold pairing settles immediately),
-`item_completed` bookkeeping that lands after a call settled is attributed by exact call id —
-first against open calls, then already-settled ones — before any lone-open-call fallback,
+`item_completed` is also the tool's TERMINAL status: `item.status === 'failed'` or a non-zero
+`exit_code` marks the call failed in both views (the output text `Process exited with code N` /
+`Error:` prefixes are only a fallback for old logs). Unified-exec exit codes are read only
+from the leading header, after optional `Chunk ID`/`Wall time` and before `Output:`;
+quoted body text is never status. The item is attributed by exact id (current CommandExecution
+and McpToolCall producers use the call id), then a unique full command match against pending
+and recently settled calls, then the lone open call when nothing settled since it opened; anything
+ambiguous is left alone. Commands match decoded `cmd`/`command` arguments or the full raw input,
+never substrings of JSON. An item landing after the output already folded flips the settled node
+(`ToolCallTracker.markError`),
 `tool_search_call`/`tool_search_output` pair by `call_id` and carry discovered schemas in
 `tools`, `agent_message` items and top-level `inter_agent_communication` records are agent
 relays (never human prompts), `configuration_update` records reasoning-effort changes,
@@ -123,6 +155,11 @@ Top-level `realtime_item/transcript_segment` records are presentation-only speec
 Trajectory displays them and search indexes their role/text. They do not alter
 Context, human prompt counts, request timing or billing. `bem_item_promoted` only
 references an existing response item and must not duplicate its display or index.
+
+`reasoning` items carry `summary[]` and may carry plaintext `content` of type `reasoning_text` or `text`
+beside the opaque `encrypted_content`. `codexReasoningText` (core) is the one readable-text rule
+for Trajectory, Context and search: summary texts, then readable content not already in the
+summary. Never decode `encrypted_content`.
 
 ### Dynamic tools
 
@@ -147,6 +184,15 @@ sum `inputOther + inputCacheRead + inputCacheCreation`, excluding output. Missin
 unknown even if output is reported. Compaction requests and their usage must not change the
 ordinary model route or provide ordinary request-input samples.
 
+`usage.record { agentId, model, usage, usageScope? }` is written when the response completes,
+BEFORE the step's loop events flush, and a failed/interrupted `step.end` carries no `usage`. Both
+views hold the pending record and credit it to the step that closes next (`step.end.usage` wins
+when present; the two are never summed); an `llm.request` with `kind: 'compaction'` clears it so
+auxiliary usage cannot leak into the next loop step. TTFT is `step.end.llmFirstTokenLatencyMs`
+relative to the step start — when absent, Trajectory reports `firstTokenTime: null`, never the
+start time. The response end is the `usage.record` instant (when ≥ the step start), else start +
+`llmStreamDurationMs`, else the settling record's time; tool durations remain unrecoverable.
+
 ### Compaction
 
 An `llm.request` with `kind: 'compaction'` is not a loop step: it has no `turnStep` and its
@@ -162,6 +208,13 @@ Undo also removes immediately preceding injections with the anchor's
 `ownerPromptId`. Invalid or unavailable counts do nothing. Compaction and clear
 invalidate undo checkpoints; Kimi undo cannot cross a compaction summary.
 
+`swarm_mode.exit` pops the swarm-mode reminder only when it is the LAST context message
+(`popSwarmModeReminder`): Context prunes that one node (marker `plugin: 'swarm-exit'`), never
+earlier reminders, and strips the seq from undo anchors so `context.undo` cannot resurrect it.
+A buffered assistant blocks deletion only when it was inserted after the reminder; a reminder
+appended later can still be removed. Exit never splits the response. Undo checkpoint filtering
+preserves shared prefixes rather than copying each complete history.
+
 ### Subagent binding
 
 There is no durable spawn record for subagents: a background launch binds through
@@ -170,6 +223,15 @@ There is no durable spawn record for subagents: a background launch binds throug
 buffered until it lands), an `AgentSwarm` through the result's `<subagent agent_id="…">` XML.
 There is no sidecar: the listing description is the parent Agent call's `description` (else the
 child's delegated prompt), discovered by the meta scanner.
+
+`agentMentions` reads `agent_id:` / `actual_subagent_type:` / `status:` from the result HEADER
+only (the lines before the first blank line; the `[summary]` body is the agent's own text and may
+quote any shape). Swarm parsing requires a complete `<agent_swarm_result>` wrapper and closed
+top-level `<subagent …>` elements at line starts; nested quoted elements are skipped, and
+unbalanced input suppresses the candidates. The producer does not escape result bodies, so
+text deliberately shaped as closing and reopening sibling elements remains indistinguishable
+from real siblings without independent identity evidence. Scanner version 5 invalidates older
+cached child associations, including those extracted from single-agent result bodies.
 
 ### Late records and images
 
@@ -185,8 +247,16 @@ server's blob route.
 ## Grok
 
 Parse only `updates.jsonl` (`chat_history.jsonl` is a derived cache, `events.jsonl` is
-telemetry). Envelope `timestamp` is seconds, `_meta.agentTimestampMs` is ms. Usage arrives per
-turn in `turn_completed`; billing allocation uses each stream's minimum `_meta.totalTokens`.
+telemetry). Envelope `timestamp` is seconds, `_meta.agentTimestampMs` is ms.
+`_x.ai/session/update` `response_completed.usage` (snake_case, `input_tokens` already
+uncached) is the per-model-call figure and lands on the streaming step, or on the turn's last
+request when the step was already sealed. `turn_completed.usage` (`PromptUsage`, camelCase,
+`inputTokens` includes cache) is the whole turn's total: it is used only when no request of the
+turn has an exact figure, attached once to the turn's last request with `TokenUsage.scope:
+'turn'` — never stacked on exact usage, including turns with only partial per-call coverage.
+The UI labels these counts “Turn total”/“本轮合计” and excludes them from per-response
+throughput. Per-call `reasoning_tokens` is retained as a subset of output, never added again.
+Billing allocation uses each stream's minimum `_meta.totalTokens`.
 That field is a live-context estimate (including post-response additions), not measured
 request input. Only a per-call `response_completed.usage` supplies reported input; otherwise
 the viewer labels the reconstructed input estimate separately. One stream's multiple
@@ -218,6 +288,13 @@ epoch SECONDS; `chat_message.metadata.created_at`/`started_generation_at` are IS
 Without upstream source or a verified protocol, `metrics.input_tokens` may include cached
 input or exclude it. Preserve existing billing behavior, but mark request input unknown;
 do not infer a window. Re-rendered assistant copies are never new measurements.
+
+`metadata.generation_model` is per message; the session row's `model` is only the initial
+route. Context emits a `request/header` (`reason: 'change'`, repeating the system prefix) before
+any non-replay assistant whose `generation_model` differs from the last header, so the fold
+prices each response at its own model; replay copies never change the route. `metrics`
+buckets are disjoint for `totalTokens`: input + output + cache read + cache creation, and a
+metrics object with only `cache_creation_tokens` is still usage.
 
 ### Chain identity
 

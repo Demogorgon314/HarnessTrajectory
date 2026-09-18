@@ -114,6 +114,8 @@ class DevinSynthesizer implements EventSynthesizer {
   private label: string | undefined
   private systemText: string | undefined
   private headerEmitted = false
+  /** The model the last emitted header routed to (generation_model changes). */
+  private headerModel: string | undefined
   /**
    * Provenance of the prefix run in progress: parts append only to a run of
    * the same provenance — a render's re-copied prefix (tagged `kept`, or an
@@ -302,14 +304,26 @@ class DevinSynthesizer implements EventSynthesizer {
       ? text
       : `${this.systemText}\n\n${text}`
     this.prefixRun = run
+    this.emitHeader(out, time)
+  }
+
+  /**
+   * Emit a header epoch. `header.system` repeats the last known prefix on
+   * purpose: the fold clears its system nodes when an envelope-sourced header
+   * omits `system`, so a `generation_model` change header that dropped the
+   * field would silently zero the prompt (same trap the Claude synth's
+   * emitHeader documents).
+   */
+  private emitHeader(out: TimelineEvent[], time: number): void {
     this.emit(out, 'request/header', time, {
       header: {
-        system: this.systemText,
+        ...(this.systemText === undefined ? {} : { system: this.systemText }),
         config: { provider: PROVIDER, ...(this.model === undefined ? {} : { model: this.model }) },
       },
       reason: this.headerEmitted ? 'change' : 'initial',
     })
     this.headerEmitted = true
+    this.headerModel = this.model
   }
 
   /**
@@ -440,6 +454,11 @@ class DevinSynthesizer implements EventSynthesizer {
     }
     const model = asString(msgMeta(msg)?.['generation_model'])
     if (model !== undefined) this.model = model
+    // The fold routes cost by the model the LAST header established; a
+    // generation_model that differs must claim its own epoch BEFORE the
+    // assistant/message emit (the fold snapshots the request there). Replay
+    // copies never reach this branch — they are not billed.
+    if (this.model !== undefined && this.model !== this.headerModel) this.emitHeader(out, started)
 
     // Devin stores no stream deltas, only the settled message — but it DOES
     // record `ttft_ms` (harness-measured first-token latency). Synthesize the

@@ -87,6 +87,8 @@ export interface TrajectoryCellProps extends HTMLAttributes<HTMLDivElement> {
   startedAt?: number | null
   /** Message-only prompt token count. */
   input?: number
+  /** These token counts cover the whole turn rather than this response. */
+  usageScope?: 'turn'
   /** Message-only input tokens served from a provider cache. */
   cacheRead?: number
   /** Message-only input tokens written into a provider cache. */

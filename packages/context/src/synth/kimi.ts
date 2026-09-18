@@ -54,7 +54,7 @@ import type { ContentBlock, MessageSource, StreamRecord, TimelineEvent } from '.
 import type { FileOpInput } from '../fold/fold.ts'
 import type { AgentSpawn, EventSynthesizer, SynthMeta } from './types.ts'
 import { restoreSurface } from './surfaceRestore.ts'
-import { appendSurface, checkpointSurface, surfaceValues, type SurfaceCheckpoint } from './surfaceCheckpoint.ts'
+import { appendSurface, checkpointSurface, createSurfaceFilter, surfaceValues, type SurfaceCheckpoint } from './surfaceCheckpoint.ts'
 import { disjointInput, setRequestInput } from './requestInput.ts'
 
 /** Label length cap, matching the Claude/Codex synthesizers' session titles. */
@@ -88,6 +88,8 @@ interface BufferedResult {
 
 /** One model step being accumulated between `step.begin` and its settle. */
 interface OpenStep {
+  /** Surface seq at the last logical assistant/tool message insertion. */
+  tailAfterSeq: number
   /** `step.begin.time` — the request instant (unit trap 3 makes this the ONLY honest start). */
   start: number
   turn: number
@@ -214,6 +216,7 @@ class KimiSynthesizer implements EventSynthesizer {
           this.ownedInjections.clear()
           break
         case 'context.undo': this.onUndo(record, time, out); break
+        case 'swarm_mode.exit': this.onSwarmExit(time, out); break
         case 'plan_mode.enter':
           this.emit(out, 'plan/mode', time, { active: true })
           break
@@ -521,6 +524,7 @@ class KimiSynthesizer implements EventSynthesizer {
     this.turnOpen = true
     this.emit(out, 'step/start', time)
     this.open = {
+      tailAfterSeq: this.seq,
       start: time,
       turn: this.turn,
       step: this.step,
@@ -538,6 +542,7 @@ class KimiSynthesizer implements EventSynthesizer {
     this.step += 1
     this.emit(out, 'step/start', time)
     const created: OpenStep = {
+      tailAfterSeq: this.seq,
       start: time,
       turn: this.turn,
       step: this.step,
@@ -605,6 +610,7 @@ class KimiSynthesizer implements EventSynthesizer {
     // call-then-result in order); one whose call came from an already-settled
     // step goes out immediately at its own time.
     if (open !== null && open.callIds.has(callId)) {
+      open.tailAfterSeq = this.seq
       open.results.push({ callId, content, isError: result['isError'] === true, time })
       return
     }
@@ -834,6 +840,33 @@ class KimiSynthesizer implements EventSynthesizer {
     return new Set(this.liveSeqs.filter(seq => protectedSeqs.has(seq)))
   }
 
+  /**
+   * `swarm_mode.exit` pops the swarm-mode reminder — the LAST context message,
+   * and only when that message is the reminder itself (contextOps
+   * `popSwarmModeReminder`). Buffered output does not imply it is last: a
+   * reminder can be appended after the assistant opened. Never flush the step
+   * here (a swarm exit mid-response is not a request boundary). Anchors and
+   * owner sets lose the pruned seq so a later `context.undo` cannot resurrect
+   * the reminder.
+   */
+  private onSwarmExit(time: number, out: TimelineEvent[]): void {
+    const last = this.liveSeqs.at(-1)
+    if (last === undefined) return
+    if (this.open !== null && last <= this.open.tailAfterSeq) return
+    const source = this.surfaceEvents.get(last)?.data?.['source']
+    if (!isRecord(source) || source['kind'] !== 'swarm_mode') return
+    this.prune(out, time, [last], 'swarm-exit')
+    const filter = createSurfaceFilter<TimelineEvent>(entry => entry.seq !== last)
+    for (let index = 0; index < this.undoAnchors.length; index += 1) {
+      const anchor = this.undoAnchors[index]
+      this.undoAnchors[index] = filter(anchor ?? null)
+    }
+    for (const [owner, owned] of this.ownedInjections) {
+      owned.delete(last)
+      if (owned.size === 0) this.ownedInjections.delete(owner)
+    }
+  }
+
   /** `context.undo` retracts the last `count` context messages. */
   private onUndo(record: Record<string, unknown>, time: number, out: TimelineEvent[]): void {
     this.flushStep(out, time, undefined)
@@ -877,7 +910,7 @@ class KimiSynthesizer implements EventSynthesizer {
       return event === undefined ? [] : [event]
     }))
     this.humanSeqs = this.humanSeqs.filter(seq => !gone.has(seq))
-    this.emitSurface(out, 'user/message', time, {
+    this.emit(out, 'user/message', time, {
       content: [],
       source: { kind: 'plugin', form: 'compaction', plugin } satisfies MessageSource,
     }, { op: 'replace', startSeq: Math.min(...shadowed), endSeq: Math.max(...shadowed) })

@@ -19,7 +19,7 @@
  */
 
 import type { SessionFileRef } from '@harness-trajectory/core'
-import { asArray, asNumber, asString, codexUserItems, isRecord, parseJsonLine, parseTime } from '@harness-trajectory/core'
+import { asArray, asNumber, asString, codexCommandMatches, codexCommandOf, codexReasoningText, codexUserItems, isRecord, parseJsonLine, parseTime } from '@harness-trajectory/core'
 import type { ContentBlock, MessageSource, StreamRecord, TimelineEvent } from '../fold/event.ts'
 import type { FileOpInput } from '../fold/fold.ts'
 import type { AgentSpawn, EventSynthesizer, SynthMeta } from './types.ts'
@@ -299,8 +299,7 @@ class CodexSynthesizer implements EventSynthesizer {
       else if (role !== 'developer') return
     } else if (itemType === 'reasoning') {
       eventType = 'assistant/message'
-      content = [{ type: 'reasoning', text: (asArray(payload['summary']) ?? [])
-        .flatMap(item => isRecord(item) ? [asString(item['text']) ?? ''] : []).join('\n\n') }]
+      content = [{ type: 'reasoning', text: codexReasoningText(payload) }]
     } else if (itemType !== undefined && (CALL_TYPES.has(itemType) || itemType === 'web_search_call' || itemType === 'image_generation_call')) {
       eventType = 'assistant/message'
       const { name, args } = toolCallContent(payload, itemType)
@@ -611,8 +610,8 @@ class CodexSynthesizer implements EventSynthesizer {
   /**
    * The call an `item_completed` Command/FileChange belongs to, when one can
    * be proven — across BOTH pending and settled calls, since a late item
-   * routinely lands after its own result folded. Order: exact item id (the
-   * McpToolCall shape, where item id IS the call id) → unique command-content
+   * routinely lands after its own result folded. Order: exact item id (current
+   * CommandExecution and McpToolCall producers use the call id) → unique full command
    * match → the lone-open call when nothing has settled since it opened (a
    * just-folded result can still own the item, so "only one call remains"
    * alone proves nothing). `undefined` when the pairing is ambiguous.
@@ -627,16 +626,16 @@ class CodexSynthesizer implements EventSynthesizer {
       const settled = this.settledCalls.get(itemId)
       if (settled !== undefined) return { settled }
     }
-    const command = commandOf(item)
+    const command = codexCommandOf(item)
     if (command !== undefined) {
       let matched: { open: OpenCall } | { settled: SettledCall } | undefined
       for (const call of this.openCalls.values()) {
-        if (!call.args.includes(command)) continue
+        if (!codexCommandMatches(command, call.args)) continue
         if (matched !== undefined) return undefined
         matched = { open: call }
       }
       for (const call of this.settledCalls.values()) {
-        if (!call.args.includes(command)) continue
+        if (!codexCommandMatches(command, call.args)) continue
         if (matched !== undefined) return undefined
         matched = { settled: call }
       }
@@ -650,8 +649,7 @@ class CodexSynthesizer implements EventSynthesizer {
 
   /**
    * A file-op item that arrived after its call's output folded. The call is
-   * named either exactly (`item.id` IS a call id — true for `McpToolCall`
-   * today, and the shape a future build may adopt for the others) or by the
+   * named either exactly (`item.id` is the call id in current producers) or by the
    * only candidate that can have produced it: the single result settled since
    * the last call opened. Anything else is ambiguous — parallel calls — and is
    * dropped rather than misfiled against the wrong node.
@@ -726,15 +724,12 @@ class CodexSynthesizer implements EventSynthesizer {
       return
     }
     if (type === 'reasoning') {
-      // The reasoning trace itself is `encrypted_content` (opaque); only the
-      // model-authored summary is readable, so that is what gets sized. An
-      // empty summary still opens a reasoning block so the stream's decode
-      // split keeps the block, priced at ~0.
-      const summary = (asArray(payload['summary']) ?? [])
-        .flatMap(entry => (isRecord(entry) ? [asString(entry['text']) ?? ''] : []))
-        .filter(text => text !== '')
-        .join('\n\n')
-      this.appendBlock(out, { type: 'reasoning', text: summary }, time)
+      // The reasoning trace itself is `encrypted_content` (opaque); the
+      // readable parts are the summary and any `reasoning_text` content
+      // (`codexReasoningText`, shared with core and search). An empty text
+      // still opens a reasoning block so the stream's decode split keeps the
+      // block, priced at ~0.
+      this.appendBlock(out, { type: 'reasoning', text: codexReasoningText(payload) }, time)
       return
     }
     if (CALL_TYPES.has(type)) {
@@ -1514,20 +1509,9 @@ function subagentLabelOf(payload: Record<string, unknown>): string | undefined {
   return asString(payload['parent_thread_id']) === undefined ? undefined : 'subagent'
 }
 
-/**
- * The command a CommandExecution item ran: `command` is argv, and the shell's
- * `-c` argument (or the bare argv) is what a call's raw arguments contain.
- */
-function commandOf(item: Record<string, unknown>): string | undefined {
-  const argv = (asArray(item['command']) ?? []).filter((part): part is string => typeof part === 'string')
-  if (argv.length === 0) return undefined
-  const dashC = argv.findIndex(part => part === '-c' || part === '-lc' || part === '-cl')
-  return argv[dashC + 1] ?? argv[argv.length - 1]
-}
-
 /** Human-readable label for an unattributed file-activity item. */
 function itemLabel(item: Record<string, unknown>): string {
-  const command = commandOf(item)
+  const command = codexCommandOf(item)
   if (command !== undefined) return command
   const changes = item['changes']
   if (isRecord(changes)) {

@@ -14,6 +14,16 @@ function pairs(drafts: readonly SearchDocDraft[]): string[] {
   return drafts.map(draft => `${draft.role}: ${draft.text}`)
 }
 
+it('indexes both durable Codex reasoning content types without repeating the summary', () => {
+  expect(pairs(docs('codex', { type: 'response_item', payload: {
+    type: 'reasoning', summary: [{ type: 'summary_text', text: 'summary' }],
+    content: [
+      { type: 'reasoning_text', text: 'summary' },
+      { type: 'text', text: 'final thought' },
+    ],
+  } }))).toEqual(['other: summary\n\nfinal thought'])
+})
+
 it('indexes durable Codex speech without indexing promoted item mirrors or standalone tool outputs', () => {
   for (const role of ['user', 'assistant']) {
     expect(docs('codex', {

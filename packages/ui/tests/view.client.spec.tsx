@@ -5,7 +5,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import type {
   ImageAttachmentRef, SourceLineIndex, SourceLineTarget, TrajectorySnapshot,
 } from '@harness-trajectory/core'
@@ -93,6 +93,22 @@ function View({ inspectLine, snapshot, onInspectApplied }: {
 }
 
 describe('TrajectoryView line anchor', () => {
+  it('labels whole-turn usage in the ledger and request details', () => {
+    const base = snapshotOf(undefined)
+    const usage = { inputTokens: 30, outputTokens: 12, scope: 'turn' as const }
+    const snapshot: TrajectorySnapshot = {
+      ...base,
+      eventNodes: base.eventNodes.map(node => node.kind === 'assistant' ? { ...node, usage } : node),
+      requests: [{ purpose: 'assistant', turn: 1, step: 1, startSeq: 2,
+        startedAt: 1_000, completedAt: 2_000, resultSeq: 2, status: 'complete', usage }],
+    }
+    render(<View snapshot={snapshot} inspectLine={null} />)
+    expect(screen.getByText('Turn total')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Request #1' }))
+    fireEvent.click(screen.getByRole('tab', { name: 'Usage' }))
+    expect(screen.getByRole('heading', { name: 'Turn total' })).toBeTruthy()
+    expect(screen.queryByRole('heading', { name: 'This request' })).toBeNull()
+  })
   it('opens the record a line folded into and acknowledges once', () => {
     const onInspectApplied = vi.fn()
     render(<View snapshot={snapshotOf(RESOLVED)} inspectLine={{ line: 4 }} onInspectApplied={onInspectApplied} />)

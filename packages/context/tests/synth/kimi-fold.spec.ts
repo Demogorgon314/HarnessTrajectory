@@ -10,6 +10,7 @@
 import type { SessionFileRef } from '@harness-trajectory/core'
 import { describe, expect, it } from 'vitest'
 import { DEFAULT_BOUNDS } from '../../src/fold/config.ts'
+import type { TimelineEvent } from '../../src/fold/event.ts'
 import { applyTimeline, buildTimelineView, createTimelineState } from '../../src/fold/fold.ts'
 import type { Snapshot } from '../../src/shared/types.ts'
 import { createKimiSynthesizer } from '../../src/synth/kimi.ts'
@@ -266,5 +267,78 @@ describe('kimi synthesizer → fold', () => {
     }
     expect(seqs).toEqual([...seqs].sort((a, b) => a - b))
     expect(buildTimelineView(state, DEFAULT_BOUNDS).requests).toHaveLength(2)
+  })
+})
+
+describe('kimi synthesizer → fold — swarm_mode.exit', () => {
+  const swarmReminder = (s: number, text = 'swarm reminder') =>
+    appendMessage(s, text, { kind: 'injection', variant: 'swarm_mode' })
+  const swarmExit = (s: number) => line(s, 'swarm_mode.exit')
+
+  function foldState(lines: readonly string[]) {
+    const synth = createKimiSynthesizer(MAIN)
+    let state = createTimelineState()
+    const events: TimelineEvent[] = []
+    for (const l of lines) {
+      for (const event of synth.push(l)) {
+        events.push(event)
+        state = applyTimeline(state, event, DEFAULT_BOUNDS)
+      }
+    }
+    return { state, events }
+  }
+
+  const surfaceTexts = (state: ReturnType<typeof createTimelineState>) =>
+    state.surface.map(node => node.text)
+
+  it('frees the reminder from the live surface', () => {
+    const { state, events } = foldState([swarmReminder(1), swarmExit(2)])
+    expect(surfaceTexts(state)).not.toContain('swarm reminder')
+    expect(events.some(event => event.type === 'compaction/prune')).toBe(true)
+  })
+
+  it('removes a reminder appended after buffered assistant content without splitting billing', () => {
+    const { state } = foldState([
+      loop(1, { type: 'step.begin', turnId: '0', step: 1 }),
+      loop(2, { type: 'content.part', part: { type: 'text', text: 'working' } }),
+      swarmReminder(3), swarmExit(4),
+      loop(5, { type: 'step.end', finishReason: 'stop', usage: { inputOther: 10, output: 2 } }),
+    ])
+    expect(surfaceTexts(state).filter(Boolean)).toEqual(['working'])
+    expect(buildTimelineView(state, DEFAULT_BOUNDS).requests).toHaveLength(1)
+  })
+
+  it('keeps the reminder when a human prompt is the last message', () => {
+    const { state } = foldState([
+      swarmReminder(1),
+      appendMessage(2, 'hi', { kind: 'user' }),
+      swarmExit(3),
+    ])
+    expect(surfaceTexts(state)).toContain('swarm reminder')
+    expect(surfaceTexts(state)).toContain('hi')
+  })
+
+  it('drops only the last reminder when two were appended', () => {
+    const { state } = foldState([
+      swarmReminder(1, 'reminder one'),
+      swarmReminder(2, 'reminder two'),
+      swarmExit(3),
+    ])
+    expect(surfaceTexts(state)).toContain('reminder one')
+    expect(surfaceTexts(state)).not.toContain('reminder two')
+  })
+
+  it('stays gone when a later context.undo restores an anchor', () => {
+    const { state } = foldState([
+      appendMessage(1, 'first', { kind: 'user' }),
+      swarmReminder(2),
+      swarmExit(3),
+      appendMessage(4, 'second', { kind: 'user' }),
+      line(5, 'context.undo', { count: 1 }),
+    ])
+    // The undo restores the pre-'second' checkpoint; the pruned reminder must
+    // not come back with it.
+    expect(surfaceTexts(state)).toContain('first')
+    expect(surfaceTexts(state)).not.toContain('swarm reminder')
   })
 })

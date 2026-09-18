@@ -75,7 +75,7 @@ export interface MetaScanner {
  * Bump when any scanner's logic changes: cached listing states from an older
  * version are discarded and the transcripts they covered are re-read.
  */
-export const META_SCANNER_VERSION = 4
+export const META_SCANNER_VERSION = 5
 
 /**
  * Serialized scanner payload for the listing cache: the public `state` plus

@@ -7,7 +7,7 @@
 import type { SessionFileRef } from '@harness-trajectory/core'
 import { describe, expect, it } from 'vitest'
 import { DEFAULT_BOUNDS } from '../../src/fold/config.ts'
-import { applyTimeline, buildTimelineView, createTimelineState } from '../../src/fold/fold.ts'
+import { applyTimeline, buildTimelineView, createTimelineState, type TimelineState } from '../../src/fold/fold.ts'
 import type { Snapshot } from '../../src/shared/types.ts'
 import { createClaudeSynthesizer } from '../../src/synth/claude.ts'
 
@@ -26,6 +26,17 @@ function fold(records: readonly Rec[], file: SessionFileRef = MAIN): Snapshot {
     }
   }
   return buildTimelineView(state, DEFAULT_BOUNDS)
+}
+
+function foldState(records: readonly Rec[], file: SessionFileRef = MAIN): TimelineState {
+  const synth = createClaudeSynthesizer(file)
+  let state = createTimelineState()
+  for (const record of records) {
+    for (const event of synth.push(JSON.stringify(record))) {
+      state = applyTimeline(state, event, DEFAULT_BOUNDS)
+    }
+  }
+  return state
 }
 
 function human(s: number, text: string, extra: Rec = {}): Rec {
@@ -117,7 +128,8 @@ function session(): Rec[] {
       compactMetadata: {
         trigger: 'auto', preTokens: 120_000, postTokens: 30_000, durationMs: 3_000,
         cumulativeDroppedTokens: 90_000,
-        preservedMessages: { allUuids: ['a-14'], uuids: ['a-14'], anchorUuid: 'a-14' },
+        // Prefix-preserving (anchor = boundary uuid): kept nodes precede the summary.
+        preservedSegment: { headUuid: 'a-14', tailUuid: 'a-14', anchorUuid: 'boundary-1' },
       },
     },
     { ...human(17, 'summary of the session so far'), uuid: 'summary-1', isCompactSummary: true },
@@ -242,5 +254,129 @@ describe('claude synthesizer → fold, model switch', () => {
     expect(models).toHaveLength(1)
     expect([models[0]?.from, models[0]?.to]).toEqual(['claude-opus-4', 'claude-sonnet-9'])
     expect(view.model).toBe('claude-sonnet-9')
+  })
+})
+
+describe('claude synthesizer → fold, compaction ordering', () => {
+  const segmentBoundary = (s: number, anchor: string, extra: Rec = {}): Rec => ({
+    type: 'system', uuid: 'b', timestamp: at(s), subtype: 'compact_boundary', parentUuid: null,
+    compactMetadata: {
+      trigger: 'auto', preTokens: 5_000,
+      preservedSegment: { headUuid: 'u2', tailUuid: 'u3', anchorUuid: anchor },
+      ...extra,
+    },
+  })
+
+  const chained = (): Rec[] => [
+    { ...human(0, 'discard'), uuid: 'u1', parentUuid: null },
+    { ...human(1, 'keep me'), uuid: 'u2', parentUuid: 'u1' },
+    { ...human(2, 'keep too'), uuid: 'u3', parentUuid: 'u2' },
+  ]
+
+  it('suffix-preserving (anchor = summary): surface is summary, kept, then the next record', () => {
+    const state = foldState([
+      ...chained(),
+      segmentBoundary(3, 'summary'),
+      { ...human(4, 'summary text'), uuid: 'summary', parentUuid: 'b', isCompactSummary: true },
+      { ...human(5, 'after'), uuid: 'u4', parentUuid: 'u3' },
+    ])
+    expect(state.surface.map(node => node.text)).toEqual(['summary text', 'keep me', 'keep too', 'after'])
+  })
+
+  it('prefix-preserving (anchor = boundary): kept nodes precede the summary', () => {
+    const state = foldState([
+      ...chained(),
+      segmentBoundary(3, 'b'),
+      { ...human(4, 'summary text'), uuid: 'summary', parentUuid: 'b', isCompactSummary: true },
+      { ...human(5, 'after'), uuid: 'u4', parentUuid: 'u3' },
+    ])
+    expect(state.surface.map(node => node.text)).toEqual(['keep me', 'keep too', 'summary text', 'after'])
+  })
+
+  it('the legacy preservedMessages.allUuids contract still applies', () => {
+    const state = foldState([
+      ...chained(),
+      {
+        type: 'system', uuid: 'b', timestamp: at(3), subtype: 'compact_boundary', parentUuid: null,
+        compactMetadata: {
+          trigger: 'auto', preTokens: 5_000,
+          preservedMessages: { allUuids: ['u2', 'u3'], uuids: ['u2', 'u3'], anchorUuid: 'u3' },
+        },
+      },
+      { ...human(4, 'summary text'), uuid: 'summary', parentUuid: 'b', isCompactSummary: true },
+    ])
+    expect(state.surface.map(node => node.text)).toEqual(['keep me', 'keep too', 'summary text'])
+  })
+
+  it('snip_boundary drops the listed uuids from the live surface', () => {
+    const state = foldState([
+      ...chained(),
+      {
+        type: 'system', uuid: 'b', timestamp: at(3), subtype: 'snip_boundary', parentUuid: 'u3',
+        snipMetadata: { removedUuids: ['u2'] },
+      },
+      { ...human(4, 'after'), uuid: 'u4', parentUuid: 'u3' },
+    ])
+    const texts = state.surface.map(node => node.text)
+    expect(texts).toContain('discard')
+    expect(texts).toContain('keep too')
+    expect(texts).not.toContain('keep me')
+    expect(texts[texts.length - 1]).toBe('after')
+  })
+
+  it('retains each ancestor checkpoint after a snip, including across later appends', () => {
+    const state = foldState([
+      ...chained(),
+      { type: 'system', uuid: 'snip', parentUuid: 'u3', subtype: 'snip_boundary', snipMetadata: { removedUuids: ['u2'] } },
+      { ...human(4, 'continue'), uuid: 'u4', parentUuid: 'u3' },
+      { ...human(5, 'new branch'), uuid: 'u5', parentUuid: 'u1' },
+    ])
+    expect(state.surface.map(node => node.text).filter(Boolean)).toEqual(['discard', 'new branch'])
+  })
+
+  it('resolves a parent inside a snipped gap to the surviving prefix', () => {
+    const state = foldState([
+      ...chained(),
+      { type: 'system', uuid: 'snip', parentUuid: 'u3', subtype: 'snip_boundary', snipMetadata: { removedUuids: ['u2'] } },
+      { ...human(4, 'new branch'), uuid: 'u4', parentUuid: 'u2' },
+    ])
+    expect(state.surface.map(node => node.text).filter(Boolean)).toEqual(['discard', 'new branch'])
+  })
+
+  it('keeps a microcompacted result removed when an older branch is restored', () => {
+    const state = foldState([
+      { ...human(0, 'hello'), uuid: 'u1', parentUuid: null },
+      { ...assistantBlock(2, { requestId: 'r1', index: 0, block: { type: 'tool_use', id: 'c1', name: 'Bash', input: { command: 'ls' } } }), parentUuid: 'u1' },
+      { ...toolResult(4, 'c1'), uuid: 'result', parentUuid: 'a-2' },
+      { ...human(5, 'later'), uuid: 'u2', parentUuid: 'result' },
+      { type: 'system', uuid: 'micro', parentUuid: 'u2', subtype: 'microcompact_boundary', microcompactMetadata: { compactedToolIds: ['c1'] } },
+      { ...human(6, 'new branch'), uuid: 'u3', parentUuid: 'result' },
+    ])
+    const texts = state.surface.map(node => node.text).filter(Boolean)
+    expect(texts).not.toContain('ok')
+    expect(texts).not.toContain('later')
+    expect(texts).toContain('hello')
+    expect(texts.at(-1)).toBe('new branch')
+  })
+
+  it('microcompact_boundary drops the compacted tool result from the live surface', () => {
+    const state = foldState([
+      human(0, 'hello'),
+      assistantBlock(2, {
+        requestId: 'r1', index: 0,
+        block: { type: 'tool_use', id: 'c1', name: 'Bash', input: { command: 'ls' } },
+      }),
+      { ...toolResult(4, 'c1'), uuid: 'r-4', parentUuid: 'a-2' },
+      {
+        type: 'system', uuid: 'b', timestamp: at(5), subtype: 'microcompact_boundary', parentUuid: 'r-4',
+        microcompactMetadata: {
+          trigger: 'auto', preTokens: 2_000, tokensSaved: 500,
+          compactedToolIds: ['c1'], clearedAttachmentUUIDs: [],
+        },
+      },
+    ])
+    const texts = state.surface.map(node => node.text)
+    expect(texts).toContain('hello')
+    expect(texts).not.toContain('ok')
   })
 })

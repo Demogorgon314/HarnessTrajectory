@@ -27,7 +27,7 @@ import type { ContentBlock, MessageSource, StreamRecord, TimelineEvent } from '.
 import type { FileOpRecord } from '../shared/types.ts'
 import type { AgentSpawn, EventSynthesizer, SynthMeta } from './types.ts'
 import { restoreSurface } from './surfaceRestore.ts'
-import { appendSurface, checkpointSurface, surfaceValues, type SurfaceCheckpoint } from './surfaceCheckpoint.ts'
+import { appendSurface, checkpointSurface, createSurfaceFilter, surfaceValues, type SurfaceCheckpoint } from './surfaceCheckpoint.ts'
 import { disjointInput, setRequestInput } from './requestInput.ts'
 
 /**
@@ -112,12 +112,17 @@ interface OpenGroup {
 interface LiveNode {
   seq: number
   uuids: string[]
+  /** The tool_use ids a `tool/result` node answers (microcompact matching). */
+  callIds?: string[]
 }
 
 /** A `compact_boundary` waiting for its `isCompactSummary` user record. */
 interface PendingCompaction {
   compactionId: string | undefined
   shadowedSeqs: number[]
+  kept: LiveNode[]
+  /** Suffix-preserving compaction: the summary lands BEFORE the kept nodes. */
+  keptAfterSummary: boolean
   trigger: string | undefined
   preTokens: number | undefined
   postTokens: number | undefined
@@ -243,6 +248,38 @@ function textOf(blocks: readonly ContentBlock[]): string {
   return blocks.flatMap(block => (block.type === 'text' && block.text !== undefined ? [block.text] : [])).join('\n')
 }
 
+/**
+ * The record uuids a `compact_boundary` kept. `preservedSegment` is the real
+ * contract: walk tailUuid → headUuid through the recorded parent chain,
+ * collecting every visited uuid (head included). A walk that breaks early —
+ * unknown uuid or null parent — keeps what it collected (see the boundary
+ * note); `preservedMessages.allUuids` is a legacy fallback only, absent from
+ * current transcripts.
+ */
+function preservedUuidsOf(
+  meta: Record<string, unknown> | undefined,
+  parents: ReadonlyMap<string, string | null>,
+): Set<string> {
+  const segment = isRecord(meta?.preservedSegment) ? meta.preservedSegment : undefined
+  const head = asString(segment?.headUuid)
+  const tail = asString(segment?.tailUuid)
+  const preserved = new Set<string>()
+  if (head !== undefined && tail !== undefined) {
+    const seen = new Set<string>()
+    let uuid: string | null = tail
+    while (uuid !== null && !seen.has(uuid)) {
+      seen.add(uuid)
+      preserved.add(uuid)
+      if (uuid === head) break
+      uuid = parents.get(uuid) ?? null
+    }
+    return preserved
+  }
+  const legacy = isRecord(meta?.preservedMessages) ? asArray(meta.preservedMessages.allUuids) : undefined
+  for (const uuid of legacy ?? []) if (typeof uuid === 'string') preserved.add(uuid)
+  return preserved
+}
+
 class ClaudeSynthesizer implements EventSynthesizer {
   readonly kind = 'claude' as const
 
@@ -263,6 +300,8 @@ class ClaudeSynthesizer implements EventSynthesizer {
   private readonly children = new Map<string, AgentSpawn>()
 
   private live: LiveNode[] = []
+  /** uuid → parentUuid for every record seen (the compaction segment walk). */
+  private readonly parents = new Map<string, string | null>()
   private readonly surfaceEvents = new Map<number, TimelineEvent>()
   private surfaceCheckpoint: SurfaceCheckpoint<LiveNode> | null = null
   private readonly branchSurfaces = new Map<string, SurfaceCheckpoint<LiveNode> | null>()
@@ -334,6 +373,8 @@ class ClaudeSynthesizer implements EventSynthesizer {
     if (record.isSidechain === true && !this.child) return
     const version = asString(record.version)
     if (version !== undefined && version !== '') this.version = version
+    const recordUuid = asString(record.uuid)
+    if (recordUuid !== undefined) this.parents.set(recordUuid, asString(record.parentUuid) ?? null)
     const time = this.timeOf(record)
 
     switch (type) {
@@ -737,7 +778,7 @@ class ClaudeSynthesizer implements EventSynthesizer {
     if (ops.length > 0) data.fileOps = ops
 
     const event = this.emit(out, 'tool/result', time, data)
-    this.trackNode(event.seq, record)
+    this.trackNode(event.seq, record, [callId])
     this.resolveSpawn(callId, meta, time)
   }
 
@@ -860,6 +901,16 @@ class ClaudeSynthesizer implements EventSynthesizer {
       this.onCompactBoundary(record, time, out)
       return
     }
+    // Detected structurally, not by subtype literal: the metadata is what
+    // changes the model's context.
+    if (isRecord(record.snipMetadata) && asArray(record.snipMetadata.removedUuids) !== undefined) {
+      this.onSnip(record, time, out)
+      return
+    }
+    if (isRecord(record.microcompactMetadata)) {
+      this.onMicrocompact(record, time, out)
+      return
+    }
     if (subtype === 'turn_duration') {
       // The turn is over; close the step it ended so the timing card books it.
       if (this.stepOpen && this.pendingCalls.size === 0) {
@@ -876,13 +927,25 @@ class ClaudeSynthesizer implements EventSynthesizer {
    * `isCompactSummary` user record that replaces the dropped surface (verified
    * on real transcripts). The fold arms the shadow claim on the metering event
    * and consumes it on the next surface event, so the two must stay adjacent.
+   *
+   * The boundary's `compactMetadata.preservedSegment = { headUuid, tailUuid,
+   * anchorUuid }` names the message span the harness kept across the compact:
+   * the loader walks tail → head through `parentUuid` (the kept messages keep
+   * their pre-compact parents — they are NOT re-written). `anchorUuid` fixes
+   * the model-visible order:
+   *   anchor === last summary uuid (≠ boundary uuid): [boundary, summary, kept…]
+   *   anchor === boundary uuid:                     [boundary, kept…, summary]
+   * The first order is handled by re-emitting the kept nodes as replay copies
+   * after the summary lands (see `onCompactSummary`); the second needs nothing
+   * since the kept nodes already precede it. A walk that cannot reach headUuid
+   * keeps the prefix it did collect — those messages were certainly kept — a
+   * deliberate degradation from upstream, which skips pruning entirely when a
+   * resumed transcript cannot prove the segment.
    */
   private onCompactBoundary(record: Record<string, unknown>, time: number, out: TimelineEvent[]): void {
     const meta = isRecord(record.compactMetadata) ? record.compactMetadata : undefined
-    const preservedRecord = isRecord(meta?.preservedMessages) ? meta.preservedMessages : undefined
-    const preserved = new Set(
-      (asArray(preservedRecord?.allUuids) ?? []).filter((uuid): uuid is string => typeof uuid === 'string'),
-    )
+    const segment = isRecord(meta?.preservedSegment) ? meta.preservedSegment : undefined
+    const preserved = preservedUuidsOf(meta, this.parents)
     const shadowed: number[] = []
     const kept: LiveNode[] = []
     for (const node of this.live) {
@@ -891,6 +954,10 @@ class ClaudeSynthesizer implements EventSynthesizer {
     }
     this.live = kept
     this.surfaceCheckpoint = checkpointSurface(kept)
+    // The next real record chains off a preserved uuid (or the boundary, which
+    // `rememberBoundary` covers after `onSystem`); the stale pre-compaction
+    // checkpoint would fake a branch restore.
+    for (const uuid of preserved) this.branchSurfaces.set(uuid, this.surfaceCheckpoint)
 
     const preTokens = asNumber(meta?.preTokens)
     const postTokens = asNumber(meta?.postTokens)
@@ -902,6 +969,9 @@ class ClaudeSynthesizer implements EventSynthesizer {
     this.pendingCompaction = {
       compactionId: asString(record.uuid),
       shadowedSeqs: shadowed,
+      // A copy: `this.live` IS `kept`, and the summary's trackNode pushes into it.
+      kept: [...kept],
+      keptAfterSummary: segment !== undefined && asString(segment.anchorUuid) !== asString(record.uuid),
       trigger: asString(meta?.trigger),
       preTokens,
       postTokens,
@@ -938,6 +1008,100 @@ class ClaudeSynthesizer implements EventSynthesizer {
       : undefined
     const event = this.emit(out, 'user/message', time, data, surfaceOp)
     this.trackNode(event.seq, record)
+
+    if (pending !== undefined && pending.keptAfterSummary && pending.kept.length > 0) {
+      // Suffix-preserving: the kept nodes precede the summary in the surface
+      // but follow it in the model's context — re-emit them as replay copies.
+      const kept = pending.kept.flatMap(node => {
+        const keptEvent = this.surfaceEvents.get(node.seq)
+        return keptEvent === undefined ? [] : [{ node, event: keptEvent }]
+      })
+      const events = restoreSurface(
+        kept.map(pair => pair.node.seq), kept.map(pair => pair.event), time, this.seq, 'compaction',
+      )
+      out.push(...events)
+      this.seq += events.length
+      const copies = events.filter(copy => copy.type !== 'compaction/prune')
+      const summaryUuid = asString(record.uuid)
+      this.live = [
+        { seq: event.seq, uuids: summaryUuid === undefined ? [] : [summaryUuid] },
+        ...copies.map((copy, index) => {
+          this.surfaceEvents.set(copy.seq, copy)
+          const node = kept[index]?.node
+          return {
+            seq: copy.seq,
+            uuids: node?.uuids ?? [],
+            ...(node?.callIds === undefined ? {} : { callIds: node.callIds }),
+          }
+        }),
+      ]
+      this.surfaceCheckpoint = checkpointSurface(this.live)
+      if (summaryUuid !== undefined) this.branchSurfaces.set(summaryUuid, this.surfaceCheckpoint)
+    }
+    // Whether relocated or already in place, the kept uuids now chain off the
+    // post-summary surface (and the boundary, for stale children of anchor).
+    if (pending !== undefined) {
+      for (const node of pending.kept) {
+        for (const uuid of node.uuids) this.branchSurfaces.set(uuid, this.surfaceCheckpoint)
+      }
+      if (pending.compactionId !== undefined) this.branchSurfaces.set(pending.compactionId, this.surfaceCheckpoint)
+    }
+  }
+
+  /**
+   * A `snip_boundary` (`snipMetadata.removedUuids`) or `microcompact_boundary`
+   * (`microcompactMetadata`) deletes live context server-side. Both reduce to
+   * the same prune + contentless-marker pair the Kimi synthesizer uses: the
+   * prune only ARMS the fold's shadow claim, so a marker `user/message`
+   * carrying the replace op must consume it. The marker is not a live node.
+   */
+  private pruneLive(
+    matches: (node: LiveNode) => boolean,
+    time: number,
+    plugin: string,
+    shadowedTokenCount: number | undefined,
+    out: TimelineEvent[],
+  ): void {
+    const shadowedSeqs = this.live.filter(matches).map(node => node.seq)
+    const filter = createSurfaceFilter<LiveNode>(node => !matches(node))
+    this.surfaceCheckpoint = filter(this.surfaceCheckpoint)
+    this.live = surfaceValues(this.surfaceCheckpoint)
+    for (const [uuid, checkpoint] of this.branchSurfaces) this.branchSurfaces.set(uuid, filter(checkpoint))
+    if (shadowedSeqs.length === 0) return
+    this.emit(out, 'compaction/prune', time, {
+      shadowedSeqs,
+      ...(shadowedTokenCount === undefined ? {} : { shadowedTokenCount }),
+    })
+    this.emit(out, 'user/message', time, {
+      content: [],
+      source: { kind: 'plugin', form: 'compaction', plugin } satisfies MessageSource,
+    }, {
+      op: 'replace',
+      startSeq: shadowedSeqs.reduce((min, seq) => Math.min(min, seq), Infinity),
+      endSeq: shadowedSeqs.reduce((max, seq) => Math.max(max, seq), -Infinity),
+    })
+  }
+
+  private onSnip(record: Record<string, unknown>, time: number, out: TimelineEvent[]): void {
+    const meta = isRecord(record.snipMetadata) ? record.snipMetadata : undefined
+    const gone = new Set(
+      (asArray(meta?.removedUuids) ?? []).filter((uuid): uuid is string => typeof uuid === 'string'),
+    )
+    this.pruneLive(node => node.uuids.some(uuid => gone.has(uuid)), time, 'snip', undefined, out)
+  }
+
+  private onMicrocompact(record: Record<string, unknown>, time: number, out: TimelineEvent[]): void {
+    const meta = isRecord(record.microcompactMetadata) ? record.microcompactMetadata : undefined
+    if (meta === undefined) return
+    const callIds = new Set(
+      (asArray(meta.compactedToolIds) ?? []).filter((id): id is string => typeof id === 'string'),
+    )
+    const cleared = new Set(
+      (asArray(meta.clearedAttachmentUUIDs) ?? []).filter((uuid): uuid is string => typeof uuid === 'string'),
+    )
+    this.pruneLive(node =>
+      node.uuids.some(uuid => cleared.has(uuid)) || (node.callIds ?? []).some(id => callIds.has(id)),
+    time, 'microcompact', asNumber(meta.tokensSaved), out)
   }
 
   // ---------------------------------------------------------------------------
@@ -1014,10 +1178,15 @@ class ClaudeSynthesizer implements EventSynthesizer {
   }
 
   /** Remember which record uuid produced which surface node (compaction shadowing). */
-  private trackNode(seq: number, record: Record<string, unknown>): void {
+  private trackNode(seq: number, record: Record<string, unknown>, callIds?: readonly string[]): void {
     const uuid = asString(record.uuid)
-    this.live.push({ seq, uuids: uuid === undefined ? [] : [uuid] })
-    this.surfaceCheckpoint = appendSurface(this.surfaceCheckpoint, { seq, uuids: uuid === undefined ? [] : [uuid] })
+    const node: LiveNode = {
+      seq,
+      uuids: uuid === undefined ? [] : [uuid],
+      ...(callIds === undefined ? {} : { callIds: [...callIds] }),
+    }
+    this.live.push(node)
+    this.surfaceCheckpoint = appendSurface(this.surfaceCheckpoint, node)
     if (uuid !== undefined) this.branchSurfaces.set(uuid, this.surfaceCheckpoint)
     // Parallel results point at different blocks of one assistant request.
     // The upstream chain recovery retains every sibling's result; restoring
@@ -1051,7 +1220,12 @@ class ClaudeSynthesizer implements EventSynthesizer {
     const copies = events.filter(event => event.type !== 'compaction/prune')
     this.live = copies.map((event, index) => {
       this.surfaceEvents.set(event.seq, event)
-      return { seq: event.seq, uuids: source[index]?.node.uuids ?? [] }
+      const node = source[index]?.node
+      return {
+        seq: event.seq,
+        uuids: node?.uuids ?? [],
+        ...(node?.callIds === undefined ? {} : { callIds: node.callIds }),
+      }
     })
     this.surfaceCheckpoint = checkpointSurface(this.live)
     this.pendingCalls.clear()

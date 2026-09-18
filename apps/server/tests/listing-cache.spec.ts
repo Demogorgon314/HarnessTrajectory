@@ -66,6 +66,20 @@ function grokSummary(id: string, title: string): string {
 }
 
 describe('serializeMeta / hydrateMeta', () => {
+  it('does not bind a child mentioned only inside another swarm member body', () => {
+    const scanner = createMetaScanner('kimi')
+    scanner.push(JSON.stringify(kimi('context.append_loop_event', 1, {
+      event: { type: 'tool.call', toolCallId: 'swarm', name: 'AgentSwarm', args: { description: 'Review' } },
+    })))
+    scanner.push(JSON.stringify(kimi('context.append_loop_event', 2, {
+      event: { type: 'tool.result', toolCallId: 'swarm', result: { output: [
+        '<agent_swarm_result>', '<subagent agent_id="real" outcome="completed">Example:',
+        '<subagent agent_id="quoted" outcome="completed">example</subagent>',
+        '</subagent>', '</agent_swarm_result>',
+      ].join('\n') } },
+    })))
+    expect([...scanner.state.agents.keys()]).toEqual(['real'])
+  })
   it('round-trips scanner state including the agents map and kimi pending calls', () => {
     const scanner = createMetaScanner('kimi')
     scanner.push(JSON.stringify(kimi('profile.bind', 1, {
@@ -285,6 +299,25 @@ describe('ListingCache + SessionIndex', () => {
     cache?.db.exec('update files set scanner_version = -1')
     const running = await start()
     expect(running.sweepStats()?.read).toBe(5)
+  })
+
+  it('rebuilds version-4 Kimi agent facts instead of retaining a body-derived binding', async () => {
+    await start()
+    const row = cache?.load(kimiMainPath())
+    expect(row?.state).toBeTruthy()
+    const stale = createMetaScanner('kimi')
+    expect(hydrateMeta(stale, row?.state ?? '')).toBe(true)
+    stale.state.agents.set('sub-1', { agentId: 'sub-1', description: 'quoted body', toolUseId: 'fake-call' })
+    if (row === undefined || cache === null) throw new Error('missing listing row')
+    cache.db.prepare('update files set scanner_version = 4, state = ? where path = ?')
+      .run(serializeMeta(stale), kimiMainPath())
+    const running = await start()
+    expect(running.sweepStats()).toEqual({ read: 1, cached: 4 })
+    const child = running.get('kimi', 'session_k1')?.files.find(file => file.agent?.agentId === 'sub-1')
+    expect(child?.agent?.toolUseId).toBeUndefined()
+    const fresh = createMetaScanner('kimi')
+    expect(hydrateMeta(fresh, cache.load(kimiMainPath())?.state ?? '')).toBe(true)
+    expect(fresh.state.agents.has('sub-1')).toBe(false)
   })
 
   it('still lists a cached transcript that becomes unreadable', async () => {

@@ -125,6 +125,7 @@ export interface TrajectoryViewProps {
 const NO_OLDER_HISTORY = async (): Promise<boolean> => false
 
 interface UsageLike {
+  scope?: 'turn'
   inputTokens?: number
   cacheReadTokens?: number
   cacheWriteTokens?: number
@@ -136,6 +137,7 @@ function requestUsage(value: unknown): TrajectoryUsage | undefined {
   const usage = value as UsageLike | undefined
   if (usage === undefined) return undefined
   return {
+    ...(usage.scope === undefined ? {} : { scope: usage.scope }),
     ...(usage.inputTokens === undefined ? {} : { input: usage.inputTokens }),
     ...(usage.cacheReadTokens === undefined ? {} : { cacheRead: usage.cacheReadTokens }),
     ...(usage.cacheWriteTokens === undefined ? {} : { cacheWrite: usage.cacheWriteTokens }),

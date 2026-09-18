@@ -178,13 +178,13 @@ function msgUsage(msg: Record<string, unknown>): TokenUsage | undefined {
   // Observed stores write `cache_creation_tokens` (null so far); the
   // `cache_write_tokens` spelling is kept as a forward-compat alias.
   const cacheWrite = asNumber(metrics['cache_write_tokens']) ?? asNumber(metrics['cache_creation_tokens'])
-  if (input === undefined && output === undefined && cacheRead === undefined) return undefined
+  if (input === undefined && output === undefined && cacheRead === undefined && cacheWrite === undefined) return undefined
   return {
     inputTokens: input ?? 0,
     outputTokens: output ?? 0,
     ...(cacheRead === undefined ? {} : { cacheReadTokens: cacheRead }),
     ...(cacheWrite === undefined ? {} : { cacheWriteTokens: cacheWrite }),
-    totalTokens: (input ?? 0) + (output ?? 0) + (cacheRead ?? 0),
+    totalTokens: (input ?? 0) + (output ?? 0) + (cacheRead ?? 0) + (cacheWrite ?? 0),
   }
 }
 

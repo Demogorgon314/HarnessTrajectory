@@ -92,6 +92,12 @@ export interface TokenUsage {
   cacheReadTokens?: number
   cacheWriteTokens?: number
   reasoningTokens?: number
+  /**
+   * Absent = the usage of exactly one model call. `'turn'` = the harness only
+   * recorded the turn's aggregate and it is attached to the turn's last
+   * request as an estimate.
+   */
+  scope?: 'turn'
 }
 
 export interface ToolSchema {

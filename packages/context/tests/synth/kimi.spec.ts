@@ -516,7 +516,9 @@ describe('kimi synthesizer', () => {
         output: [
           '<agent_swarm_result>',
           '<summary>1 completed, 1 failed, 0 aborted</summary>',
-          '<subagent agent_id="agent-3" item="Review a.ts" outcome="completed">fine</subagent>',
+          '<subagent agent_id="agent-3" item="Review a.ts" outcome="completed">Example:',
+          '<subagent agent_id="quoted" outcome="completed">quoted body</subagent>',
+          '</subagent>',
           '<subagent agent_id="agent-4" item="Review b.ts &amp; co" outcome="failed">boom</subagent>',
           '</agent_swarm_result>',
         ].join('\n'),
@@ -780,5 +782,47 @@ describe('kimi synthesizer', () => {
     expect(dataOf(result[0])['fileOps']).toEqual([{ kind: 'read', path: '/tmp/a.ts' }])
     // The call event still precedes it, so the fold can pair them.
     expect(typesOf(events).indexOf('tool/call')).toBeLessThan(typesOf(events).indexOf('tool/result'))
+  })
+})
+
+describe('kimi synthesizer — swarm_mode.exit', () => {
+  const swarmReminder = (s: number, text = 'swarm reminder') =>
+    appendMessage(s, text, { kind: 'injection', variant: 'swarm_mode' })
+  const swarmExit = (s: number) => line(s, 'swarm_mode.exit')
+
+  it('pops the swarm reminder as a claimed prune', () => {
+    const { events } = run([swarmReminder(1), swarmExit(2)])
+    const reminder = firstOf(events, 'user/message')
+    const prune = firstOf(events, 'compaction/prune')
+    expect(prune?.data?.['shadowedSeqs']).toEqual([reminder?.seq])
+    // The marker that consumes the fold's claim names the operation.
+    const marker = allOf(events, 'user/message').at(-1)
+    expect(sourceOf(marker)['plugin']).toBe('swarm-exit')
+  })
+
+  it('is a no-op when the last context message is not the reminder', () => {
+    const { events } = run([
+      swarmReminder(1),
+      appendMessage(2, 'hi', { kind: 'user' }),
+      swarmExit(3),
+    ])
+    expect(allOf(events, 'compaction/prune')).toEqual([])
+  })
+
+  it('removes only the last of two reminders', () => {
+    const { events } = run([swarmReminder(1, 'reminder one'), swarmReminder(2, 'reminder two'), swarmExit(3)])
+    const reminders = allOf(events, 'user/message').slice(0, 2)
+    expect(firstOf(events, 'compaction/prune')?.data?.['shadowedSeqs']).toEqual([reminders[1]?.seq])
+  })
+
+  it('does not split a step when the exit lands mid-response', () => {
+    const { events } = run([
+      swarmReminder(1),
+      stepBegin(2, '0', 1),
+      contentPart(3, { type: 'text', text: 'working' }),
+      swarmExit(4),
+    ])
+    expect(allOf(events, 'compaction/prune')).toEqual([])
+    expect(allOf(events, 'assistant/message')).toEqual([])
   })
 })

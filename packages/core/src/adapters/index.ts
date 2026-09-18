@@ -8,6 +8,7 @@ import { createKimiParser } from './kimi.ts'
 export { createClaudeParser, classifyInjectedUser } from './claude.ts'
 export {
   createCodexParser, isCodexHumanPrompt, codexUserItems, codexHumanPromptText,
+  codexReasoningText, codexCommandOf, codexCommandMatches,
   type CodexUserItem,
 } from './codex.ts'
 export {

@@ -55,7 +55,8 @@
 
 import {
   asArray, asNumber, asString, classifyInjectedUser, devinMessageClass, grokMessageClass,
-  codexHumanPromptText, isRecord, kimiMessageClass, kimiTitleText, parseDevinLine, parseGrokLine,
+  codexHumanPromptText, codexReasoningText, isRecord, kimiMessageClass, kimiTitleText,
+  parseDevinLine, parseGrokLine,
   parseJsonLine, parseTime, GROK_SIDECAR_METHOD, type HarnessKind, type SearchRole,
 } from '@harness-trajectory/core'
 
@@ -265,14 +266,6 @@ function claudeDocs(line: string): SearchDocDraft[] {
 }
 
 // -- Codex -------------------------------------------------------------------
-
-/** `reasoning` items carry their text in `summary[]`, `content[]`, or both. */
-function codexReasoningText(payload: Record<string, unknown>): string {
-  return [...(asArray(payload['summary']) ?? []), ...(asArray(payload['content']) ?? [])]
-    .flatMap(item => (isRecord(item) ? [asString(item['text']) ?? ''] : []))
-    .filter(text => text !== '')
-    .join('\n')
-}
 
 function codexDocs(line: string): SearchDocDraft[] {
   const record = parseJsonLine(line)

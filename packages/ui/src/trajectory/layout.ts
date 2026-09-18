@@ -47,6 +47,7 @@ export interface TrajectoryLayoutInput {
 }
 
 interface UsageLike {
+  scope?: 'turn'
   inputTokens?: number
   cacheReadTokens?: number
   cacheWriteTokens?: number
@@ -754,8 +755,8 @@ function expandAssistant(
     stepStartTime: node.timing?.stepStartTime ?? null,
     firstTokenTime: node.timing?.firstTokenTime ?? null,
     completedTime: streaming ? null : finiteTime(node.time),
-    usageProvided: usage !== undefined,
-    outputTokens: Number.isFinite(usage?.outputTokens) ? usage?.outputTokens ?? null : null,
+    usageProvided: usage !== undefined && usage.scope !== 'turn',
+    outputTokens: usage?.scope !== 'turn' && Number.isFinite(usage?.outputTokens) ? usage?.outputTokens ?? null : null,
   }
   out.push({ absTime: nodeAbs, cell: message })
 
@@ -949,6 +950,7 @@ function firstVisibleTurn(
 /** Copy provider usage onto a Message cell when present. */
 function attachUsage(cell: TrajectoryCellProps, usage: UsageLike | undefined): void {
   if (usage === undefined) return
+  if (usage.scope !== undefined) cell.usageScope = usage.scope
   if (usage.inputTokens !== undefined) cell.input = usage.inputTokens
   if (usage.cacheReadTokens !== undefined) cell.cacheRead = usage.cacheReadTokens
   if (usage.cacheWriteTokens !== undefined) cell.cacheWrite = usage.cacheWriteTokens

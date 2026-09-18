@@ -270,6 +270,8 @@ interface OpenStep {
   startedAt: number
   firstTokenTime: number | null
   lastTime: number
+  /** Exact per-call usage from `response_completed` (beats the turn aggregate). */
+  usage?: TokenUsage
   blocks: AssistantBlock[]
 }
 
@@ -334,6 +336,32 @@ function mapUsage(value: unknown): TokenUsage | undefined {
     inputTokens: uncached,
     outputTokens: output ?? 0,
     totalTokens: total ?? (input ?? 0) + (output ?? 0),
+    ...(cacheRead === undefined ? {} : { cacheReadTokens: cacheRead }),
+    ...(cacheWrite === undefined ? {} : { cacheWriteTokens: cacheWrite }),
+    ...(reasoning === undefined ? {} : { reasoningTokens: reasoning }),
+  }
+}
+
+/**
+ * `_x.ai/session/update` `response_completed.usage` — per MODEL CALL, unlike
+ * `turn_completed.usage`. `input_tokens` is ALREADY the uncached portion (no
+ * subtraction); the cache buckets are reported alongside. Snake_case on the
+ * wire, with the camelCase twins accepted.
+ */
+function mapResponseUsage(value: unknown): TokenUsage | undefined {
+  if (!isRecord(value)) return undefined
+  const input = asNumber(value['input_tokens']) ?? asNumber(value['inputTokens'])
+  const output = asNumber(value['output_tokens']) ?? asNumber(value['outputTokens'])
+  const cacheRead = asNumber(value['cache_read_input_tokens']) ?? asNumber(value['cacheReadInputTokens'])
+  const cacheWrite = asNumber(value['cache_creation_input_tokens']) ?? asNumber(value['cacheCreationInputTokens'])
+  const reasoning = asNumber(value['reasoning_tokens']) ?? asNumber(value['reasoningTokens'])
+  if (input === undefined && output === undefined && cacheRead === undefined && cacheWrite === undefined) {
+    return undefined
+  }
+  return {
+    inputTokens: Math.max(0, input ?? 0),
+    outputTokens: output ?? 0,
+    totalTokens: (input ?? 0) + (cacheRead ?? 0) + (cacheWrite ?? 0) + (output ?? 0),
     ...(cacheRead === undefined ? {} : { cacheReadTokens: cacheRead }),
     ...(cacheWrite === undefined ? {} : { cacheWriteTokens: cacheWrite }),
     ...(reasoning === undefined ? {} : { reasoningTokens: reasoning }),
@@ -561,6 +589,9 @@ class GrokParser implements SessionParser {
       case 'plan':
         this.handlePlan(update, time)
         return
+      case 'response_completed':
+        this.handleResponseCompleted(update)
+        return
       case 'turn_completed':
         this.handleTurnCompleted(update, time)
         return
@@ -622,8 +653,8 @@ class GrokParser implements SessionParser {
         const notice = noticeText(tag, update)
         if (notice !== null) this.pushNotice(notice, time, tag)
         // `hook_execution` (95% of the xAI rail), hook/plugin/memory lifecycle,
-        // `session_recap`, `response_started`/`response_completed`,
-        // `reasoning_completed`, `diff_review`, workflow/goal snapshots and every
+        // `session_recap`, `response_started`, `reasoning_completed`,
+        // `diff_review`, workflow/goal snapshots and every
         // unknown tag carry nothing the trajectory shows (GROK-DESIGN §4).
         return
       }
@@ -859,10 +890,13 @@ class GrokParser implements SessionParser {
     const open = this.open
     if (open === null) return
     this.open = null
-    this.publishStep(open, status, error, code, usage)
+    this.publishStep(open, status, error, code, open.usage ?? usage)
   }
 
   private publishStep(open: OpenStep, status: 'complete' | 'error', error?: string, code?: string, usage?: TokenUsage): void {
+    // A mid-step republish (parallel tool call) must not drop usage a
+    // `response_completed` already booked on this call.
+    const effectiveUsage = usage ?? open.usage
     const provenance = this.model === null ? undefined : { provider: GROK_PROVIDER, model: this.model }
     const requestConfig = this.model === null ? undefined : this.requestConfig()
     const node: AssistantMessageNode = {
@@ -872,12 +906,12 @@ class GrokParser implements SessionParser {
       turn: open.turn,
       step: open.step,
       blocks: [...open.blocks],
-      ...(usage === undefined ? {} : { usage }),
+      ...(effectiveUsage === undefined ? {} : { usage: effectiveUsage }),
       ...(provenance === undefined ? {} : { provenance }),
       ...(requestConfig === undefined ? {} : { requestConfig }),
       timing: {
         stepStartTime: open.startedAt,
-        firstTokenTime: open.firstTokenTime ?? open.startedAt,
+        firstTokenTime: open.firstTokenTime,
         completedTime: open.lastTime,
       },
       ...(status === 'error' ? { interrupted: true as const } : {}),
@@ -896,7 +930,7 @@ class GrokParser implements SessionParser {
       status,
       resultSeq: open.seq,
       ...(error === undefined ? {} : { error, errorCode: code ?? 'interrupted' }),
-      ...(usage === undefined ? {} : { usage }),
+      ...(effectiveUsage === undefined ? {} : { usage: effectiveUsage }),
       ...(provenance === undefined ? {} : { provenance }),
       ...(requestConfig === undefined ? {} : { requestConfig }),
     }
@@ -1071,23 +1105,43 @@ class GrokParser implements SessionParser {
   // Turn completion
   // ---------------------------------------------------------------------------
 
+  /**
+   * `response_completed.usage` is the exact per-call figure. It lands on the
+   * open step when one is streaming; a late record (the step already sealed by
+   * a tool call) attaches to the turn's last assistant request instead.
+   */
+  private handleResponseCompleted(update: Record<string, unknown>): void {
+    const usage = mapResponseUsage(update['usage'])
+    if (usage === undefined) return
+    if (this.open !== null) this.open.usage = usage
+    else this.attachUsageToLastRequest(this.turn, usage)
+  }
+
   private handleTurnCompleted(update: Record<string, unknown>, time: number): void {
     const promptId = asString(update['prompt_id'])
     const turn = (promptId === undefined ? undefined : this.promptTurns.get(promptId)) ?? this.turn
-    const usage = mapUsage(update['usage'])
+    const turnUsage = mapUsage(update['usage'])
+    // The turn aggregate is an estimate for calls the per-call records never
+    // covered — never stacked on top of an exact `response_completed` figure.
+    const scoped = turnUsage === undefined ? undefined : { ...turnUsage, scope: 'turn' as const }
+    const fallback = this.open?.usage === undefined && !this.turnHasUsage(turn) ? scoped : undefined
     const errorKind = asString(update['error_kind'])
-    if (errorKind === undefined) this.closeStep('complete', undefined, undefined, usage)
-    else this.closeStep('error', `Turn ended (${errorKind})`, errorKind, usage)
-    if (usage !== undefined) this.attachTurnUsage(turn, usage)
+    if (errorKind === undefined) this.closeStep('complete', undefined, undefined, fallback)
+    else this.closeStep('error', `Turn ended (${errorKind})`, errorKind, fallback)
+    if (scoped !== undefined && !this.turnHasUsage(turn)) this.attachUsageToLastRequest(turn, scoped)
     this.closeTurn(turn)
     if (promptId !== undefined && promptId === this.currentPromptId) this.currentPromptId = null
   }
 
-  /**
-   * `turn_completed.usage` is per turn, not per model call, so it lands on the
-   * turn's last assistant record — unless that record was just closed with it.
-   */
-  private attachTurnUsage(turn: number, usage: TokenUsage): void {
+  /** Whether any assistant request of the turn already carries usage. */
+  private turnHasUsage(turn: number): boolean {
+    return this.assembler.requests.some(
+      request => request.purpose === 'assistant' && request.turn === turn && request.usage !== undefined,
+    )
+  }
+
+  /** Attach usage to the turn's last assistant request (and its node), if it has none. */
+  private attachUsageToLastRequest(turn: number, usage: TokenUsage): void {
     for (let index = this.assembler.requests.length - 1; index >= 0; index -= 1) {
       const request = this.assembler.requests[index]
       if (request === undefined || request.purpose !== 'assistant' || request.turn !== turn) continue

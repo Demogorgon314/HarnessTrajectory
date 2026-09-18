@@ -413,6 +413,8 @@ describe('grok adapter', () => {
       cacheWriteTokens: 0,
       // Reasoning is a subset of output, never added to it.
       reasoningTokens: 363,
+      // turn_completed.usage is the turn's aggregate, marked as an estimate.
+      scope: 'turn',
     })
     const request = parser.snapshot().requests.find(item => item.startSeq === last?.seq)
     expect(request?.usage).toEqual(last?.usage)
@@ -429,6 +431,99 @@ describe('grok adapter', () => {
     expect(only?.usage?.inputTokens).toBe(8_297)
     expect(parser.snapshot().requests.find(item => item.startSeq === only?.seq)?.usage?.cacheReadTokens)
       .toBe(47_232)
+  })
+
+  it('marks the turn-aggregate usage as scope turn and leaves earlier calls unbilled', () => {
+    const parser = feed(twoStepFixture())
+    const requests = parser.snapshot().requests.filter(item => item.purpose === 'assistant')
+    expect(requests).toHaveLength(2)
+    expect(requests[0]?.usage).toBeUndefined()
+    expect(requests[1]?.usage?.scope).toBe('turn')
+  })
+
+  it('books response_completed usage as the exact per-call figure, no scope', () => {
+    const parser = feed([
+      sidecar(0),
+      prompt(100, 'hi', 0),
+      message(200, 'answer'),
+      xai({ sessionUpdate: 'response_completed', usage: { input_tokens: 100, output_tokens: 20 } }, 300),
+      xai({ sessionUpdate: 'turn_completed', prompt_id: PROMPT_ID, stop_reason: 'end_turn' }, 400),
+    ])
+    const [only] = assistants(parser)
+    expect(only?.usage).toEqual({ inputTokens: 100, outputTokens: 20, totalTokens: 120 })
+    expect(only?.usage?.scope).toBeUndefined()
+  })
+
+  it('does not add a whole-turn fallback when an earlier response has exact usage', () => {
+    const parser = feed([
+      prompt(100, 'hi', 0), message(200, 'first'),
+      xai({ sessionUpdate: 'response_completed', usage: { input_tokens: 10, output_tokens: 5, reasoning_tokens: 3 } }, 250),
+      toolCall(300, 'call-1'),
+      toolCallUpdate(350, 'call-1', { status: 'completed', content: [{ type: 'text', text: 'ok' }] }),
+      message(400, 'second'),
+      xai({ sessionUpdate: 'turn_completed', usage: { inputTokens: 30, outputTokens: 12 } }, 500),
+    ])
+    expect(parser.snapshot().requests.map(request => request.usage)).toEqual([
+      { inputTokens: 10, outputTokens: 5, reasoningTokens: 3, totalTokens: 15 }, undefined,
+    ])
+  })
+
+  it('keeps each model call its own usage and never adds the turn total on top', () => {
+    const parser = feed([
+      sidecar(0),
+      prompt(100, 'hi', 0),
+      message(200, 'first'),
+      xai({ sessionUpdate: 'response_completed', usage: { input_tokens: 10, output_tokens: 5 } }, 250),
+      toolCall(300, 'call-1'),
+      toolCallUpdate(350, 'call-1', { status: 'completed', content: [{ type: 'text', text: 'ok' }] }),
+      message(400, 'second'),
+      xai({ sessionUpdate: 'response_completed', usage: { input_tokens: 20, output_tokens: 7 } }, 450),
+      turnCompleted(500, PROMPT_ID),
+    ])
+    const requests = parser.snapshot().requests.filter(item => item.purpose === 'assistant')
+    expect(requests.map(item => item.usage)).toEqual([
+      { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+      { inputTokens: 20, outputTokens: 7, totalTokens: 27 },
+    ])
+  })
+
+  it('reads response_completed cache buckets beside an already-uncached input', () => {
+    const parser = feed([
+      sidecar(0),
+      prompt(100, 'hi', 0),
+      message(200, 'answer'),
+      xai({
+        sessionUpdate: 'response_completed',
+        usage: { input_tokens: 100, output_tokens: 20, cache_read_input_tokens: 40, cache_creation_input_tokens: 10 },
+      }, 300),
+      xai({ sessionUpdate: 'turn_completed', prompt_id: PROMPT_ID, stop_reason: 'end_turn' }, 400),
+    ])
+    expect(assistants(parser)[0]?.usage).toEqual({
+      inputTokens: 100, outputTokens: 20, cacheReadTokens: 40, cacheWriteTokens: 10, totalTokens: 170,
+    })
+  })
+
+  it('attaches a late response_completed to the request the tool call already sealed', () => {
+    const parser = feed([
+      sidecar(0),
+      prompt(100, 'hi', 0),
+      message(200, 'first'),
+      toolCall(300, 'call-1'),
+      xai({ sessionUpdate: 'response_completed', usage: { input_tokens: 9, output_tokens: 3 } }, 350),
+      xai({ sessionUpdate: 'turn_completed', prompt_id: PROMPT_ID, stop_reason: 'end_turn' }, 400),
+    ])
+    const [only] = assistants(parser)
+    expect(only?.usage).toEqual({ inputTokens: 9, outputTokens: 3, totalTokens: 12 })
+  })
+
+  it('leaves firstTokenTime null for a step that never received a chunk', () => {
+    const parser = feed([
+      sidecar(0),
+      prompt(100, 'hi', 0),
+      toolCall(200, 'call-1'),
+      xai({ sessionUpdate: 'turn_completed', prompt_id: PROMPT_ID, stop_reason: 'end_turn' }, 300),
+    ])
+    expect(assistants(parser)[0]?.timing?.firstTokenTime).toBeNull()
   })
 
   it('marks the step errored when turn_completed reports an error kind', () => {

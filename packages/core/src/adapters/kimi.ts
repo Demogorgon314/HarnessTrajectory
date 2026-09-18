@@ -144,12 +144,12 @@ export interface KimiAgentMention {
   readonly status: SubagentStatus | null
 }
 
-/** Launch receipt lines of a single-agent result; `status`/`type` are read from the header only. */
+/** Launch receipt lines of a single-agent result; `status`/`type`/`agent_id` are read from the header only. */
 const AGENT_ID_LINE = /^[ \t]*agent_id:[ \t]*(\S+)[ \t]*$/m
 const AGENT_TYPE_LINE = /^[ \t]*actual_subagent_type:[ \t]*(\S+)[ \t]*$/m
 const AGENT_STATUS_LINE = /^[ \t]*status:[ \t]*(\w+)[ \t]*$/m
-/** One single-line `<subagent …>` element per AgentSwarm item. */
-const SWARM_ELEMENT = /<subagent\b([^>\n]*)>/g
+/** Swarm bodies are unescaped: nested tags must be skipped, not treated as siblings. */
+const SWARM_ELEMENT = /<(\/?)subagent\b([^>\n]*)>/g
 const SWARM_ATTRIBUTE = /(\w+)="([^"]*)"/g
 
 /**
@@ -157,12 +157,15 @@ const SWARM_ATTRIBUTE = /(\w+)="([^"]*)"/g
  * line-oriented header of a single-agent result (foreground or background),
  * and the XML-ish `<agent_swarm_result>` of a swarm, one `<subagent>` element
  * per item. The header ends at the first blank line: the body is the agent's
- * own text and may quote any of these shapes.
+ * own text and may quote any of these shapes, so the id is read from the
+ * header only. Swarm members must be closed, top-level elements inside the
+ * wrapper; malformed or unbalanced bodies conservatively suppress candidates.
  */
 export function agentMentions(output: string): KimiAgentMention[] {
+  if (output.trimStart().startsWith('<agent_swarm_result>')) return swarmMentions(output.trim())
   const mentions: KimiAgentMention[] = []
   const header = output.split(/\n[ \t]*\n/, 1)[0] ?? ''
-  const agentId = AGENT_ID_LINE.exec(output)?.[1]
+  const agentId = AGENT_ID_LINE.exec(header)?.[1]
   if (agentId !== undefined) {
     mentions.push({
       agentId,
@@ -171,22 +174,43 @@ export function agentMentions(output: string): KimiAgentMention[] {
       status: mentionStatus(AGENT_STATUS_LINE.exec(header)?.[1]),
     })
   }
-  for (const element of output.matchAll(SWARM_ELEMENT)) {
-    const attrs = new Map<string, string>()
-    for (const attr of element[1]?.matchAll(SWARM_ATTRIBUTE) ?? []) {
-      const [, key, value] = attr
-      if (key !== undefined && value !== undefined) attrs.set(key, unescapeXml(value))
-    }
-    const id = attrs.get('agent_id')
-    if (id === undefined || id === '') continue
-    mentions.push({
-      agentId: id,
-      description: attrs.get('item') ?? null,
-      agentType: null,
-      status: mentionStatus(attrs.get('outcome')),
-    })
-  }
   return mentions
+}
+
+function swarmMentions(output: string): KimiAgentMention[] {
+  const close = '</agent_swarm_result>'
+  if (!output.endsWith(close)) return []
+  const body = output.slice('<agent_swarm_result>'.length, -close.length)
+  const mentions: KimiAgentMention[] = []
+  let depth = 0
+  let candidate: KimiAgentMention | undefined
+  for (const element of body.matchAll(SWARM_ELEMENT)) {
+    if (element[1] === '/') {
+      if (depth === 0) return []
+      depth -= 1
+      if (depth === 0 && candidate !== undefined) {
+        mentions.push(candidate)
+        candidate = undefined
+      }
+    } else {
+      depth += 1
+      if (depth !== 1 || (element.index > 0 && body[element.index - 1] !== '\n')) continue
+      const attrs = new Map<string, string>()
+      for (const attr of element[2]?.matchAll(SWARM_ATTRIBUTE) ?? []) {
+        const [, key, value] = attr
+        if (key !== undefined && value !== undefined) attrs.set(key, unescapeXml(value))
+      }
+      const id = attrs.get('agent_id')
+      if (id === undefined || id === '') continue
+      candidate = {
+        agentId: id,
+        description: attrs.get('item') ?? null,
+        agentType: null,
+        status: mentionStatus(attrs.get('outcome')),
+      }
+    }
+  }
+  return depth === 0 ? mentions : []
 }
 
 /** A terminal status a result text can report; anything else leaves the run's lifecycle alone. */
@@ -279,6 +303,22 @@ function mapUsage(value: unknown): TokenUsage | undefined {
     ...(cacheRead === undefined ? {} : { cacheReadTokens: cacheRead }),
     ...(cacheWrite === undefined ? {} : { cacheWriteTokens: cacheWrite }),
   }
+}
+
+/**
+ * The response's completion instant: the `usage.record` stamp when it is
+ * sane, else the step start plus the recorded stream duration, else the
+ * `step.end` record's own time (mirrors the context synthesizer's rule).
+ */
+function completionOf(
+  start: number,
+  responseEnd: number | undefined,
+  streamMs: number | undefined,
+  fallback: number,
+): number {
+  if (responseEnd !== undefined && responseEnd >= start) return responseEnd
+  if (streamMs !== undefined && Number.isFinite(streamMs) && streamMs >= 0) return start + streamMs
+  return Math.max(fallback, start)
 }
 
 /** Provider id for pricing; the wire `provider` field is the protocol, not the vendor. */
@@ -407,6 +447,11 @@ class KimiParser implements SessionParser {
   private turnOpenPending = false
   private lastTime = 0
   private open: OpenStep | null = null
+  /** The current `llm.request` is auxiliary (kind 'compaction'): its usage is not the step's. */
+  private auxiliaryRequest = false
+  /** `usage.record` lands before the step's `step.end`; held until the step closes. */
+  private pendingUsage: TokenUsage | undefined
+  private responseEnd: number | null = null
   private readonly turnSeqs = new Map<number, number[]>()
   /** Subagent runs keyed by the child's agent (= directory, = file) id. */
   private readonly runs = new Map<string, AgentRun>()
@@ -452,6 +497,16 @@ class KimiParser implements SessionParser {
       case 'llm.request':
         this.handleRequest(record, time)
         return
+      case 'usage.record': {
+        // Written when the response completes, BEFORE the step's loop events
+        // flush — the usage fallback for a `step.end` that carries none.
+        if (this.auxiliaryRequest || asString(record['kind']) === 'compaction') return
+        const usage = mapUsage(record['usage'])
+        if (usage === undefined) return
+        this.pendingUsage = usage
+        this.responseEnd = time
+        return
+      }
       case 'context.append_message':
         this.handleMessage(record, time)
         return
@@ -495,7 +550,7 @@ class KimiParser implements SessionParser {
         return
       default:
         // plan_mode.*, permission.*, interaction.*, mcp.*, llm.tools_snapshot,
-        // usage.record (== step.end.usage), token_counting.*, file_history.*,
+        // token_counting.*, file_history.*,
         // tools.update_store, task.waitDelivered, plugin.session_start,
         // context.clear, context.undo, prompt.*: not conversation records.
         return
@@ -575,7 +630,13 @@ class KimiParser implements SessionParser {
     // `maxTokens` is the summary model's cap, not the context window. Folding
     // it like a loop request would open a phantom step (an empty assistant
     // node at the compaction boundary) and corrupt the window figure.
-    if (asString(record['kind']) === 'compaction') return
+    this.auxiliaryRequest = asString(record['kind']) === 'compaction'
+    if (this.auxiliaryRequest) {
+      // The compaction request's usage.record must not leak into the next step.
+      this.pendingUsage = undefined
+      this.responseEnd = null
+      return
+    }
     const model = asString(record['model'])
     if (model !== undefined && model !== '') {
       this.model = model
@@ -790,34 +851,45 @@ class KimiParser implements SessionParser {
     const ttft = asNumber(event['llmFirstTokenLatencyMs'])
     if (ttft !== undefined && ttft >= 0) open.firstTokenTime = open.startedAt + ttft
     if (time > open.lastTime) open.lastTime = time
+    const completed = completionOf(
+      open.startedAt, this.responseEnd ?? undefined, asNumber(event['llmStreamDurationMs']), time,
+    )
     const finish = asString(event['finishReason'])
     if (finish !== undefined && ABORTED_FINISH_REASONS.has(finish)) {
-      this.closeStep('error', `Step ended (${finish})`, finish)
+      this.closeStep('error', `Step ended (${finish})`, finish, completed)
       return
     }
-    this.closeStep('complete')
+    this.closeStep('complete', undefined, undefined, completed)
   }
 
-  private closeStep(status: 'complete' | 'error', error?: string, code?: string): void {
+  private closeStep(status: 'complete' | 'error', error?: string, code?: string, completedTime?: number): void {
     const open = this.open
     if (open === null) return
     this.open = null
+    // `usage.record` outranks a missing `step.end.usage` (interrupted/failed
+    // steps carry none); it is consumed by whichever step closes first.
+    const usage = open.usage ?? this.pendingUsage
+    this.pendingUsage = undefined
+    this.responseEnd = null
+    const completed = completedTime === undefined
+      ? open.lastTime
+      : Math.max(completedTime, open.firstTokenTime ?? open.startedAt)
     const provenance = this.model === null ? undefined : { provider: this.provider, model: this.model }
     const requestConfig = this.model === null ? undefined : this.requestConfig()
     this.assembler.pushNode({
       kind: 'assistant',
       seq: open.seq,
-      time: open.lastTime,
+      time: completed,
       turn: open.turn,
       step: open.step,
       blocks: open.blocks,
-      ...(open.usage === undefined ? {} : { usage: open.usage }),
+      ...(usage === undefined ? {} : { usage }),
       ...(provenance === undefined ? {} : { provenance }),
       ...(requestConfig === undefined ? {} : { requestConfig }),
       timing: {
         stepStartTime: open.startedAt,
-        firstTokenTime: open.firstTokenTime ?? open.startedAt,
-        completedTime: open.lastTime,
+        firstTokenTime: open.firstTokenTime,
+        completedTime: completed,
       },
       ...(status === 'error' ? { interrupted: true as const } : {}),
     })
@@ -828,11 +900,11 @@ class KimiParser implements SessionParser {
       step: open.step,
       startSeq: open.seq,
       startedAt: open.startedAt,
-      completedAt: open.lastTime,
+      completedAt: completed,
       status,
       resultSeq: open.seq,
       ...(error === undefined ? {} : { error, errorCode: code ?? 'interrupted' }),
-      ...(open.usage === undefined ? {} : { usage: open.usage }),
+      ...(usage === undefined ? {} : { usage }),
       ...(provenance === undefined ? {} : { provenance }),
       ...(requestConfig === undefined ? {} : { requestConfig }),
     }

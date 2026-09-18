@@ -23,3 +23,29 @@ export function checkpointSurface<T>(values: readonly T[]): SurfaceCheckpoint<T>
   for (const value of values) checkpoint = appendSurface(checkpoint, value)
   return checkpoint
 }
+
+/**
+ * Filter a family of checkpoints while preserving each historical endpoint.
+ * Reuse this function for all roots in one removal: shared prefixes are visited
+ * once, unchanged prefixes retain identity, and long histories need no recursion.
+ */
+export function createSurfaceFilter<T>(keep: (value: T) => boolean):
+  (root: SurfaceCheckpoint<T> | null) => SurfaceCheckpoint<T> | null {
+  const filtered = new Map<SurfaceCheckpoint<T>, SurfaceCheckpoint<T> | null>()
+  return root => {
+    const path: SurfaceCheckpoint<T>[] = []
+    let cursor = root
+    while (cursor !== null && !filtered.has(cursor)) {
+      path.push(cursor)
+      cursor = cursor.previous
+    }
+    let previous = cursor === null ? null : filtered.get(cursor) ?? null
+    for (let index = path.length - 1; index >= 0; index -= 1) {
+      const node = path[index]
+      if (node === undefined) continue
+      if (keep(node.value)) previous = previous === node.previous ? node : { value: node.value, previous }
+      filtered.set(node, previous)
+    }
+    return previous
+  }
+}

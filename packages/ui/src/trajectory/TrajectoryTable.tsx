@@ -471,6 +471,7 @@ export type TrajectoryRequestNumber = TrajectoryRequestNumberBase & (
 
 /** Disjoint provider token buckets for one request or a session prefix. */
 export interface TrajectoryUsage {
+  scope?: 'turn'
   input?: number
   cacheRead?: number
   cacheWrite?: number
@@ -837,7 +838,7 @@ function RequestUsagePanel({
   return (
     <div className={css.usagePanel}>
       <section className={css.usageGroup}>
-        <h4 className={css.usageHeading}>{t('usage.thisRequest')}</h4>
+        <h4 className={css.usageHeading}>{t(usage?.scope === 'turn' ? 'usage.turnTotal' : 'usage.thisRequest')}</h4>
         <UsageRows usage={usage} t={t} />
       </section>
       <section className={css.usageGroup}>
@@ -2033,6 +2034,9 @@ export function TrajectoryTable({
     selectedRequestAssistant === undefined
       ? undefined
       : {
+        ...(selectedRequestAssistant.cell.usageScope === undefined
+          ? {}
+          : { scope: selectedRequestAssistant.cell.usageScope }),
         ...(selectedRequestAssistant.cell.input === undefined
           ? {}
           : { input: selectedRequestAssistant.cell.input }),
@@ -2650,6 +2654,7 @@ export function TrajectoryTable({
                                   {t(KIND_LABEL_KEY[record.cell.kind])}
                                 </span>
                               </span>
+                              {record.cell.usageScope === 'turn' && <span className={css.detailsLocation}>{t('usage.turnTotal')}</span>}
                             </span>
                           )}
                         </div>
@@ -2983,7 +2988,7 @@ export function TrajectoryTable({
                       <RequestOptions options={selectedRequestOptions} preview t={t} />
                     </OverviewSection>
                   )}
-                  <OverviewSection label={t('tab.usage')} onOpen={() => { activateTab('usage') }}>
+                  <OverviewSection label={t(selectedRequestUsage?.scope === 'turn' ? 'usage.turnTotal' : 'tab.usage')} onOpen={() => { activateTab('usage') }}>
                     <UsageRows usage={selectedRequestUsage} t={t} />
                   </OverviewSection>
                   <OverviewSection label={t('tab.timing')} onOpen={() => { activateTab('timing') }}>

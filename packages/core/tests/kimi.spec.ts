@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { createKimiParser, kimiMessageClass } from '../src/adapters/kimi.ts'
+import { agentMentions, createKimiParser, kimiMessageClass } from '../src/adapters/kimi.ts'
 import type { SessionFileRef } from '../src/session.ts'
 import type {
   AssistantMessageNode, ContextMessageNode, ToolResultNode,
@@ -254,9 +254,11 @@ describe('kimi adapter', () => {
       { kind: 'tool-call', callId: 'call-1', name: 'Read', argsRaw: JSON.stringify({ path: '/tmp/a.ts' }) },
     ])
     expect(second?.blocks).toEqual([{ kind: 'text', text: 'It exports a.' }])
-    // TTFT is a latency from the request start, not a timestamp.
+    // TTFT is a latency from the request start, not a timestamp; the
+    // completion is the usage.record instant (the response ended there, the
+    // step's loop events flushed later).
     expect(first?.timing).toEqual({
-      stepStartTime: at(200), firstTokenTime: at(500), completedTime: at(1_020),
+      stepStartTime: at(200), firstTokenTime: at(500), completedTime: at(900),
     })
   })
 
@@ -913,6 +915,102 @@ describe('kimi adapter', () => {
     expect(parser.snapshot().requests[0]?.errorCode).toBe('aborted')
   })
 
+  it('credits the response usage.record even when the step was interrupted', () => {
+    const parser = feed([
+      metadata(),
+      profileBind(10),
+      turnPrompt(100, 'go'),
+      appendMessage(110, 'go', { kind: 'user' }),
+      stepBegin(200, '0', 1),
+      llmRequest(210, '0.1'),
+      usageRecord(900, usage(100, 0, 0, 10)),
+      textPart(950, '0', 1, 'Partial'),
+      loop(1_000, { type: 'step.end', finishReason: 'interrupted', step: 1, turnId: '0' }),
+    ])
+    const [request] = parser.snapshot().requests
+    expect(request?.status).toBe('error')
+    expect(request?.usage).toEqual({
+      inputTokens: 100, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 110,
+    })
+  })
+
+  it('keeps step.end usage when it duplicates the earlier usage.record', () => {
+    const parser = feed([
+      metadata(),
+      profileBind(10),
+      turnPrompt(100, 'go'),
+      appendMessage(110, 'go', { kind: 'user' }),
+      stepBegin(200, '0', 1),
+      llmRequest(210, '0.1'),
+      usageRecord(900, usage(100, 0, 0, 10)),
+      stepEnd(1_000, '0', 1, { usage: usage(100, 0, 0, 10) }),
+    ])
+    expect(parser.snapshot().requests[0]?.usage).toEqual({
+      inputTokens: 100, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 110,
+    })
+  })
+
+  it('never lets a compaction request leak usage into the next loop step', () => {
+    const parser = feed([
+      metadata(),
+      profileBind(10),
+      llmRequest(50, '0.0', { kind: 'compaction' }),
+      usageRecord(60, usage(9, 0, 0, 1)),
+      turnPrompt(100, 'go'),
+      appendMessage(110, 'go', { kind: 'user' }),
+      stepBegin(200, '0', 1),
+      llmRequest(210, '0.1'),
+      stepEnd(1_000, '0', 1, { usage: undefined }),
+    ])
+    expect(parser.snapshot().requests.at(-1)?.usage).toBeUndefined()
+  })
+
+  it('times completion from the response record and leaves first token null without TTFT', () => {
+    const parser = feed([
+      metadata(),
+      profileBind(10),
+      turnPrompt(100, 'go'),
+      appendMessage(110, 'go', { kind: 'user' }),
+      stepBegin(200, '0', 1),
+      llmRequest(210, '0.1'),
+      usageRecord(1_200, usage(5, 0, 0, 1)),
+      textPart(5_200, '0', 1, 'late text'),
+      stepEnd(5_201, '0', 1, {
+        usage: undefined, llmFirstTokenLatencyMs: undefined, llmStreamDurationMs: 1_000,
+      }),
+    ])
+    const timing = assistants(parser)[0]?.timing
+    expect(timing?.stepStartTime).toBe(at(200))
+    expect(timing?.firstTokenTime).toBeNull()
+    expect(timing?.completedTime).toBe(at(1_200))
+  })
+
+  it('uses llmFirstTokenLatencyMs as an offset from the step start', () => {
+    const parser = feed([
+      metadata(),
+      profileBind(10),
+      turnPrompt(100, 'go'),
+      appendMessage(110, 'go', { kind: 'user' }),
+      stepBegin(200, '0', 1),
+      llmRequest(210, '0.1'),
+      stepEnd(1_000, '0', 1, { llmFirstTokenLatencyMs: 200 }),
+    ])
+    expect(assistants(parser)[0]?.timing?.firstTokenTime).toBe(at(400))
+  })
+
+  it('falls back to the step.end record time when nothing else marks the response end', () => {
+    const parser = feed([
+      metadata(),
+      profileBind(10),
+      turnPrompt(100, 'go'),
+      appendMessage(110, 'go', { kind: 'user' }),
+      stepBegin(200, '0', 1),
+      llmRequest(210, '0.1'),
+      stepEnd(1_700, '0', 1, { usage: undefined, llmStreamDurationMs: undefined }),
+    ])
+    expect(assistants(parser)[0]?.timing?.completedTime).toBe(at(1_700))
+  })
+
   it('opens a step for an llm.request whose step.begin was lost', () => {
     const parser = feed([
       metadata(),
@@ -1047,5 +1145,58 @@ describe('kimi source lines', () => {
     expect(index?.targetAt(2, CHILD.id)).toEqual({ kind: 'call', callId: 'child-call' })
     // The same line number in the MAIN file is a different record entirely.
     expect(index?.targetAt(2, MAIN.id)).not.toEqual({ kind: 'call', callId: 'child-call' })
+  })
+})
+
+describe('agentMentions', () => {
+  it('does not bind a nested result quoted in a real swarm member body', () => {
+    expect(agentMentions([
+      '<agent_swarm_result>',
+      '<subagent agent_id="real" outcome="completed">Example:',
+      '<subagent agent_id="quoted" outcome="completed">example</subagent>',
+      '</subagent>',
+      '<subagent agent_id="real-2" outcome="completed">done</subagent>',
+      '</agent_swarm_result>',
+    ].join('\n')).map(mention => mention.agentId)).toEqual(['real', 'real-2'])
+  })
+  it('reads agent_id from the header only, not a quoted body shape', () => {
+    const mentions = agentMentions([
+      'agent_id: real',
+      'actual_subagent_type: explore',
+      'status: completed',
+      '',
+      '[summary]',
+      'the agent echoes its own input:',
+      '<subagent agent_id="fake" item="x" outcome="completed">body</subagent>',
+    ].join('\n'))
+    expect(mentions.map(mention => mention.agentId)).toEqual(['real'])
+  })
+
+  it('announces every element of a real swarm result', () => {
+    const mentions = agentMentions([
+      '<agent_swarm_result>',
+      '<summary>2 completed</summary>',
+      '<subagent agent_id="a-1" item="one" outcome="completed">ok</subagent>',
+      '<subagent agent_id="a-2" item="two" outcome="failed">boom</subagent>',
+      '</agent_swarm_result>',
+    ].join('\n'))
+    expect(mentions).toEqual([
+      { agentId: 'a-1', description: 'one', agentType: null, status: 'completed' },
+      { agentId: 'a-2', description: 'two', agentType: null, status: 'failed' },
+    ])
+  })
+
+  it('ignores an indented element inside a swarm body', () => {
+    const mentions = agentMentions([
+      '<agent_swarm_result>',
+      '<subagent agent_id="a-1" item="one" outcome="completed">ok</subagent>',
+      '  <subagent agent_id="x" item="quoted" outcome="completed">indented</subagent>',
+      '</agent_swarm_result>',
+    ].join('\n'))
+    expect(mentions.map(mention => mention.agentId)).toEqual(['a-1'])
+  })
+
+  it('finds nothing when agent_id appears only in the body', () => {
+    expect(agentMentions('[summary]\nthe note says agent_id: ghost')).toEqual([])
   })
 })

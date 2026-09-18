@@ -61,6 +61,7 @@ export function TrajectoryCell({
   timeSeconds,
   startedAt: _startedAt,
   input,
+  usageScope,
   output,
   think,
   selected = false,
@@ -81,6 +82,7 @@ export function TrajectoryCell({
       </span>
       <span className={css.text}>{text}</span>
       <span className={css.trailing}>
+        {usageScope === 'turn' && <span className={css.metric}>{t('usage.turnTotal')}</span>}
         {showMetrics ? (
           <>
             <span className={css.metric}>{input ?? ''}</span>

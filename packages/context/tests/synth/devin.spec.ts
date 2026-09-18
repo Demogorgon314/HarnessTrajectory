@@ -70,6 +70,7 @@ const assistantMsg = (opts: {
   thinking?: string
   calls?: { id: string; name: string; args?: unknown }[]
   metrics?: Record<string, number>
+  model?: string
 }) => (node: number, s: number, w: MsgOpts = {}) => msg(node, {
   message_id: w.mid ?? `a-${node}`,
   role: 'assistant',
@@ -81,7 +82,7 @@ const assistantMsg = (opts: {
   metadata: {
     created_at: iso(s),
     started_generation_at: iso(s - 1),
-    generation_model: 'swe-1.5',
+    generation_model: opts.model ?? 'swe-1.5',
     metrics: opts.metrics ?? { input_tokens: 500, output_tokens: 80, ttft_ms: 120 },
   },
 }, s, wire(w))
@@ -243,9 +244,10 @@ describe('devin synthesizer', () => {
     expect(summary?.type).toBe('user/message')
     expect(summary?.data?.['source']).toEqual({ kind: 'plugin', form: 'compaction', plugin: 'compaction' })
     expect(summary?.['surfaceOp']).toEqual({ op: 'replace', startSeq: shadowed[0], endSeq: shadowed[shadowed.length - 1] })
-    // The summary text must not leak into the system header.
+    // The summary text must not leak into the system header. The second
+    // header is the assistant's generation_model claiming its own epoch.
     const headers = events.filter(event => event.type === 'request/header')
-    expect(headers).toHaveLength(1)
+    expect(headers).toHaveLength(2)
     expect((headers[0]?.data?.['header'] as { system: string }).system).toBe('You are Devin.')
     // Life continues: post-compaction messages are surface nodes again.
     const users = events.filter(event => event.type === 'user/message')
@@ -290,10 +292,13 @@ describe('devin synthesizer', () => {
       sysInjectMsg('<rules>v2</rules>', 'agent-ext/rules-loaded')(7, 5),
     ])
     const headers = events.filter(event => event.type === 'request/header')
-    expect(headers).toHaveLength(3)
+    // initial + v1 accumulation + the assistant's generation_model epoch + v2.
+    expect(headers).toHaveLength(4)
     expect((headers[1]?.data?.['header'] as { system: string }).system)
       .toBe('Prefix v1 part one.\n\nPrefix v1 part two.')
-    expect((headers[2]?.data?.['header'] as { system: string }).system).toBe('Prefix v2.')
+    expect((headers[2]?.data?.['header'] as { system: string }).system)
+      .toBe('Prefix v1 part one.\n\nPrefix v1 part two.')
+    expect((headers[3]?.data?.['header'] as { system: string }).system).toBe('Prefix v2.')
     const users = events.filter(event => event.type === 'user/message')
     expect(users).toHaveLength(3)
     expect(users[0]?.data?.['source']).toMatchObject({ kind: 'inject', name: 'agent-ext/rules-loaded', plugin: 'rules-loaded' })
@@ -532,5 +537,81 @@ describe('devin synthesizer', () => {
     expect(synth.push('{"t":"devin.msg"}')).toEqual([])
     expect(synth.push(JSON.stringify({ t: 'devin.msg', msg: { role: 'alien' } }))).toEqual([])
     expect(synth.meta().running).toBe(false)
+  })
+})
+
+describe('devin synthesizer — generation_model routing', () => {
+  const BOUNDS = {
+    maxKeptTurns: 200, maxRequestSteps: 1500, maxEvents: 600,
+    maxNodes: 200, maxArchiveNodes: 300, maxFileOps: 400,
+  }
+
+  function foldState(synth: Synth, lines: string[]) {
+    let state = createTimelineState()
+    for (const line of lines) {
+      for (const event of synth.push(line)) state = applyTimeline(state, event, BOUNDS)
+    }
+    return state
+  }
+
+  const headers = (events: readonly TimelineEvent[]) => events.filter(event => event.type === 'request/header')
+
+  it('re-routes cost to generation_model when it differs from the session model', () => {
+    const synth = createDevinSynthesizer(MAIN)
+    const lines = [
+      sidecar({ model: 'model-new' }),
+      systemMsg('You are Devin.')(1, 0),
+      humanMsg('hi')(2, 1),
+      assistantMsg({ text: 'answer', model: 'model-old', metrics: { input_tokens: 100, output_tokens: 20 } })(3, 2),
+    ]
+    const events = feed(synth, lines)
+    const state = foldState(createDevinSynthesizer(MAIN), lines)
+    expect(state.model).toBe('model-old')
+    expect(state.cost?.['cognition']?.['model-old']).toBeDefined()
+    expect(state.cost?.['cognition']?.['model-new']).toBeUndefined()
+    const heads = headers(events)
+    expect(heads.map(event => event.data?.['reason'])).toEqual(['initial', 'change'])
+    // The change header still repeats the system prefix (a dropped field
+    // would zero the fold's system-prompt bookkeeping).
+    expect((heads[1]?.data?.['header'] as Record<string, unknown>)['system']).toBe('You are Devin.')
+    expect((heads[1]?.data?.['header'] as { config: Record<string, unknown> }).config['model']).toBe('model-old')
+  })
+
+  it('emits a header only when generation_model actually changes', () => {
+    const synth = createDevinSynthesizer(MAIN)
+    const events = feed(synth, [
+      sidecar({ model: 'model-new' }),
+      systemMsg('You are Devin.')(1, 0),
+      assistantMsg({ text: 'one', model: 'model-old' })(2, 1),
+      assistantMsg({ text: 'two', model: 'model-new' })(3, 2),
+      assistantMsg({ text: 'three', model: 'model-new' })(4, 3),
+    ])
+    expect(headers(events).map(event => event.data?.['reason'])).toEqual(['initial', 'change', 'change'])
+  })
+
+  it('emits an initial header without system when no prefix was ever rendered', () => {
+    const synth = createDevinSynthesizer(MAIN)
+    const events = feed(synth, [assistantMsg({ text: 'a', model: 'model-old' })(1, 0)])
+    const heads = headers(events)
+    expect(heads).toHaveLength(1)
+    expect(heads[0]?.data?.['reason']).toBe('initial')
+    const header = heads[0]?.data?.['header'] as Record<string, unknown>
+    expect(header['system']).toBeUndefined()
+    expect((header['config'] as Record<string, unknown>)['model']).toBe('model-old')
+  })
+
+  it('does not re-route for a replay copy carrying a different generation_model', () => {
+    const synth = createDevinSynthesizer(MAIN)
+    const lines = [
+      sidecar({ model: 'model-new' }),
+      systemMsg('You are Devin.')(1, 0),
+      assistantMsg({ text: 'answer', model: 'model-old' })(3, 1),
+      // A render's kept copy reuses the message_id and is not billed.
+      assistantMsg({ text: 'answer', model: 'model-new' })(4, 2, { kept: true, mid: 'a-3' }),
+    ]
+    const events = feed(synth, lines)
+    const state = foldState(createDevinSynthesizer(MAIN), lines)
+    expect(headers(events)).toHaveLength(2)
+    expect(state.model).toBe('model-old')
   })
 })

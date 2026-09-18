@@ -4,6 +4,12 @@
  *
  * Verified against codex-cli 0.147–0.153 rollouts. Each line is
  * `{ timestamp, ordinal?, type, payload }`; the mapping is documented inline.
+ *
+ * Tool terminal status comes from `event_msg.item_completed` (`item.status` /
+ * `exit_code`) — the output text is only the fallback heuristic. An item is
+ * attributed to its call by exact id, then a unique
+ * command match against pending and recently settled calls, then the lone
+ * open call; a late item flips the already settled node (`markError`).
  */
 
 import type {
@@ -275,7 +281,58 @@ function mapUsage(value: unknown): TokenUsage | undefined {
 function outputLooksFailed(payload: Record<string, unknown>, text: string): boolean {
   const status = asString(payload['status'])
   if (status === 'failed' || status === 'error') return true
+  // Unified-exec puts the exit code after Chunk ID / Wall time, before Output.
+  // Stop at the first non-header line so quoted output cannot become status.
+  for (const line of text.trimStart().split('\n')) {
+    const exited = /^Process exited with code (-?\d+)\s*$/.exec(line)
+    if (exited !== null) return Number(exited[1]) !== 0
+    if (!/^(?:Chunk ID: \S+|Wall time: [\d.]+ seconds)\s*$/.test(line)) break
+  }
   return /^\s*(?:Error:|error:|Script failed|Traceback \(most recent call last\))/.test(text)
+}
+
+/**
+ * Readable text of a `reasoning` response item: the `summary[]` item texts,
+ * then `content[]` items of type `reasoning_text` or `text` (plaintext the model chose
+ * to show; `encrypted_content` is opaque and never decoded). Content texts
+ * identical to a summary text are not repeated.
+ */
+export function codexReasoningText(payload: Record<string, unknown>): string {
+  const texts: string[] = []
+  for (const item of asArray(payload['summary']) ?? []) {
+    if (!isRecord(item)) continue
+    const text = asString(item['text'])
+    if (text !== undefined && text !== '') texts.push(text)
+  }
+  for (const item of asArray(payload['content']) ?? []) {
+    if (!isRecord(item) || (item['type'] !== 'reasoning_text' && item['type'] !== 'text')) continue
+    const text = asString(item['text'])
+    if (text !== undefined && text !== '' && !texts.includes(text)) texts.push(text)
+  }
+  return texts.join('\n\n')
+}
+
+/**
+ * The command a CommandExecution item ran: `command` is argv, and the shell's
+ * `-c` argument (or the bare argv) is what a call's raw arguments contain.
+ */
+export function codexCommandOf(item: Record<string, unknown>): string | undefined {
+  const argv = (asArray(item['command']) ?? []).filter((part): part is string => typeof part === 'string')
+  if (argv.length === 0) return undefined
+  const dashC = argv.findIndex(part => part === '-c' || part === '-lc' || part === '-cl')
+  return dashC >= 0 ? argv[dashC + 1] : argv.join(' ')
+}
+
+/** Match a legacy item's full command against decoded shell call arguments. */
+export function codexCommandMatches(command: string, argsRaw: string): boolean {
+  // Custom/legacy shell tools can carry the command as their entire input.
+  if (argsRaw === command) return true
+  const args = parseJsonLine(argsRaw)
+  if (!isRecord(args)) return false
+  const value = args['cmd'] ?? args['command']
+  if (typeof value === 'string') return value === command
+  if (!Array.isArray(value) || !value.every(part => typeof part === 'string')) return false
+  return codexCommandOf({ command: value }) === command
 }
 
 function subagentLabel(payload: Record<string, unknown>): string {
@@ -331,6 +388,12 @@ class CodexParser implements SessionParser {
   private readonly lastRequestSeqByTurn = new Map<number, number>()
   private readonly turnSeqs = new Map<number, number[]>()
   private readonly children = new Map<string, ChildThread>()
+  /** Terminal `item_completed` failure seen before the call's output folded. */
+  private readonly failedCalls = new Set<string>()
+  /** `argsRaw` of the most recently settled calls, for late item attribution (bounded, oldest evicted). */
+  private readonly recentSettled = new Map<string, string>()
+  /** Calls settled since the newest call opened; resets on every call start. */
+  private settledSinceOpen = 0
   private systemPrompt: SystemPrompt | null = null
   private systemPromptAttached = false
   private provider = 'openai'
@@ -533,6 +596,9 @@ class CodexParser implements SessionParser {
         if (isRecord(info)) this.attachUsage(mapUsage(info['last_token_usage']), false)
         return
       }
+      case 'item_completed':
+        this.handleItemCompleted(payload)
+        return
       case 'thread_rolled_back': {
         // Legacy marker: the last N user turns were dropped from model context
         // (thread_rollout_truncation.rs). The records stay in the ledger; the
@@ -592,7 +658,7 @@ class CodexParser implements SessionParser {
         this.handleMessage(payload, time)
         return
       case 'reasoning': {
-        const text = reasoningText(payload)
+        const text = codexReasoningText(payload)
         if (text === '') return
         this.appendBlock({ kind: 'reasoning', text }, time)
         return
@@ -756,6 +822,7 @@ class CodexParser implements SessionParser {
         ?? (payload['input'] === undefined && payload['arguments'] === undefined
           ? ''
           : JSON.stringify(payload['input'] ?? payload['arguments'])))
+    this.settledSinceOpen = 0
     if (parentCallId === undefined) {
       this.appendBlock({ kind: 'tool-call', callId, name, argsRaw }, time)
     }
@@ -797,14 +864,82 @@ class CodexParser implements SessionParser {
       seq,
       time,
       content,
-      isError: outputLooksFailed(payload, text),
+      // An `item_completed` failure beats the output text heuristic.
+      isError: this.failedCalls.delete(callId) || outputLooksFailed(payload, text),
     })
+    this.noteSettled(callId, node.call?.argsRaw)
     if (topLevel) {
       this.assembler.pushNode(node)
       this.locate(seq, Math.max(1, this.turn))
     } else {
       this.assembler.touch()
     }
+  }
+
+  /**
+   * `event_msg.item_completed` mirrors a response item and carries the call's
+   * TERMINAL status (`item.status`, and `exit_code` for commands) — the only
+   * honest failure signal when the output text itself looks fine. The item
+   * usually lands between the call and its `function_call_output`, sometimes
+   * after the output already folded, in which case the settled node is
+   * flipped instead. Current CommandExecution and McpToolCall producers use
+   * the call id. Older unmatched items use the compatibility lookup below;
+   * ambiguous matches are left alone.
+   */
+  private handleItemCompleted(payload: Record<string, unknown>): void {
+    const item = payload['item']
+    if (!isRecord(item)) return
+    const kind = asString(item['type'])
+    if (kind !== 'CommandExecution' && kind !== 'FileChange' && kind !== 'McpToolCall') return
+    const exitCode = asNumber(item['exit_code'])
+    const failed = asString(item['status']) === 'failed' || (exitCode !== undefined && exitCode !== 0)
+    if (!failed) return
+    const callId = this.attributeCompletedItem(item)
+    if (callId === undefined) return
+    if (this.assembler.tools.isPending(callId)) this.failedCalls.add(callId)
+    else if (this.assembler.tools.markError(callId)) this.assembler.touch()
+  }
+
+  /**
+   * The call an `item_completed` belongs to, when one can be proven — across
+   * BOTH pending and recently settled calls, since a late item lands after
+   * its own result folded. Order: exact item id → unique command-content
+   * match → the lone open call when nothing has settled since it opened.
+   */
+  private attributeCompletedItem(item: Record<string, unknown>): string | undefined {
+    const itemId = asString(item['id'])
+    if (itemId !== undefined && this.assembler.tools.has(itemId)) return itemId
+    const command = codexCommandOf(item)
+    if (command !== undefined) {
+      let matched: string | undefined
+      for (const callId of this.assembler.tools.pendingIds()) {
+        if (!codexCommandMatches(command, this.assembler.tools.pendingCall(callId)?.argsRaw ?? '')) continue
+        if (matched !== undefined) return undefined
+        matched = callId
+      }
+      for (const [callId, argsRaw] of this.recentSettled) {
+        if (!codexCommandMatches(command, argsRaw)) continue
+        if (matched !== undefined) return undefined
+        matched = callId
+      }
+      if (matched !== undefined) return matched
+    }
+    const running = this.assembler.tools.runningCalls()
+    if (running.length === 1 && this.settledSinceOpen === 0) return running[0]?.callId
+    return undefined
+  }
+
+  /** Remember a settled call for late item attribution (bounded, oldest evicted). */
+  private noteSettled(callId: string, argsRaw: string | null | undefined): void {
+    if (argsRaw !== undefined && argsRaw !== null) {
+      this.recentSettled.delete(callId)
+      this.recentSettled.set(callId, argsRaw)
+      if (this.recentSettled.size > 64) {
+        const oldest = this.recentSettled.keys().next().value
+        if (oldest !== undefined) this.recentSettled.delete(oldest)
+      }
+    }
+    this.settledSinceOpen += 1
   }
 
   /**
@@ -873,6 +1008,7 @@ class CodexParser implements SessionParser {
       content,
       isError: status === 'failed' || status === 'error' || status === 'incomplete',
     })
+    this.noteSettled(callId, node.call?.argsRaw)
     if (topLevel) {
       this.assembler.pushNode(node)
       this.locate(seq, Math.max(1, this.turn))
@@ -1318,6 +1454,8 @@ class CodexParser implements SessionParser {
         this.completeChild(child, time)
       } else if (eventType === 'turn_aborted') {
         this.completeChild(child, time)
+      } else if (eventType === 'item_completed') {
+        this.handleItemCompleted(payload)
       }
     }
   }
@@ -1355,6 +1493,7 @@ class CodexParser implements SessionParser {
       content: child.lastAgentMessage === null ? [] : [{ type: 'text', text: child.lastAgentMessage }],
       isError: false,
     })
+    this.noteSettled(child.callId, node.call?.argsRaw)
     if (topLevel) {
       this.assembler.pushNode(node)
       this.locate(seq, Math.max(1, this.turn))
@@ -1430,13 +1569,6 @@ function stringifyRaw(value: unknown): string | undefined {
   }
 }
 
-function reasoningText(payload: Record<string, unknown>): string {
-  const summary = asArray(payload['summary']) ?? []
-  return summary
-    .flatMap(item => (isRecord(item) ? [asString(item['text']) ?? ''] : []))
-    .filter(text => text !== '')
-    .join('\n\n')
-}
 
 /** Create the incremental Codex rollout parser. */
 export function createCodexParser(): SessionParser {

@@ -1113,3 +1113,162 @@ describe('codex source lines', () => {
     expect(index?.targetAt(1, MAIN.id)).not.toEqual({ kind: 'call', callId: 'child-call' })
   })
 })
+
+describe('codex readable reasoning text', () => {
+  const reasoningItem = (offset: number, payload: Record<string, unknown>) => line('response_item', {
+    type: 'reasoning', id: `rs-${offset}`, ...payload,
+  }, offset)
+
+  const reasoningTexts = (parser: ReturnType<typeof createCodexParser>) =>
+    assistants(parser).flatMap(node => node.blocks)
+      .flatMap(block => (block.kind === 'reasoning' ? [block.text] : []))
+
+  it('reads reasoning_text content when the summary is empty', () => {
+    const parser = feed([
+      sessionMeta(0),
+      reasoningItem(100, {
+        summary: [],
+        content: [{ type: 'reasoning_text', text: 'Visible reasoning' }, { type: 'text', text: 'Final thought' }],
+        encrypted_content: 'opaque',
+      }),
+      // The step flushes when the next input arrives.
+      userMessage(200, 'next'),
+    ])
+    expect(reasoningTexts(parser)).toEqual(['Visible reasoning\n\nFinal thought'])
+  })
+
+  it('joins summary and content text, and dedups an identical one', () => {
+    const parser = feed([
+      sessionMeta(0),
+      reasoningItem(100, {
+        summary: [{ type: 'summary_text', text: 'A' }],
+        content: [{ type: 'reasoning_text', text: 'B' }],
+      }),
+      reasoningItem(200, {
+        summary: [{ type: 'summary_text', text: 'same' }],
+        content: [{ type: 'reasoning_text', text: 'same' }],
+      }),
+      userMessage(300, 'next'),
+    ])
+    expect(reasoningTexts(parser)).toEqual(['A\n\nB', 'same'])
+  })
+
+  it('emits no reasoning node for encrypted_content alone', () => {
+    const parser = feed([
+      sessionMeta(0),
+      reasoningItem(100, { summary: [], encrypted_content: 'opaque' }),
+    ])
+    expect(reasoningTexts(parser)).toEqual([])
+  })
+})
+
+describe('codex tool terminal status (item_completed)', () => {
+  const itemCompleted = (offset: number, item: Record<string, unknown>) => line('event_msg', {
+    type: 'item_completed', item,
+  }, offset)
+
+  it('matches decoded commands exactly and leaves repeated terminal events unchanged', () => {
+    const parser = feed([
+      functionCall(100, 'quoted', 'exec_command', JSON.stringify({ cmd: 'printf "hi"' })),
+      functionCall(200, 'longer', 'exec_command', JSON.stringify({ cmd: 'printf "hi"; pwd' })),
+      functionOutput(300, 'quoted', 'hi'), functionOutput(400, 'longer', 'hi /tmp'),
+      itemCompleted(500, { type: 'CommandExecution', id: 'legacy-id', status: 'failed', command: ['bash', '-lc', 'printf "hi"'] }),
+    ])
+    expect(toolResults(parser).map(result => result.isError)).toEqual([true, false])
+    const before = parser.snapshot()
+    parser.push(itemCompleted(500, { type: 'CommandExecution', id: 'quoted', status: 'failed' }), MAIN)
+    expect(parser.snapshot()).toBe(before)
+  })
+
+  it('marks the result isError when the item lands between call and output', () => {
+    const parser = feed([
+      sessionMeta(0),
+      taskStarted(100, 'turn-1'),
+      functionCall(200, 'call-1', 'shell', '{"cmd":"pnpm test"}'),
+      itemCompleted(300, {
+        id: 'call-1', type: 'CommandExecution', status: 'failed', exit_code: 1,
+        command: ['bash', '-lc', 'pnpm test'],
+      }),
+      functionOutput(400, 'call-1', 'looks fine'),
+      taskComplete(500, 'turn-1', 'done'),
+    ])
+    expect(toolResults(parser)[0]?.isError).toBe(true)
+  })
+
+  it('flips an already settled result when the item arrives late', () => {
+    const parser = feed([
+      sessionMeta(0),
+      taskStarted(100, 'turn-1'),
+      functionCall(200, 'call-1', 'shell', '{"cmd":"pnpm test"}'),
+      functionOutput(300, 'call-1', 'ok-looking text'),
+      itemCompleted(400, {
+        id: 'xyz', type: 'CommandExecution', status: 'failed', exit_code: 1,
+        command: ['bash', '-lc', 'pnpm test'],
+      }),
+      taskComplete(500, 'turn-1', 'done'),
+    ])
+    expect(toolResults(parser)[0]?.isError).toBe(true)
+  })
+
+  it('matches on the command text when the item id is not the call id', () => {
+    const parser = feed([
+      sessionMeta(0),
+      taskStarted(100, 'turn-1'),
+      functionCall(200, 'call-1', 'shell', '{"cmd":"pnpm test"}'),
+      itemCompleted(300, {
+        id: 'xyz', type: 'CommandExecution', status: 'failed',
+        command: ['bash', '-lc', 'pnpm test'],
+      }),
+      functionOutput(400, 'call-1', 'fine'),
+      taskComplete(500, 'turn-1', 'done'),
+    ])
+    expect(toolResults(parser)[0]?.isError).toBe(true)
+  })
+
+  it('does not guess across parallel open calls', () => {
+    const parser = feed([
+      sessionMeta(0),
+      taskStarted(100, 'turn-1'),
+      functionCall(200, 'call-1', 'shell', '{"cmd":"cmd one"}'),
+      functionCall(250, 'call-2', 'shell', '{"cmd":"cmd two"}'),
+      itemCompleted(300, {
+        id: 'xyz', type: 'CommandExecution', status: 'failed',
+        command: ['bash', '-lc', 'unrelated'],
+      }),
+      functionOutput(400, 'call-1', 'one'),
+      functionOutput(450, 'call-2', 'two'),
+      taskComplete(500, 'turn-1', 'done'),
+    ])
+    expect(toolResults(parser).map(result => result.isError)).toEqual([false, false])
+  })
+
+  it('reads the unified-exec exit-code line as a text fallback', () => {
+    const parser = feed([
+      sessionMeta(0),
+      taskStarted(100, 'turn-1'),
+      functionCall(200, 'call-1', 'shell', '{"cmd":"a"}'),
+      functionOutput(300, 'call-1', 'Chunk ID: abc123\nWall time: 0.1000 seconds\nProcess exited with code -1\nOutput:\noops'),
+      functionCall(400, 'call-2', 'shell', '{"cmd":"b"}'),
+      functionOutput(500, 'call-2', 'Process exited with code 0\nfine'),
+      functionCall(600, 'call-3', 'shell', '{"cmd":"c"}'),
+      functionOutput(700, 'call-3', 'Chunk ID: def456\nWall time: 0.1000 seconds\nProcess exited with code 0\nOutput:\nProcess exited with code 1'),
+      taskComplete(800, 'turn-1', 'done'),
+    ])
+    expect(toolResults(parser).map(result => result.isError)).toEqual([true, false, false])
+  })
+
+  it('ignores a completed item with exit_code 0', () => {
+    const parser = feed([
+      sessionMeta(0),
+      taskStarted(100, 'turn-1'),
+      functionCall(200, 'call-1', 'shell', '{"cmd":"pnpm test"}'),
+      itemCompleted(300, {
+        id: 'xyz', type: 'CommandExecution', status: 'completed', exit_code: 0,
+        command: ['bash', '-lc', 'pnpm test'],
+      }),
+      functionOutput(400, 'call-1', 'fine'),
+      taskComplete(500, 'turn-1', 'done'),
+    ])
+    expect(toolResults(parser)[0]?.isError).toBe(false)
+  })
+})

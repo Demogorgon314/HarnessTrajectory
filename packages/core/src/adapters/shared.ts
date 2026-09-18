@@ -305,6 +305,26 @@ export class ToolCallTracker {
     return { node, topLevel: true }
   }
 
+  /**
+   * Flip a COMPLETED call's node to `isError` — a late terminal-status record
+   * (codex `item_completed`) arrived after the output folded. Returns false
+   * while the call is still pending or unknown.
+   */
+  markError(callId: string): boolean {
+    const done = this.completed.get(callId)
+    if (done === undefined || done.isError) return false
+    const next = { ...done, isError: true }
+    this.completed.set(callId, next)
+    const parentCallId = this.parentOf.get(callId)
+    if (parentCallId !== undefined) {
+      const siblings = this.children.get(parentCallId) ?? []
+      this.children.set(parentCallId, siblings.map(block => (block.callId === callId ? next : block)))
+      // A completed ancestor keeps a stale subCalls array; refresh it.
+      this.refreshCompletedAncestors(parentCallId)
+    }
+    return true
+  }
+
   private refreshCompletedAncestors(callId: string): void {
     const visited = new Set<string>()
     let current: string | undefined = callId

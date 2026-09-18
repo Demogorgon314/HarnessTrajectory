@@ -203,6 +203,39 @@ describe('devin adapter', () => {
     expect(parser.meta().cwd).toBe('/work/project')
   })
 
+  it('counts cache_creation_tokens in usage and totalTokens', () => {
+    const parser = createDevinParser()
+    parser.push(assistant(1, 0, 100, {
+      text: 'a',
+      metrics: { input_tokens: 100, output_tokens: 20, cache_creation_tokens: 50 },
+    }), MAIN, 0)
+    expect(assistants(parser)[0]?.usage).toMatchObject({
+      inputTokens: 100, outputTokens: 20, cacheWriteTokens: 50, totalTokens: 170,
+    })
+  })
+
+  it('reports usage when only cache_creation_tokens is recorded', () => {
+    const parser = createDevinParser()
+    parser.push(assistant(1, 0, 100, {
+      text: 'a',
+      metrics: { cache_creation_tokens: 50 },
+    }), MAIN, 0)
+    expect(assistants(parser)[0]?.usage).toEqual({
+      inputTokens: 0, outputTokens: 0, cacheWriteTokens: 50, totalTokens: 50,
+    })
+  })
+
+  it('honours the cache_write_tokens alias', () => {
+    const parser = createDevinParser()
+    parser.push(assistant(1, 0, 100, {
+      text: 'a',
+      metrics: { input_tokens: 10, output_tokens: 5, cache_write_tokens: 7 },
+    }), MAIN, 0)
+    expect(assistants(parser)[0]?.usage).toMatchObject({
+      inputTokens: 10, outputTokens: 5, cacheWriteTokens: 7, totalTokens: 22,
+    })
+  })
+
   it('counts only is_user_input messages as prompts', () => {
     const parser = createDevinParser()
     parser.push(human('real prompt', 2, 1, 10), MAIN, 0)
