@@ -427,17 +427,32 @@ Verified against pi 0.85.1 (`packages/coding-agent/src/core/session-manager.ts`,
   `{type, id (8 hex), parentId: string|null, timestamp: ISO}`. TIMESTAMP TRAP: the
   entry `timestamp` is ISO; a nested `message.timestamp` is epoch MILLISECONDS. Only
   the entry stamp is used.
-- The context is the parentId path from the latest entry to the root. The Trajectory
-  shows file order; the Context restores the surface checkpoint saved at the parent
-  entry (a `/tree` branch appends an entry whose parentId is earlier, pruning the
-  abandoned suffix; `parentId: null` restarts an empty context).
+- The entry TREE is the only source of truth for the model-visible context
+  (`PiSessionTree.contextEntries` ports pi's `buildContextEntries`; rendered
+  surfaces are never consulted). The Trajectory shows file order; the Context
+  rebuilds the surface and re-resolves the route/prompt from the parent's path
+  whenever an entry's parentId is not the previous entry (a `/tree` branch,
+  pruning the abandoned suffix; `parentId: null` restarts an empty context).
+  The Trajectory likewise re-resolves the request route/prompt at a branch so
+  nothing from an abandoned branch leaks through. `resolvePiContextState`
+  splits state the way pi's `buildSessionContext` does: the PROMPT replays
+  the compacted entry list, while the ROUTE (provider/model/thinking) reads
+  the FULL parent path (`getSessionContextSettings`) — a compaction that
+  shadows a `model_change`/`thinking_level_change` does not forget it.
 - `compaction` entries carry `summary`, `firstKeptEntryId`, `tokensBefore`, optional
   `systemMessage`, and `usage`. The summary is placed BEFORE the kept range (file
-  order keeps the retained entries first — the suffix-preserving case). An unknown
-  `firstKeptEntryId` keeps nothing. `branch_summary` entries ({fromId, summary})
-  inject a summary node at the branch point.
+  order keeps the retained entries first — the suffix-preserving case). The kept
+  range is path entries from `firstKeptEntryId` up to the compaction, minus system
+  messages; an off-path `firstKeptEntryId` keeps nothing, a later compaction
+  re-keeps the path range even when the surface holds replay copies, and an
+  extension compaction may WIDEN the range — entries the surface no longer
+  holds replay their original emitted events. The optional `systemMessage` is
+  a COMPLETE prompt checkpoint (pi stores `getCurrentSystemMessage`): it
+  replaces the replayed state, never applies as a delta. `branch_summary`
+  entries ({fromId, summary}) inject a summary node at the branch point.
 - Roles under `message` entries: `system` (content + `sections` patches where `null`
-  deletes + `toolsAdded`/`toolsRemoved`; replayed prompt = accumulated contents then
+  deletes + `toolsAdded`/`toolsRemoved` — removals land FIRST, so a same-name
+  pair redefines the tool; replayed prompt = accumulated contents then
   section values in insertion order, nonempty joined with `\n\n`), `user` (always
   human — pi injects nothing through this role), `assistant` (one persisted record
   per model call: content blocks, provider/model, usage, `stopReason` ∈

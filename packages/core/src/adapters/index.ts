@@ -27,7 +27,8 @@ export {
 } from './devin.ts'
 export {
   createPiParser, isPiHumanPrompt, parsePiLine, piContentText, PiPromptState,
-  type PiEntry,
+  PiSessionTree, resolvePiContextState,
+  type PiContextState, type PiEntry,
 } from './pi.ts'
 export * from './shared.ts'
 
