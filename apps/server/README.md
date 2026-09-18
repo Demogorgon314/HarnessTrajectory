@@ -16,5 +16,5 @@ HARNESS_TRAJECTORY_SEARCH=1 npx @demogorgon314/harness-trajectory@latest
 ```
 
 Requires Node 22.13+. Listens on `http://127.0.0.1:5170`. See the
-[repository README](https://github.com/Demogorgon314/harness-trajectory) for
+[repository README](https://github.com/Demogorgon314/HarnessTrajectory) for
 configuration and development.

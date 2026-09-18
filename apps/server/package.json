@@ -1,6 +1,6 @@
 {
   "name": "@demogorgon314/harness-trajectory",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Local viewer for Claude Code, Codex, Kimi Code and Grok Build session transcripts",
   "type": "module",
   "license": "MIT",
@@ -15,12 +15,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Demogorgon314/harness-trajectory.git",
+    "url": "git+https://github.com/Demogorgon314/HarnessTrajectory.git",
     "directory": "apps/server"
   },
-  "homepage": "https://github.com/Demogorgon314/harness-trajectory",
+  "homepage": "https://github.com/Demogorgon314/HarnessTrajectory",
   "bugs": {
-    "url": "https://github.com/Demogorgon314/harness-trajectory/issues"
+    "url": "https://github.com/Demogorgon314/HarnessTrajectory/issues"
   },
   "publishConfig": {
     "access": "public"
