@@ -19,6 +19,7 @@
 import { readdir, stat } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 import { isRecord, asArray, asNumber, asString } from '@harness-trajectory/core'
+import type { Classified } from './harness/classified.ts'
 import { readHead, type FileHead } from './meta.ts'
 import {
   plainTranscriptPath, readFirstLine, resolveTranscriptFile, zstdSupported,
@@ -37,6 +38,24 @@ export function codexIdsFromName(name: string): { threadUuid?: string; rolloutId
   if (match === null) return {}
   const threadUuid = match[1]!.toLowerCase()
   return { threadUuid, rolloutId: (match[2] ?? match[1]!).toLowerCase() }
+}
+
+/**
+ * YYYY/MM/DD/rollout-<timestamp>-<threadId>[_<rolloutId>].jsonl[.zst]; a
+ * reverted thread's new file appends its own rollout id after the stable
+ * thread id, and cold files carry `.zst` (rollout/src/rollout_file_name.rs).
+ * `name` is the basename with the `.jsonl[.zst]` suffix already stripped.
+ */
+export function classifyCodexPath(name: string): Classified | null {
+  if (!name.startsWith('rollout-')) return null
+  const ids = codexIdsFromName(name)
+  const rolloutId = ids.rolloutId ?? name
+  return {
+    id: rolloutId,
+    role: 'main',
+    ...(ids.rolloutId === undefined ? {} : { rolloutId: ids.rolloutId }),
+    ...(ids.threadUuid === undefined ? {} : { threadUuid: ids.threadUuid }),
+  }
 }
 
 /** One slice of another rollout that a head inherits: the decoded prefix below its cut. */

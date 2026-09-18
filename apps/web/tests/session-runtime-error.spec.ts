@@ -240,4 +240,24 @@ describe('session runtime stream-error classification', () => {
     expect(source?.closed).toBe(true)
     runtime.close()
   })
+
+  test('a line the parser throws on is skipped; the rest of the batch still folds', () => {
+    const runtime = new SessionRuntime('claude', 'sess-1')
+    runtime.start()
+    const source = FakeEventSource.instances[0]
+    source?.open()
+    source?.emit({ type: 'file', file: MAIN })
+    const parser = (runtime as unknown as { parser: { push: (line: string) => void } }).parser
+    const pushed: string[] = []
+    vi.spyOn(parser, 'push').mockImplementation((line: string) => {
+      pushed.push(line)
+      if (pushed.length === 2) throw new Error('boom')
+    })
+    source?.emit({ type: 'lines', file: MAIN, lines: ['l-1', 'l-2', 'l-3'], startLine: 0 })
+    source?.emit({ type: 'ready' })
+    // The throw on line 2 neither dropped line 3 nor lost the batch's count.
+    expect(pushed).toEqual(['l-1', 'l-2', 'l-3'])
+    expect(runtime.store.getSnapshot().lines).toBe(3)
+    runtime.close()
+  })
 })

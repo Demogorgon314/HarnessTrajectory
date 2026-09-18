@@ -200,7 +200,14 @@ export class SessionRuntime {
         // A negative `startLine` marks synthetic lines (grok's sidecar) that
         // belong to no line of the file; they stay negative and bind nothing.
         for (const [at, line] of event.lines.entries()) {
-          this.parser.push(line, event.file, event.startLine < 0 ? -1 : event.startLine + at)
+          // One bad record must not drop the rest of the batch: the parser is
+          // written not to throw, but a future record shape is contained here
+          // the same way `ContextSession.push` already contains it.
+          try {
+            this.parser.push(line, event.file, event.startLine < 0 ? -1 : event.startLine + at)
+          } catch {
+            // Skip the line; folding continues with the next record.
+          }
           this.context.push(line, event.file)
         }
         this.lineCount += event.lines.length

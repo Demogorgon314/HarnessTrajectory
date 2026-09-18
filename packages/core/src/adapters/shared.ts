@@ -214,7 +214,8 @@ interface PendingCall {
  */
 export class ToolCallTracker {
   private readonly pending = new Map<string, PendingCall>()
-  private readonly order: string[] = []
+  /** Ids of still-pending calls in start order (a Set keeps insertion order). */
+  private readonly pendingOrder = new Set<string>()
   private readonly children = new Map<string, ToolCallBlock[]>()
   private readonly parentOf = new Map<string, string>()
   private readonly completed = new Map<string, ToolResultNode>()
@@ -229,7 +230,7 @@ export class ToolCallTracker {
   start(call: RunningToolCall): void {
     this.lines?.noteCallStart(call.callId)
     this.pending.set(call.callId, { call })
-    this.order.push(call.callId)
+    this.pendingOrder.add(call.callId)
     if (call.parentCallId !== undefined && call.parentCallId !== call.callId) {
       this.parentOf.set(call.callId, call.parentCallId)
       this.pendingChildren.set(call.parentCallId, (this.pendingChildren.get(call.parentCallId) ?? 0) + 1)
@@ -274,6 +275,7 @@ export class ToolCallTracker {
     const pending = this.pending.get(callId)
     const call = pending?.call
     this.pending.delete(callId)
+    this.pendingOrder.delete(callId)
     const parentCallId = call?.parentCallId ?? this.parentOf.get(callId)
     if (pending !== undefined && parentCallId !== undefined) {
       const remaining = (this.pendingChildren.get(parentCallId) ?? 1) - 1
@@ -351,9 +353,10 @@ export class ToolCallTracker {
 
   private subCallsOf(callId: string): readonly ToolCallBlock[] {
     const done = this.children.get(callId) ?? []
-    const running = this.order
-      .filter(id => this.pending.has(id) && this.parentOf.get(id) === callId)
-      .map(id => this.runningView(id))
+    const running: ToolCallBlock[] = []
+    for (const id of this.pendingOrder) {
+      if (this.parentOf.get(id) === callId) running.push(this.runningView(id))
+    }
     return [...done, ...running].sort((left, right) => blockTime(left) - blockTime(right))
   }
 
@@ -365,14 +368,16 @@ export class ToolCallTracker {
 
   /** Top-level calls still awaiting a result, oldest first, with nested state attached. */
   runningCalls(): readonly RunningToolCall[] {
-    return this.order
-      .filter(id => this.pending.has(id) && this.parentOf.get(id) === undefined)
-      .map(id => this.runningView(id))
+    const running: RunningToolCall[] = []
+    for (const id of this.pendingOrder) {
+      if (this.parentOf.get(id) === undefined) running.push(this.runningView(id))
+    }
+    return running
   }
 
   /** Every pending call id, including nested ones. */
   pendingIds(): readonly string[] {
-    return this.order.filter(id => this.pending.has(id))
+    return [...this.pendingOrder]
   }
 }
 
@@ -391,6 +396,8 @@ export class TrajectoryAssembler {
   readonly seq = new SequenceCounter((seq) => { this.lines.noteSeq(seq) })
   readonly nodes: ConversationNode[] = []
   readonly requests: RequestView[] = []
+  /** `startSeq` → index into `requests`, kept in sync by {@link upsertRequest}. */
+  private readonly requestIndex = new Map<number, number>()
   readonly locations = new Map<number, ConversationLocation>()
   readonly callSchemas = new Map<string, ToolSchema>()
   readonly systemPrompts: SystemPromptNode[] = []
@@ -432,14 +439,18 @@ export class TrajectoryAssembler {
 
   /** Replace a request by its start seq, or append it. */
   upsertRequest(request: RequestView): void {
-    const index = this.requests.findIndex(item => item.startSeq === request.startSeq)
-    if (index >= 0) this.requests[index] = request
-    else this.requests.push(request)
+    const index = this.requestIndex.get(request.startSeq)
+    if (index !== undefined) this.requests[index] = request
+    else {
+      this.requestIndex.set(request.startSeq, this.requests.length)
+      this.requests.push(request)
+    }
     this.touch()
   }
 
   findRequest(startSeq: number): RequestView | undefined {
-    return this.requests.find(item => item.startSeq === startSeq)
+    const index = this.requestIndex.get(startSeq)
+    return index === undefined ? undefined : this.requests[index]
   }
 
   snapshot(): TrajectorySnapshot {

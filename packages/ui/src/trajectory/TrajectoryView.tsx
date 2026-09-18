@@ -205,9 +205,11 @@ export function TrajectoryView({
   const [historyTailSeq, setHistoryTailSeq] = useState(latestNodeSeq)
   const [historyNodeLimit, setHistoryNodeLimit] = useState(HISTORY_PAGE_NODES)
   const fixedTailSeq = historyTailSeq ?? latestNodeSeq
-  const historyTailIndex = fixedTailSeq === undefined
-    ? -1
-    : completeInspection.eventNodes.findLastIndex(node => node.seq <= fixedTailSeq)
+  const historyTailIndex = useMemo(() => (
+    fixedTailSeq === undefined
+      ? -1
+      : completeInspection.eventNodes.findLastIndex(node => node.seq <= fixedTailSeq)
+  ), [completeInspection.eventNodes, fixedTailSeq])
   const historyEndIndex = historyTailIndex < 0 && latestNodeSeq !== undefined
     ? completeInspection.eventNodes.length
     : historyTailIndex + 1
