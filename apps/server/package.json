@@ -1,7 +1,7 @@
 {
   "name": "@demogorgon314/harness-trajectory",
   "version": "0.3.0",
-  "description": "Local viewer for Claude Code, Codex, Kimi Code, Grok Build, Devin CLI, and pi session transcripts",
+  "description": "Local viewer for Claude Code, Codex, Kimi Code, Grok Build, Devin CLI, pi, and OpenCode session transcripts",
   "type": "module",
   "license": "MIT",
   "bin": {

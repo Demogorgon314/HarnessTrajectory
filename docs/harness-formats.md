@@ -476,6 +476,118 @@ Verified against pi 0.85.1 (`packages/coding-agent/src/core/session-manager.ts`,
 - Context window is never recorded and never inferred. Pi persists only complete
   messages, so there is no streaming/TTFT data.
 
+## OpenCode
+
+No JSONL transcripts — `opencode.db` (WAL) at `$XDG_DATA_HOME/opencode/opencode.db`,
+else `~/.local/share/opencode/opencode.db` (`HARNESS_TRAJECTORY_OPENCODE_DB` overrides).
+Verified against opencode 1.18.31 (`packages/schema/src/v1/session.ts`,
+`packages/core/src/session/sql.ts`) and a 1.18.x local store. Tables read: `session`,
+`message` (V1 `Info` JSON in `data`, minus `id`/`sessionID`), `part` (V1 `Part` JSON in
+`data`). `session_message`/`session_v2`/`session_input` are the V2 projection and are
+ignored. ALL times are epoch MILLISECONDS; row order is `(time_created, id)` for
+messages and `(message_id, id)` for parts.
+
+Token buckets are disjoint: `tokens.input` excludes cache read/write and `tokens.output`
+excludes `reasoning` (unlike pi, where reasoning ⊂ output). Wire usage maps
+`outputTokens = output + reasoning`, `reasoningTokens = reasoning`, `totalTokens =
+total ?? input+output+reasoning+cache.read+cache.write`; request input =
+input + cache.read + cache.write. No context window is ever recorded; never infer one.
+`cost` is USD per assistant message.
+
+### Wire vocabulary
+
+The server synthesizes five line kinds (`opencode.session` sidecar with title/cwd/
+model/children facts, `opencode.message` header carrying parts inline ONLY for user
+messages, `opencode.part` for settled assistant parts, `opencode.finish` for a terminal
+assistant's tokens/cost/finish/error, `opencode.prune` sidecar when a tool output is
+cleared). `summary.diffs` on user messages is stripped at wire time — session diff
+blobs (~500 KB) are not model content. Sidecars ride `startLine: -1`, are never
+indexed, and are re-sent when their facts change.
+
+### Settle and close rules
+
+`planLines` in `opencode/transcript.ts` is the single emission plan for live and
+replay: per message, header once → parts in strict `id` order once SETTLED → finish
+once TERMINAL; the walk stops at the first unclosed message so live and replay share
+line numbering. A part is settled by its own terminal state (text `time.end`,
+reasoning `time.end`, tool `completed|error`), by its message being terminal, or by a
+later ASSISTANT message existing — the only reliable "writer moved on" signal. A
+queued prompt's user row lands while the previous assistant is still streaming
+(the prompt path inserts the row, then joins the running loop; ~10% of prompts in
+a real store), so a later row of any other role settles nothing — the user header
+waits behind the open assistant, as OpenCode itself renders it. Assistant messages
+never overlap (one row per step, sequential). An out-of-order part waits for its
+predecessors. A trailing user message with no later message waits one tick
+(`trailingSeen`) because its parts land in separate statements after the row. A
+crashed assistant (never terminal) closes when the next ASSISTANT message appears;
+a part arriving for an already-closed message still emits as an append at the
+stream tail (the cursor records the append order so replay reproduces it
+exactly). TERMINAL = `time.completed` or `error` present. A compaction user
+header has its own gate: OpenCode writes the `compaction` part WITHOUT
+`tail_start_id` and updates it ~1–2 ms AFTER the summary's `time.completed`,
+so the header waits for an ASSISTANT beyond the summary (a prompt queued while
+the summary still generates lands a user row there — only the next assistant
+proves the loop moved past the part update), an errored summary, or one
+tick after the summary went terminal (`compactionSeen`) — shipping early would
+emit `tailStartId: null` and shadow the whole surface. Replay pins to the
+cursor's emitted id sets and re-derives the stream from current rows — the store is
+the buffer, no lines are retained.
+
+### Classifier, compaction, prune, children
+
+`opencodeUserClass` is structural: `compaction` when the message carries a
+`compaction` part, `human` when any non-synthetic text/file/agent/subtask part exists,
+else `injection` (`compaction-continue` when `metadata.compaction_continue` is set).
+Compaction = a compaction-class user, then a `summary: true` assistant (the summary —
+never an assistant step), then a synthetic continue message; `tail_start_id` on the
+compaction part names the first retained message and the tail (up to the compaction
+user) replays after the summary. An unfinished or errored summary does not compact.
+Prune mutates in place: `SessionCompaction.prune` sets `state.time.compacted` on old
+completed tool parts; the source emits one `opencode.prune` per part and the fold
+replaces the output with the cleared marker. A part that arrives already carrying
+`state.time.compacted` (pruned before materialization) folds the cleared marker
+directly — same rule OpenCode's `filterCompacted` applies. Revert (`session.revert`) deletes rows on
+the next prompt — count regression → full rebuild with `file reset`. Children are
+`session` rows with `parent_id`, flattened under the ROOT session at
+`opencode://sessions/<root>/<childId>`; the parent's `task` tool part binds
+`toolUseId`/model/description/agentType via `state.metadata.sessionId`
+(`metadata.background: true` keeps the run open until the child stream's own finish).
+
+### Source tiers and polling
+
+Two tiers keep startup off the message/part blobs (~340 MB of JSON on the reference
+store): the catalog tier reads `session` rows plus grouped `COUNT`/`MAX`/`SUM(length)`
+queries — sizes once at startup and per changed session, never per tick — and feeds
+each scanner user header lines only; the transcript tier materializes a session's full
+stream lazily on first `subscribe`/`readAll`/search registration and rebuilds the
+scanner fresh (a catalog-fed scanner must never double count). The tick gate is
+`PRAGMA data_version` (unchanged → skip everything), then grouped count/max probes per
+session: regression → `file reset` + search reset; advanced max → incremental fetch of
+rows with `time_updated >= lastMax` (`>=` so a second write in the same millisecond
+is not lost; re-reads are idempotent). A materialized stream with an open tail
+re-queries on every moved tick — a same-ms terminal update hides behind the strict
+watermark otherwise; closed streams keep the cheap strict gate. File identity
+(`dev:ino`) detects atomic replacement; a missing db degrades to empty and recovers
+on its own.
+
+Search attached at startup backfills through the same tiers: a stream the index
+already covers (`coverage` — the index's registered row-count `size` EQUALS the
+current count, its `mtimeMs` is at least as new, AND `indexedBytes` ≥ `size` —
+a reverted, rewritten, or not-fully-consumed stream is not mistaken for
+covered) is never re-read, every other indexable stream materializes and
+queues as it emits, with an event-loop yield between streams. `size` and
+`indexedBytes` carry the same shape as JSONL's file-bytes/bytes-consumed pair:
+`size` is the total row count (`beginFile`'s shrink check needs it) and
+`indexedBytes` is `countOf − openRowCount` — the rows the emitted lines
+account for, so a stream stopped with an open tail (a prompt still behind
+the patience gate) reads as incomplete on the next boot and materializes.
+A covered stream stays unmaterialized, but a later touch while search
+is live materializes it on the spot — `beginFile` anchors at the index's
+`indexedLines` watermark and only the appended lines queue. Toggling search on
+later reuses the same pass and replay-queues the backlog of streams already
+materialized; a new session registered while search is live materializes
+immediately.
+
 ## Request-input statistics (shared)
 
 ### Incremental parser extension points

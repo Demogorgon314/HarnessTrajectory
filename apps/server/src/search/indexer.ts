@@ -119,6 +119,23 @@ export class SearchIndexer {
   }
 
   /**
+   * What the index already holds for a path — the `size`/`mtimeMs`
+   * watermarks a source registered with, the consumed-prefix `indexedBytes`,
+   * and the highest indexed line. Lets a lazy source ask whether the store
+   * already covers a transcript without materializing it.
+   */
+  coverage(path: string): { size: number; mtimeMs: number; indexedBytes: number; indexedLines: number } | undefined {
+    const state = this.store.fileState(path)
+    if (state === undefined) return undefined
+    return {
+      size: state.size,
+      mtimeMs: state.mtimeMs,
+      indexedBytes: state.indexedBytes,
+      indexedLines: state.indexedLines,
+    }
+  }
+
+  /**
    * Register a file about to be replayed and report the first line index that
    * still needs indexing.
    *

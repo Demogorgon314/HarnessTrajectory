@@ -4,6 +4,7 @@ import { createCodexSynthesizer } from './codex.ts'
 import { createDevinSynthesizer } from './devin.ts'
 import { createGrokSynthesizer } from './grok.ts'
 import { createKimiSynthesizer } from './kimi.ts'
+import { createOpencodeSynthesizer } from './opencode.ts'
 import { createPiSynthesizer } from './pi.ts'
 import type { EventSynthesizer } from './types.ts'
 
@@ -14,6 +15,7 @@ export {
   createDevinSynthesizer,
   createGrokSynthesizer,
   createKimiSynthesizer,
+  createOpencodeSynthesizer,
   createPiSynthesizer,
 }
 
@@ -25,5 +27,6 @@ export function createSynthesizer(kind: HarnessKind, file: SessionFileRef): Even
     case 'grok': return createGrokSynthesizer(file)
     case 'devin': return createDevinSynthesizer(file)
     case 'pi': return createPiSynthesizer(file)
+    case 'opencode': return createOpencodeSynthesizer(file)
   }
 }

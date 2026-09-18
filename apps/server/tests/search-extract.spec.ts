@@ -5,7 +5,7 @@ import { MAX_DOC_CHARS, extractSearchDocs, type SearchDocDraft } from '../src/se
 const T0 = Date.parse('2026-09-14T10:00:00.000Z')
 const iso = (offsetMs: number) => new Date(T0 + offsetMs).toISOString()
 
-function docs(kind: 'claude' | 'codex' | 'kimi' | 'grok' | 'devin' | 'pi', record: unknown): SearchDocDraft[] {
+function docs(kind: 'claude' | 'codex' | 'kimi' | 'grok' | 'devin' | 'pi' | 'opencode', record: unknown): SearchDocDraft[] {
   return extractSearchDocs(kind, JSON.stringify(record))
 }
 
@@ -535,6 +535,66 @@ describe('extractSearchDocs — pi', () => {
       { type: 'session', version: 3, id: 's', timestamp: iso(5007), cwd: '/work' },
     ]) {
       expect(docs('pi', record), JSON.stringify(record)).toEqual([])
+    }
+  })
+})
+
+describe('extractSearchDocs — OpenCode', () => {
+  const userHeader = (offset: number, parts: Record<string, unknown>[], msg: Record<string, unknown> = {}): unknown => ({
+    t: 'opencode.message', time: T0 + offset, id: 'msg_u',
+    msg: { role: 'user', time: { created: T0 + offset }, ...msg },
+    parts: parts.map((part, index) => ({ id: `prt_${index}`, ...part })),
+  })
+
+  const partLine = (offset: number, part: Record<string, unknown>): unknown => ({
+    t: 'opencode.part', time: T0 + offset, id: 'prt_1', messageID: 'msg_a', part,
+  })
+
+  it('indexes a human prompt — synthetic parts inside it stay out', () => {
+    expect(pairs(docs('opencode', userHeader(0, [
+      { type: 'text', text: 'Wire up the OpenCode adapter' },
+      { type: 'text', text: 'appended reminder', synthetic: true },
+    ])))).toEqual(['human: Wire up the OpenCode adapter'])
+  })
+
+  it('never indexes injected or compaction user messages', () => {
+    expect(docs('opencode', userHeader(100, [
+      { type: 'text', text: 'system reminder', synthetic: true },
+    ], { metadata: { compaction_continue: true } }))).toEqual([])
+    expect(docs('opencode', userHeader(200, [
+      { type: 'compaction', auto: true, tail_start_id: 'msg_x' },
+    ]))).toEqual([])
+  })
+
+  it('indexes assistant text, reasoning as other, and tool calls — never outputs', () => {
+    expect(docs('opencode', partLine(300, {
+      type: 'text', text: 'Starting with the parser.', time: { start: T0, end: T0 + 1 },
+    }))).toEqual([{ role: 'assistant', text: 'Starting with the parser.', timeMs: T0 + 300 }])
+    expect(docs('opencode', partLine(400, {
+      type: 'reasoning', text: 'Plan the work first.', time: { start: T0, end: T0 + 1 },
+    }))).toEqual([{ role: 'other', text: 'Plan the work first.', timeMs: T0 + 400 }])
+    expect(pairs(docs('opencode', partLine(500, {
+      type: 'tool', callID: 'c1', tool: 'edit',
+      state: {
+        status: 'completed',
+        input: { filePath: 'a.ts', oldString: 'x', newString: 'y' },
+        output: 'edited ok — this output must not index',
+        time: { start: T0, end: T0 + 5 },
+      },
+    })))).toEqual(['tool: edit\nfilePath: a.ts\noldString: x\nnewString: y'])
+  })
+
+  it('never indexes sidecars, finishes, or bookkeeping parts', () => {
+    for (const record of [
+      { t: 'opencode.session', time: T0, session: { id: 's', title: 't', directory: '/w' }, children: [] },
+      { t: 'opencode.finish', time: T0 + 600, id: 'msg_a', msg: { role: 'assistant', modelID: 'm' } },
+      { t: 'opencode.prune', time: T0 + 700, id: 'prt_1', messageID: 'msg_a', callID: 'c1' },
+      partLine(800, { type: 'step-finish', reason: 'stop' }),
+      partLine(900, { type: 'file', mime: 'text/plain', url: 'file:///f' }),
+      '{ not json',
+      'null',
+    ]) {
+      expect(docs('opencode', record), JSON.stringify(record)).toEqual([])
     }
   })
 })

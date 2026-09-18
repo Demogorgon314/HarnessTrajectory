@@ -361,7 +361,8 @@ export function App() {
               <div className={css.emptyHint}>
                 Sessions are scanned from <code>~/.claude/projects</code>, <code>~/.codex/sessions</code>,{' '}
                 <code>~/.kimi-code/sessions</code>, <code>~/.grok/sessions</code>, Devin CLI's{' '}
-                <code>~/.local/share/devin/cli/sessions.db</code>, and <code>~/.pi/agent/sessions</code> on this machine.
+                <code>~/.local/share/devin/cli/sessions.db</code>, <code>~/.pi/agent/sessions</code>, and OpenCode's{' '}
+                <code>~/.local/share/opencode/opencode.db</code> on this machine.
                 Running sessions update live.
               </div>
             </div>

@@ -25,4 +25,12 @@ describe('harness registry', () => {
       .toBe(`cd /work/project && pi --session abc123`)
     expect(meta.resumeCommand({ id: 'abc123', cwd: null })).toBe('pi --session abc123')
   })
+
+  test('opencode resumes through `opencode --session` in the session directory', () => {
+    const meta = harnessMeta('opencode')
+    expect(meta.label).toBe('OpenCode')
+    expect(meta.resumeCommand({ id: 'ses_abc123', cwd: '/work/project' }))
+      .toBe(`cd /work/project && opencode --session ses_abc123`)
+    expect(meta.resumeCommand({ id: 'ses_abc123', cwd: null })).toBe('opencode --session ses_abc123')
+  })
 })

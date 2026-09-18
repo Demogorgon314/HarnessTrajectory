@@ -48,6 +48,16 @@
  *   `branch_summary` summaries, `session_info`, `custom`, `label`,
  *   `model_change`, `thinking_level_change` and `system` are not indexed;
  *   `bashExecution` indexes only its command, never the output.
+ * - **OpenCode**: the server's synthesized `opencode.*` lines (epoch MS
+ *   `time`). `opencode.session`/`opencode.finish`/`opencode.prune` are never
+ *   indexed; a `role: 'user'` `opencode.message` indexes its non-synthetic
+ *   `text` parts only when `opencodeUserClass` says `human` — the same
+ *   structural classifier the adapter and meta scanner share (synthetic
+ *   reminders, compaction and injection messages index nothing). An
+ *   `opencode.part` indexes `text` as assistant, `reasoning` as other, and
+ *   `tool` as a call rendered from `tool` + `state.input` (camelCase arg
+ *   keys — `filePath`, `oldString`, `newString`); tool outputs are never
+ *   indexed.
  *
  * The rules that are the same everywhere: the human/injected split reuses the
  * classifier the meta scanner and the adapters use, image blocks are skipped,
@@ -66,7 +76,8 @@ import {
   asArray, asNumber, asString, classifyInjectedUser, devinMessageClass, grokMessageClass,
   codexHumanPromptText, codexReasoningText, isRecord, isPiHumanPrompt, kimiMessageClass, kimiTitleText,
   parseDevinLine, parseGrokLine, parsePiLine, piContentText,
-  parseJsonLine, parseTime, GROK_SIDECAR_METHOD, type HarnessKind, type SearchRole,
+  opencodeTextOf, opencodeUserClass, parseJsonLine, parseOpencodeLine, parseTime,
+  GROK_SIDECAR_METHOD, type HarnessKind, type SearchRole,
 } from '@harness-trajectory/core'
 
 /** One document before the indexer stamps it with its line number. */
@@ -133,7 +144,7 @@ const TOOL_ARG_KEYS: readonly string[] = [
   // Grok reads use `target_file`, `list_dir` uses `target_directory`.
   'file_path', 'filePath', 'path', 'target_file', 'target_directory', 'notebook_path',
   'pattern', 'glob', 'query', 'search', 'output_mode', 'url',
-  'old_string', 'new_string', 'oldText', 'newText', 'content', 'body', 'message', 'title', 'plan', 'todos', 'edits',
+  'old_string', 'new_string', 'oldString', 'newString', 'oldText', 'newText', 'content', 'body', 'message', 'title', 'plan', 'todos', 'edits',
   // MCP passthrough (Grok `use_tool`, Kimi `mcp__*`) and background-task handles.
   'tool_name', 'tool_input', 'task_id', 'task_ids',
 ]
@@ -215,6 +226,7 @@ export function extractSearchDocs(kind: HarnessKind, line: string): SearchDocDra
       case 'grok': return grokDocs(line)
       case 'devin': return devinDocs(line)
       case 'pi': return piDocs(line)
+      case 'opencode': return opencodeDocs(line)
     }
   } catch {
     return []
@@ -583,6 +595,55 @@ function piDocs(line: string): SearchDocDraft[] {
       builder.add('other', piContentText(message['content']))
       break
     // `system`, `toolResult`, and anything newer: not indexed.
+    default:
+      break
+  }
+  return builder.docs
+}
+
+// -- OpenCode ------------------------------------------------------------------
+
+/**
+ * OpenCode's synthesized `opencode.*` lines: the human half is a
+ * `role: 'user'` `opencode.message` whose authored parts classify `human`
+ * under `opencodeUserClass` (appended synthetic reminders ride inside a
+ * human message — `opencodeTextOf` keeps only non-synthetic text). Assistant
+ * parts index `text`/`reasoning`/`tool` calls from `state.input`; tool
+ * outputs (`state.output`/`state.error`), `finish`, `session` and `prune`
+ * records are never indexed.
+ */
+function opencodeDocs(line: string): SearchDocDraft[] {
+  const record = parseOpencodeLine(line)
+  if (record === null) return []
+  const builder = new DocBuilder(record.time)
+  switch (record.tag) {
+    case 'message': {
+      if (asString(record.msg['role']) !== 'user') break
+      if (opencodeUserClass(record.msg, record.parts).kind !== 'human') break
+      builder.add('human', opencodeTextOf(record.parts))
+      break
+    }
+    case 'part': {
+      switch (asString(record.part['type'])) {
+        case 'text':
+          builder.add('assistant', asString(record.part['text']) ?? '')
+          break
+        case 'reasoning':
+          builder.add('other', asString(record.part['text']) ?? '')
+          break
+        case 'tool': {
+          const state = isRecord(record.part['state']) ? record.part['state'] : undefined
+          builder.add('tool', renderToolCall(
+            asString(record.part['tool']) ?? 'tool',
+            state?.['input'],
+          ))
+          break
+        }
+        default:
+          break
+      }
+      break
+    }
     default:
       break
   }

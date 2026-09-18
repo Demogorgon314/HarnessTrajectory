@@ -27,6 +27,22 @@ export function devinDbPath(env: NodeJS.ProcessEnv = process.env): string {
 }
 
 /**
+ * The OpenCode data directory (`$XDG_DATA_HOME/opencode`, or
+ * `~/.local/share/opencode`): home of `opencode.db`, the SQLite session
+ * store (the legacy JSON tree under `storage/` was migrated into it).
+ * `HARNESS_TRAJECTORY_OPENCODE_DB` overrides the database file itself.
+ */
+export function opencodeDataDir(env: NodeJS.ProcessEnv = process.env): string {
+  const dataHome = env['XDG_DATA_HOME'] ?? join(homedir(), '.local', 'share')
+  return join(dataHome, 'opencode')
+}
+
+/** Absolute path of the OpenCode session store (existing or not — the caller stats it). */
+export function opencodeDbPath(env: NodeJS.ProcessEnv = process.env): string {
+  return resolve(env['HARNESS_TRAJECTORY_OPENCODE_DB'] ?? join(opencodeDataDir(env), 'opencode.db'))
+}
+
+/**
  * Resolve transcript roots, honouring the same overrides the harnesses use
  * (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `KIMI_CODE_HOME`, `GROK_HOME`,
  * `PI_CODING_AGENT_DIR`) plus explicit `HARNESS_TRAJECTORY_*` overrides.

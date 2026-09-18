@@ -9,6 +9,10 @@
  * - {@link DevinSource} (`devin/source.ts`) — the SQLite source: Devin CLI
  *   keeps its transcript forest in `sessions.db`, so its "files" are virtual
  *   per-chain streams materialized from `message_nodes`.
+ * - {@link OpencodeSource} (`opencode/source.ts`) — the other SQLite source:
+ *   OpenCode keeps V1 sessions in `opencode.db`, so its "files" are virtual
+ *   per-session streams emitted from the `message`/`part` tables (catalog
+ *   eagerly, transcript lazily).
  *
  * A source is a collection of line streams ("files", one main per session plus
  * child transcripts), session-list metadata, and a per-session pub/sub channel

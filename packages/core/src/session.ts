@@ -2,9 +2,9 @@
 
 import type { ImageAttachmentRef, TrajectorySnapshot } from './contract.ts'
 
-export type HarnessKind = 'claude' | 'codex' | 'kimi' | 'grok' | 'devin' | 'pi'
+export type HarnessKind = 'claude' | 'codex' | 'kimi' | 'grok' | 'devin' | 'pi' | 'opencode'
 
-export const HARNESS_KINDS: readonly HarnessKind[] = ['claude', 'codex', 'kimi', 'grok', 'devin', 'pi']
+export const HARNESS_KINDS: readonly HarnessKind[] = ['claude', 'codex', 'kimi', 'grok', 'devin', 'pi', 'opencode']
 
 /** A session counts as live when its transcript was written to this recently. */
 export const LIVE_WINDOW_MS = 2 * 60_000

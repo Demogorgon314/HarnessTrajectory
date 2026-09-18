@@ -7,7 +7,8 @@
 import {
   agentMentions, asArray, asNumber, asString, classifyInjectedUser, devinMessageClass, grokMessageClass, GrokPromptChunks,
   codexHumanPromptText, isRecord, isPiHumanPrompt, kimiMessageClass, kimiTitleText, parseDevinLine, parseGrokLine,
-  parseJsonLine, parsePiLine, parseTime, piContentText, titleFrom, type AgentFileMeta, type HarnessKind,
+  opencodeTextOf, opencodeUserClass, parseJsonLine, parseOpencodeLine, parsePiLine, parseTime, piContentText,
+  titleFrom, type AgentFileMeta, type HarnessKind,
 } from '@harness-trajectory/core'
 
 export interface FileHead {
@@ -75,7 +76,7 @@ export interface MetaScanner {
  * Bump when any scanner's logic changes: cached listing states from an older
  * version are discarded and the transcripts they covered are re-read.
  */
-export const META_SCANNER_VERSION = 5
+export const META_SCANNER_VERSION = 6
 
 /**
  * Serialized scanner payload for the listing cache: the public `state` plus
@@ -165,6 +166,7 @@ export function createMetaScanner(
     case 'grok': return grokMetaScanner(summary ?? null)
     case 'devin': return devinMetaScanner(summary ?? null)
     case 'pi': return piMetaScanner()
+    case 'opencode': return opencodeMetaScanner(summary ?? null)
   }
 }
 
@@ -650,6 +652,70 @@ function piMetaScanner(): MetaScanner {
   }
 }
 
+/**
+ * OpenCode keeps title/directory/model in the `session` row — handed in as
+ * `summary` (or refreshed by the `opencode.session` sidecar) — and its title
+ * lands late or starts as `New session - <iso>`, so it goes to `aiTitle`.
+ * The source feeds the catalog scanner only `role: 'user'` header lines
+ * (cheap listing facts without assistant bodies) and the materialized one
+ * the full stream; the shared `opencodeUserClass` decides human vs injected
+ * in both, so a prompt count never disagrees with the trajectory. The model
+ * falls back to the first assistant header's `modelID`.
+ */
+function opencodeMetaScanner(session: Record<string, unknown> | null): MetaScanner {
+  const state = emptyMeta()
+  // The `opencode.session` sidecar carries `directory`/`model.id`; the summary
+  // seed arrives pre-shaped (`cwd`, `model` as a plain string) like Devin's.
+  const seed = (record: Record<string, unknown>): void => {
+    const title = asString(record['title'])?.trim()
+    if (title !== undefined && title !== '') state.aiTitle = title
+    state.cwd = asString(record['directory']) ?? state.cwd
+    const model = isRecord(record['model']) ? record['model'] : undefined
+    state.model = asString(model?.['id']) ?? state.model
+    noteTime(state, record['createdAt'])
+    noteTime(state, record['updatedAt'])
+  }
+  if (session !== null) {
+    const title = asString(session['title'])?.trim()
+    if (title !== undefined && title !== '') state.aiTitle = title
+    state.cwd = asString(session['cwd']) ?? null
+    state.model = asString(session['model']) ?? null
+    noteTime(state, session['createdAt'])
+    noteTime(state, session['updatedAt'])
+  }
+  return {
+    state,
+    push(line) {
+      const record = parseOpencodeLine(line)
+      if (record === null) return
+      if (record.time !== null) noteTime(state, record.time)
+      switch (record.tag) {
+        case 'session':
+          seed(record.session)
+          break
+        case 'message': {
+          const role = asString(record.msg['role'])
+          if (role === 'assistant') {
+            state.model ??= asString(record.msg['modelID']) ?? null
+            break
+          }
+          if (role !== 'user') break
+          if (opencodeUserClass(record.msg, record.parts).kind !== 'human') break
+          state.promptCount += 1
+          const text = opencodeTextOf(record.parts)
+          if (state.title === null && text.trim() !== '') state.title = titleFrom(text)
+          break
+        }
+        case 'finish':
+          state.model ??= asString(record.msg['modelID']) ?? null
+          break
+        default:
+          break
+      }
+    },
+  }
+}
+
 /** Read identity facts from the first record of a transcript. */
 export function readHead(kind: HarnessKind, firstLine: string): FileHead {
   // Kimi identity is path-derived (`session_<id>/agents/<agentId>/wire.jsonl`); nothing to probe.
@@ -657,7 +723,8 @@ export function readHead(kind: HarnessKind, firstLine: string): FileHead {
   // parent's `subagents/<id>/meta.json`, not in the first record (GROK-FORMAT §D.4).
   // Devin's likewise (`devin://sessions/<id>` — the source derives chains, not the head).
   // pi's too (`<encoded-cwd>/<ts>_<id>.jsonl`; `parentSession` is fork lineage, not a child link).
-  if (kind === 'kimi' || kind === 'grok' || kind === 'devin' || kind === 'pi') {
+  // OpenCode's likewise (`opencode://sessions/<id>` — the source derives children from `parent_id`).
+  if (kind === 'kimi' || kind === 'grok' || kind === 'devin' || kind === 'pi' || kind === 'opencode') {
     return { id: null, parentId: null }
   }
   const record = parseJsonLine(firstLine)

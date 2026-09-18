@@ -1,7 +1,7 @@
 # Harness Trajectory
 
 A local viewer for coding-agent sessions. It reads the transcripts that **Claude Code**,
-**Codex**, **Kimi Code**, **Grok Build**, **Devin CLI**, and **pi** write on your machine and renders each session
+**Codex**, **Kimi Code**, **Grok Build**, **Devin CLI**, **pi**, and **OpenCode** write on your machine and renders each session
 as a turn-by-turn trajectory with timing, token usage, subagents, and a context dashboard.
 Live sessions update as they run. Nothing leaves your machine.
 
@@ -97,6 +97,7 @@ card opens the rule editor directly.
 | `PI_CODING_AGENT_DIR` | `~/.pi/agent` | pi agent home (`<home>/sessions` is scanned) |
 | `HARNESS_TRAJECTORY_{CLAUDE,CODEX,KIMI,GROK,PI}_ROOT` | derived | Point one harness at an arbitrary directory |
 | `HARNESS_TRAJECTORY_DEVIN_DB` | `$XDG_DATA_HOME/devin/cli/sessions.db`, else `~/.local/share/devin/cli/sessions.db` | Devin CLI session store — read directly (read-only); no transcript files exist |
+| `HARNESS_TRAJECTORY_OPENCODE_DB` | `$XDG_DATA_HOME/opencode/opencode.db`, else `~/.local/share/opencode/opencode.db` | OpenCode V1 session store — read directly (read-only); no transcript files exist |
 | `HARNESS_TRAJECTORY_CACHE_DIR` | `$XDG_CACHE_HOME/harness-trajectory`, else `~/.cache/harness-trajectory` | Holds `search.sqlite` and `settings.json`, the only files the server writes |
 | `HARNESS_TRAJECTORY_SEARCH` | off | `1`, `true`, or `on` forces indexing on for the launch; otherwise the Content search toggle in `settings.json` decides. While off, `/api/search` answers `{ "enabled": false }` |
 | `HARNESS_TRAJECTORY_NO_OPEN` | off | `1`, `true`, or `on` skips opening the default browser (same as `--no-open`). SSH sessions never open one. |
@@ -121,12 +122,16 @@ view and the context synthesizer for the Context tab. Replays merge a session wi
 subagent transcripts by timestamp. Parsers never throw on malformed or unknown records, so a
 newer harness version degrades to "unknown record" rather than a blank page.
 
-Devin CLI is the exception: it keeps sessions in a SQLite store (`sessions.db`), so the
-server's `DevinSource` reads it read-only and materializes the message forest as virtual
-line streams (`devin://sessions/<id>` URIs — nothing is written to disk). Context renders
-duplicate the chain under shared `message_id`s, so the logical transcript dedupes them;
+Devin CLI and OpenCode are the exceptions: both keep sessions in a SQLite store
+(`sessions.db` and `opencode.db`), so the server reads them read-only and materializes
+virtual line streams (`devin://sessions/<id>` and `opencode://sessions/<id>` URIs —
+nothing is written to disk). Devin's store is a message forest: chains duplicate
+context under shared `message_id`s, so the logical transcript dedupes them, and
 subagent chains are the forest components disjoint from the main chain, named by the
-`subagent/agent_id` metadata on the spawning `run_subagent` result.
+`subagent/agent_id` metadata on the spawning `run_subagent` result. OpenCode's store is
+flat `message`/`part` rows per session; transcripts are emitted lazily (the catalog of
+sessions is read eagerly, message/part bodies only when a session is opened), and child
+sessions are bound to the parent's `task` tool call by `state.metadata.sessionId`.
 
 Adding a harness means one adapter, one synthesizer, a server root and classifier, and a
 web registry entry. See [AGENTS.md](AGENTS.md) for the checklist and per-harness format
@@ -151,6 +156,8 @@ Tests use hand-written synthetic records only. Never commit real transcript cont
   is `[1m]`. Grok Build assumes 500k unless a compaction record reports one. Devin CLI
   records neither a window nor per-request prompts — the Context tab shows what the store
   carries (per-call `input_tokens`, `ttft_ms`, tool durations from `tool_call_state`).
+  OpenCode records no window either; usage buckets are disjoint (output excludes
+  reasoning, input excludes cache), so request input is input + cache read + cache write.
 - **System prompt and tool schemas.** Only newer Claude Code transcripts record them. Codex
   records instructions but no schemas. Grok Build keeps both outside the JSONL and newest
   builds only write the schemas.
@@ -181,5 +188,5 @@ MIT, except where noted:
   and is Apache-2.0, see `packages/context/LICENSE` and `NOTICE`.
 - Harness marks use path data from [Simple Icons](https://simpleicons.org) (CC0) and
   [lobe-icons](https://github.com/lobehub/lobe-icons) (MIT); the Devin and pi marks are drawn
-  in-house. Claude, Codex, Kimi, Grok, and Devin are
+  in-house, and the OpenCode mark is an in-house monogram. Claude, Codex, Kimi, Grok, Devin, and OpenCode are
   trademarks of their respective owners. This project is not affiliated with any of them.

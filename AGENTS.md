@@ -1,6 +1,6 @@
 # harness-trajectory — agent guide
 
-Local viewer for Claude Code, Codex, Kimi Code, Grok Build, Devin CLI, and pi sessions.
+Local viewer for Claude Code, Codex, Kimi Code, Grok Build, Devin CLI, pi, and OpenCode sessions.
 Trajectory is ported from deepseek-harness; Context is ported from dsh-context.
 Transcripts stay local. Harness roots are read-only.
 
@@ -52,6 +52,7 @@ pnpm pack:cli                     # build and pack the npm CLI tarball
 | `apps/server/src/source.ts` | `SessionSource`, shared `SessionBook`, `CompositeSource` |
 | `apps/server/src/index.ts` | Filesystem `SessionIndex`: scan, classify, replay, tail JSONL |
 | `apps/server/src/devin/` | SQLite-backed source for virtual `devin://sessions/<id>` streams |
+| `apps/server/src/opencode/` | SQLite-backed source for virtual `opencode://sessions/<id>` streams |
 | `apps/server/src/meta.ts` | Listing scanners, serializable metadata, child-agent facts |
 | `apps/server/src/search/` | Full-text index; contracts in `packages/core/src/search.ts` |
 | `apps/server/src/settings.ts` | `settings.json` persistence and settings controller |
