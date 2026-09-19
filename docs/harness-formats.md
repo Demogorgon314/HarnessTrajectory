@@ -106,8 +106,15 @@ All four layers (adapter, synth, meta, search) share this classifier.
 
 ### Children and retained context
 
-Children are top-level rollouts with `parent_thread_id`; `session_meta.source.subagent` names
-them. A child's own `task_complete` ends its run but not its life — only a later
+Children are top-level rollouts with `parent_thread_id`. Their display names use
+`session_meta.agent_path` (or `source.subagent.thread_spawn.agent_path`), then
+`agent_nickname` from either location. `thread_spawn` is a source variant, not an
+agent's name; legacy `source.subagent.other` descriptions and string sources
+remain supported. Trajectory and Context share this identity decoder. Named
+children also publish that name in their listing metadata and standalone
+Trajectory/Chat title, so entering a child keeps its identity instead of falling
+back to the UUID. Scanner version 9 invalidates older cached child descriptions.
+A child's own `task_complete` ends its run but not its life — only a later
 `task_started` reopens it; late statistics or state records update the finished run without
 spawning a new one. `subagent_history_start_ordinal` marks where its own records begin
 (inherited parent history before it is not the child's activity); the boundary travels on

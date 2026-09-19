@@ -335,20 +335,36 @@ export function codexCommandMatches(command: string, argsRaw: string): boolean {
   return codexCommandOf({ command: value }) === command
 }
 
-function subagentLabel(payload: Record<string, unknown>): string {
+/** Canonical task paths identify modern agents; older builds assign nicknames. */
+export function codexAgentName(payload: Record<string, unknown>): string | undefined {
   const source = payload['source']
+  const subagent = isRecord(source) ? source['subagent'] : undefined
+  const spawn = isRecord(subagent) && isRecord(subagent['thread_spawn']) ? subagent['thread_spawn'] : undefined
+  for (const value of [payload['agent_path'], spawn?.['agent_path'], payload['agent_nickname'], spawn?.['agent_nickname']]) {
+    const name = asString(value)?.trim()
+    if (name) return name
+  }
+  return undefined
+}
+
+/** Older agent sources carry descriptions rather than a named agent identity. */
+export function codexSubagentLabel(payload: Record<string, unknown>): string | undefined {
+  const name = codexAgentName(payload)
+  if (name !== undefined) return name
+  const source = payload['source']
+  const subagent = isRecord(source) ? source['subagent'] : undefined
   if (isRecord(source)) {
-    const subagent = source['subagent']
     if (isRecord(subagent)) {
       for (const value of Object.values(subagent)) {
         if (typeof value === 'string' && value !== '') return value
       }
       const [firstKey] = Object.keys(subagent)
-      if (firstKey !== undefined) return firstKey
+      if (firstKey !== undefined && firstKey !== 'thread_spawn') return firstKey
     }
     if (typeof subagent === 'string' && subagent !== '') return subagent
   }
-  return asString(payload['thread_source']) ?? 'subagent'
+  return asString(payload['thread_source'])
+    ?? (subagent !== undefined || asString(payload['parent_thread_id']) !== undefined ? 'subagent' : undefined)
 }
 
 class CodexParser implements SessionParser {
@@ -533,6 +549,10 @@ class CodexParser implements SessionParser {
   // ---------------------------------------------------------------------------
 
   private handleSessionMeta(payload: Record<string, unknown>, time: number): void {
+    const source = payload['source']
+    if (asString(payload['parent_thread_id']) !== undefined || (isRecord(source) && source['subagent'] !== undefined)) {
+      this.title ??= codexAgentName(payload) ?? null
+    }
     this.startedAt ??= parseTime(payload['timestamp']) ?? time
     this.cwd ??= asString(payload['cwd']) ?? null
     // Persisted as a stringified number (`"24"`) in some builds.
@@ -1371,7 +1391,7 @@ class CodexParser implements SessionParser {
     if (type !== 'session_meta' && boundary !== undefined && ordinal !== undefined && ordinal < boundary) return
     let child = this.children.get(file.id)
     if (child === undefined) {
-      const label = type === 'session_meta' ? subagentLabel(payload) : 'subagent'
+      const label = type === 'session_meta' ? codexSubagentLabel(payload) ?? 'subagent' : 'subagent'
       const threadId = file.id
       child = {
         callId: `subagent:${file.id}`, fileId: file.id, threadId, label, startedAt: time,

@@ -19,7 +19,7 @@
  */
 
 import type { SessionFileRef } from '@harness-trajectory/core'
-import { asArray, asNumber, asString, codexCommandMatches, codexCommandOf, codexReasoningText, codexUserItems, isRecord, parseJsonLine, parseTime } from '@harness-trajectory/core'
+import { asArray, asNumber, asString, codexCommandMatches, codexCommandOf, codexReasoningText, codexSubagentLabel, codexUserItems, isRecord, parseJsonLine, parseTime } from '@harness-trajectory/core'
 import type { ContentBlock, MessageSource, StreamRecord, TimelineEvent } from '../fold/event.ts'
 import type { FileOpInput } from '../fold/fold.ts'
 import type { AgentSpawn, EventSynthesizer, SynthMeta } from './types.ts'
@@ -341,7 +341,7 @@ class CodexSynthesizer implements EventSynthesizer {
     // A subagent / guardian thread has no human prompt of its own (verified:
     // the first message of all 13 sampled child rollouts is a `developer` one),
     // so the Agent Network would show it unlabelled. `session_meta.source`
-    // names it — the same fallback the trajectory adapter's `subagentLabel` uses.
+    // names it — shared with the trajectory adapter's identity decoder.
     const source = payload['source']
     if (asString(payload['parent_thread_id']) !== undefined
       || (isRecord(source) && source['subagent'] !== undefined)) {
@@ -1487,26 +1487,11 @@ function lineCount(text: string): number {
 }
 
 /**
- * A subagent thread's own name: `session_meta.source.subagent` holds one
- * descriptive string under a build-specific key, and `thread_source` names the
- * flavour (`subagent`, `guardian_review`). Mirrors core's `subagentLabel`.
+ * Apply Context's label length limit to the shared Codex identity decoding.
  */
 function subagentLabelOf(payload: Record<string, unknown>): string | undefined {
-  const source = payload['source']
-  if (isRecord(source)) {
-    const subagent = source['subagent']
-    if (isRecord(subagent)) {
-      for (const value of Object.values(subagent)) {
-        if (typeof value === 'string' && value !== '') return labelOf(value)
-      }
-      const [firstKey] = Object.keys(subagent)
-      if (firstKey !== undefined) return firstKey
-    }
-    if (typeof subagent === 'string' && subagent !== '') return labelOf(subagent)
-  }
-  const threadSource = asString(payload['thread_source'])
-  if (threadSource !== undefined && threadSource !== '') return threadSource
-  return asString(payload['parent_thread_id']) === undefined ? undefined : 'subagent'
+  const name = codexSubagentLabel(payload)
+  return name === undefined ? undefined : labelOf(name)
 }
 
 /** Human-readable label for an unattributed file-activity item. */

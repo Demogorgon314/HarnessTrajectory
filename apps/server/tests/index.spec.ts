@@ -1519,6 +1519,18 @@ describe('SessionIndex Codex lineage and compression', () => {
     expect(index.hasChild('codex', THREAD, CHILD)).toBe(true)
   })
 
+  it('publishes Codex agent names in child listing metadata', async () => {
+    await writeFile(rolloutPath(`rollout-2026-09-14T10-00-00-${THREAD}`), jsonl([codexMeta(THREAD, 0)]))
+    await writeFile(rolloutPath(`rollout-2026-09-14T10-00-00-${FORK_THREAD}`), jsonl([
+      codexMeta(FORK_THREAD, 10, THREAD, {
+        agent_path: '/root/review', agent_nickname: 'Ada',
+        source: { subagent: { thread_spawn: { parent_thread_id: THREAD, depth: 1 } } },
+      }),
+    ]))
+    await startIndex()
+    expect(index.get('codex', THREAD)?.children[0]?.file.agent?.description).toBe('/root/review')
+  })
+
   it('indexes child-owned ordinals with a missing base and preserves physical search anchors', async () => {
     const store = new SearchStore({ path: ':memory:' })
     const search = new SearchIndexer({ store, extract: extractSearchDocs, maxAgeDays: 0 })

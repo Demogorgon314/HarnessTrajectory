@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { act, cleanup, render, screen } from '@testing-library/react'
 import { createTrajectoryDurationStore, createTrajectoryTranslate } from '@harness-trajectory/ui'
 import type { SessionFileRef, SessionLiveEvent, SubagentRun } from '@harness-trajectory/core'
+import { createCodexParser } from '@harness-trajectory/core'
 import type { Route } from '../src/App.tsx'
 import { SessionPane, subagentRows } from '../src/SessionPane.tsx'
 
@@ -101,6 +102,21 @@ afterEach(() => {
 })
 
 describe('subagentRows titles', () => {
+  test('keeps Codex agent names in the parent catalog and the standalone child view', () => {
+    const file: SessionFileRef = { id: 'child', role: 'child', parentId: 'parent', path: '/tmp/child.jsonl' }
+    const header = JSON.stringify({ type: 'session_meta', timestamp: new Date(T0).toISOString(), payload: {
+      id: file.id, parent_thread_id: 'parent', agent_path: '/root/review',
+      source: { subagent: { thread_spawn: { parent_thread_id: 'parent', depth: 1 } } },
+    } })
+    const parent = createCodexParser()
+    parent.push(header, file)
+    expect(subagentRows(parent.subagents(), [])[0]?.title).toBe('/root/review')
+    const standalone = createCodexParser()
+    standalone.push(header, { ...file, role: 'main' })
+    expect(standalone.meta().title).toBe('/root/review')
+    expect(subagentRows([], [{ file, bytes: 10, updatedAt: T0 }], { fileId: file.id, title: standalone.meta().title })[0]?.title)
+      .toBe('/root/review')
+  })
   test('a bound run titles the row by its description', () => {
     const rows = subagentRows(
       [run('agent-1', { callId: 'c1', description: 'Survey the repo', agentType: 'explore', status: 'completed' })],

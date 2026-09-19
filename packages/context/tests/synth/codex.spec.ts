@@ -1264,6 +1264,15 @@ describe('codex synthesizer', () => {
       expect(synth.meta().label).toBe('review the diff')
     })
 
+    it('uses the canonical spawned-agent path as the standalone Context label', () => {
+      const { synth } = run([sessionMeta(0, {
+        parent_thread_id: 'thread-parent',
+        agent_nickname: 'Ada',
+        source: { subagent: { thread_spawn: { parent_thread_id: 'thread-parent', agent_path: '/root/review' } } },
+      })])
+      expect(synth.meta().label).toBe('/root/review')
+    })
+
     it('falls back to thread_source when the subagent carries no name', () => {
       const { synth } = run([sessionMeta(0, { parent_thread_id: 'thread-parent', thread_source: 'guardian_review', source: {} })])
       expect(synth.meta().label).toBe('guardian_review')

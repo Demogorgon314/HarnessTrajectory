@@ -12,6 +12,7 @@ export { createClaudeParser, classifyInjectedUser } from './claude.ts'
 export {
   createCodexParser, isCodexHumanPrompt, codexUserItems, codexHumanPromptText,
   codexReasoningText, codexCommandOf, codexCommandMatches,
+  codexAgentName, codexSubagentLabel,
   type CodexUserItem,
 } from './codex.ts'
 export {

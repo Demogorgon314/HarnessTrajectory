@@ -334,6 +334,24 @@ describe('codex adapter', () => {
     expect(requests.find(item => item.purpose === 'compaction')).toBeUndefined()
   })
 
+  it.each([
+    { identity: { agent_path: '/root/review', agent_nickname: 'Ada' }, expected: '/root/review' },
+    { identity: { source: { subagent: { thread_spawn: { parent_thread_id: 'thread-main', agent_path: '/root/review', agent_nickname: 'Ada' } } } }, expected: '/root/review' },
+    { identity: { agent_nickname: 'Ada' }, expected: 'Ada' },
+    { identity: { source: { subagent: { thread_spawn: { parent_thread_id: 'thread-main', agent_nickname: 'Ada' } } } }, expected: 'Ada' },
+    { identity: { agent_path: ' ', agent_nickname: '' }, expected: 'subagent' },
+  ])('uses a spawned agent name instead of the thread_spawn variant', ({ identity, expected }) => {
+    const parser = createCodexParser()
+    parser.push(sessionMeta(0), MAIN)
+    parser.push(taskStarted(1_000, 'turn-1'), MAIN)
+    parser.push(line('session_meta', {
+      id: CHILD.id, parent_thread_id: MAIN.id,
+      source: { subagent: { thread_spawn: { parent_thread_id: MAIN.id, depth: 1 } } },
+      ...identity,
+    }, 2_000), CHILD)
+    expect(parser.subagents()[0]?.description).toBe(expected)
+  })
+
   it('nests a child thread under a synthetic subagent call', () => {
     const parser = createCodexParser()
     const main = [

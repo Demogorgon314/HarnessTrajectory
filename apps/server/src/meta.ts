@@ -6,7 +6,7 @@
 
 import {
   agentMentions, asArray, asNumber, asString, classifyInjectedUser, devinMessageClass, grokMessageClass, GrokPromptChunks,
-  codexHumanPromptText, dshSubagentIdOf, dshTextOf, dshToolResultOf, dshUserClass, isRecord, isPiHumanPrompt,
+  codexAgentName, codexHumanPromptText, dshSubagentIdOf, dshTextOf, dshToolResultOf, dshUserClass, isRecord, isPiHumanPrompt,
   kimiMessageClass, kimiTitleText,
   parseDevinLine, parseDshLine, parseGrokLine,
   opencodeTextOf, opencodeUserClass, parseJsonLine, parseOpencodeLine, parsePiLine, parseTime, piContentText,
@@ -78,7 +78,7 @@ export interface MetaScanner {
  * Bump when any scanner's logic changes: cached listing states from an older
  * version are discarded and the transcripts they covered are re-read.
  */
-export const META_SCANNER_VERSION = 8
+export const META_SCANNER_VERSION = 9
 
 /**
  * Serialized scanner payload for the listing cache: the public `state` plus
@@ -312,6 +312,10 @@ function codexMetaScanner(): MetaScanner {
       switch (record['type']) {
         case 'session_meta':
           state.cwd ??= asString(payload['cwd']) ?? null
+          if (asString(payload['parent_thread_id']) !== undefined
+            || (isRecord(payload['source']) && payload['source']['subagent'] !== undefined)) {
+            state.title ??= codexAgentName(payload) ?? null
+          }
           break
         case 'turn_context':
           state.model ??= asString(payload['model']) ?? null
