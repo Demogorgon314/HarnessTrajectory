@@ -14,6 +14,9 @@ import { createCodexParser } from '@harness-trajectory/core'
 import type { Route } from '../src/App.tsx'
 import { SessionPane, subagentRows } from '../src/SessionPane.tsx'
 
+// The header's canvas animation is outside these subagent identity tests.
+vi.mock('thinking-orbs', () => ({ ThinkingOrb: () => null }))
+
 const t = createTrajectoryTranslate('en')
 const durationStore = createTrajectoryDurationStore()
 

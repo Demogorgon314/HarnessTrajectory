@@ -828,6 +828,11 @@
 }
 
 .paneStatus {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  min-height: 20px;
   font-size: 12px;
   line-height: 18px;
   color: var(--dsw-alias-label-tertiary);
@@ -858,15 +863,6 @@
 
 .paneMetaItem code {
   font-family: var(--ds-font-family-code);
-}
-
-.live {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex: none;
-  width: 20px;
-  height: 20px;
 }
 
 .paneResume {

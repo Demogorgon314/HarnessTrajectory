@@ -12,6 +12,9 @@ import type { SessionLiveEvent } from '@harness-trajectory/core'
 import type { Route } from '../src/App.tsx'
 import { SessionPane } from '../src/SessionPane.tsx'
 
+// The header's canvas animation is outside these resume-command tests.
+vi.mock('thinking-orbs', () => ({ ThinkingOrb: () => null }))
+
 const t = createTrajectoryTranslate('en')
 const durationStore = createTrajectoryDurationStore()
 

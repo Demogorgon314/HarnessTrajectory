@@ -36,6 +36,11 @@ const TAB_LABELS: Record<'en' | 'zh', Record<SessionTab, string>> = {
   zh: { trajectory: '轨迹', chat: '对话', context: '上下文' },
 }
 
+const CONNECTION_LABELS = {
+  en: { loading: 'Loading history…', reconnecting: 'Reconnecting…', synced: 'Live sync', error: 'Disconnected' },
+  zh: { loading: '加载记录中', reconnecting: '重新连接中', synced: '实时同步', error: '连接中断' },
+}
+
 const { IconCheckOutline16, IconCopyOutline16 } = icons
 
 function formatBytes(bytes: number): string {
@@ -310,6 +315,12 @@ export function SessionPane({ route, summary: listSummary, onNavigate, t, locale
     [state.subagents, state.children, file, state.meta.title],
   )
   const sessionLive = summary?.live === true
+  const connection = state.error !== null ? 'error'
+    : !state.connected ? 'reconnecting' : state.loading ? 'loading' : 'synced'
+  const connectionLabel = CONNECTION_LABELS[locale][connection]
+  const orbState = connection === 'loading' ? 'breathing'
+    : connection === 'reconnecting' ? 'connecting'
+      : connection === 'synced' && sessionLive ? 'working' : null
   /*
    * The subagent a view is ABOUT, whichever tab shows it: the trajectory folds
    * that one file (`route.file`, a stream of its own), the Context tab folds
@@ -367,21 +378,24 @@ export function SessionPane({ route, summary: listSummary, onNavigate, t, locale
           <h1 className={css.paneTitle} title={agentFile === null ? (summary?.title ?? id) : agentFile}>
             {agentFile === null ? (summary?.title ?? id) : agentTitle}
           </h1>
-          {sessionLive && (
-            <Tooltip label={locale === 'zh' ? '会话正在活动' : 'Session is active'} delayMs={500}>
-              <span className={css.live}>
+          <Tooltip
+            label={connection === 'synced' && sessionLive
+              ? (locale === 'zh' ? '会话正在活动，实时接收更新' : 'Session is active; receiving live updates')
+              : connectionLabel}
+            delayMs={500}
+          >
+            <span className={css.paneStatus} data-connected={state.connected || undefined} role="status">
+              {orbState !== null && (
                 <ThinkingOrb
-                  state="working"
+                  state={orbState}
                   size={20}
                   theme={theme === 'system' ? 'auto' : theme}
-                  aria-label={locale === 'zh' ? '会话正在活动' : 'Session is active'}
+                  aria-hidden="true"
                 />
-              </span>
-            </Tooltip>
-          )}
-          <span className={css.paneStatus} data-connected={state.connected || undefined}>
-            {state.loading ? 'loading…' : state.connected ? 'following' : 'disconnected'}
-          </span>
+              )}
+              {connectionLabel}
+            </span>
+          </Tooltip>
           {rows.length > 0 && (
             <SubagentCatalog
               rows={rows}
