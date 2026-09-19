@@ -6,7 +6,11 @@ export const chatLabels = {
     earlier: 'Load earlier messages', latest: 'Jump to latest', empty: 'No messages yet',
     loading: 'Loading conversation…', missing: 'The requested record is not available in this conversation.',
     copy: 'Copy', copied: 'Copied', copyFailed: 'Copy failed', footnotes: 'Footnotes',
-    noOutput: 'No output',
+    noOutput: 'No output', resizeWidth: 'Resize conversation width',
+    turns: 'Turn navigation',
+    turnLabel: (turn: number) => `Turn ${turn}`,
+    jumpToTurn: (turn: number) => `Jump to turn ${turn}`,
+    jumpToTurnLoad: (turn: number) => `Jump to turn ${turn} (loads earlier messages)`,
   },
   zh: {
     chat: '对话', thinking: '思考', context: '上下文', compaction: '对话已压缩',
@@ -15,7 +19,11 @@ export const chatLabels = {
     earlier: '加载更早的消息', latest: '跳到最新消息', empty: '暂无消息',
     loading: '正在加载对话…', missing: '此对话中没有可定位的对应记录。',
     copy: '复制', copied: '已复制', copyFailed: '复制失败', footnotes: '脚注',
-    noOutput: '无输出',
+    noOutput: '无输出', resizeWidth: '调整对话宽度',
+    turns: '轮次导航',
+    turnLabel: (turn: number) => `第 ${turn} 轮`,
+    jumpToTurn: (turn: number) => `跳到第 ${turn} 轮`,
+    jumpToTurnLoad: (turn: number) => `跳到第 ${turn} 轮（加载更早的消息）`,
   },
 }
 export type ChatLabels = typeof chatLabels.en

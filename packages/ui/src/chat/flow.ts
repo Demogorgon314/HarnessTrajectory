@@ -4,6 +4,13 @@ export type ChatFlowEntry =
   | { kind: 'message'; index: number }
   | { kind: 'process'; turn: number; indexes: number[]; reasoningIndex?: number; messages: number; tools: number }
 
+/** Turn a node belongs to: its own field when it carries one, else its recorded location. */
+export function chatNodeTurn(node: ConversationNode, snapshot: TrajectorySnapshot): number | undefined {
+  if ('turn' in node) return node.turn
+  const location = snapshot.eventLocations.get(node.seq)
+  return location?.kind === 'step' || location?.kind === 'turn' ? location.turn.turn : undefined
+}
+
 /** Completed assistant tails own actions; preceding activity becomes a compact process. */
 export function chatFlow(nodes: readonly ConversationNode[], snapshot: TrajectorySnapshot, start: number) {
   const lastByTurn = new Map<number, number>()
@@ -35,9 +42,7 @@ export function chatFlow(nodes: readonly ConversationNode[], snapshot: Trajector
   for (let index = start; index < nodes.length; index++) {
     const node = nodes[index]
     if (node === undefined) continue
-    const location = snapshot.eventLocations.get(node.seq)
-    const turn = node.kind === 'assistant' ? node.turn
-      : location?.kind === 'step' || location?.kind === 'turn' ? location.turn.turn : undefined
+    const turn = chatNodeTurn(node, snapshot)
     const answer = turn === undefined ? undefined : lastByTurn.get(turn)
     const inlineReasoning = answer === index && compactAnswers.has(index) && node.kind === 'assistant'
       && node.blocks.some(block => block.kind === 'reasoning')

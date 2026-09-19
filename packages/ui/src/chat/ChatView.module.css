@@ -1,7 +1,9 @@
 /* Viewer integration only. The other modules are unmodified upstream styles. */
 .root {
-  /* Same adaptive axis as ConversationRoot; the viewer has no width handle. */
-  --dsh-chat-content-width: clamp(680px, calc(var(--dsh-conversation-column-width, 0px) * 0.64), 920px);
+  /* Same adaptive axis as ConversationRoot, with the --dsh-chat-user-width
+     layer the width handles publish while dragging. */
+  --dsh-chat-content-width: var(--dsh-chat-user-width,
+    clamp(680px, calc(var(--dsh-conversation-column-width, 0px) * 0.64), 920px));
   --dsh-composer-side-clearance: 16px;
   min-width: 0;
   color: var(--dsw-alias-label-primary);
@@ -9,7 +11,17 @@
      and running sweeps use the same token and must not inherit the shell layer. */
   background: var(--dsw-alias-bg-base);
 }
-.scroll { overflow-anchor: none; }
+.scroll {
+  overflow-anchor: none;
+  /* The upstream scrollBody reservations on the viewer's own scroller: the
+     gutter stays reserved so a scrollbar appearing mid-replay never shifts
+     the column sideways, and the bar floats 2px clear of the pane edge. */
+  scrollbar-gutter: stable;
+  margin-right: 2px;
+}
+/* The bar also stops 2px short of the scroller's ends, matching its edge
+   offset. WebKit-only: the Firefox path has no track to inset. */
+.scroll::-webkit-scrollbar-track { margin: 2px; }
 .message { min-width: 0; scroll-margin: 24px; border-radius: 10px; }
 .message[data-selected] { outline: 2px solid var(--dsw-alias-button-info-fill); outline-offset: 8px; }
 .plain { white-space: pre-wrap; overflow-wrap: anywhere; }

@@ -29,6 +29,8 @@ Source checkout: `ddefc45fbc7f8e46dd73185e68295696d1297887`.
 | `TurnUsagePanel.module.css` | `ui-chat/src/client/chat/TurnUsagePanel.module.css` |
 | `ContextInjectionRow.module.css` | `ui-chat/src/client/chat/ContextInjectionRow.module.css` |
 | `stat-dialog.module.css` | `ui-chat/src/client/chat/stat-dialog.module.css` |
+| `WidthHandle.module.css` | `ui-conversation/src/client/skeleton/ConversationRoot.module.css` (the `.widthHandle` block; the composer-overlay suppression rule does not apply here) |
+| `TurnNavigator.module.css` | `ui-chat/src/client/chat/TurnNavigator.module.css` (the band height is the component's own scrollport measurement rather than host-published viewport/composer vars, and the busy-mark state is dropped) |
 
 The shared theme also loads the verbatim `ui-theme/src/styles/gradient-shadow-text.css`:
 the Markdown font ladder and elevation tokens are dependencies of these sheets,
@@ -52,6 +54,32 @@ the full IN/OUT record alongside it; input arguments are not proof of an applied
 Keep viewer adaptations in `ChatView.module.css`, so upstream styles can be
 compared and refreshed without mixing local changes into them. The viewer
 supplies the column width variables normally owned by the conversation host.
+`WidthControls.tsx` adapts `ui-conversation`'s `ConversationWidthControls.tsx`
+to that role: it installs the same `--dsh-chat-content-width` axis (measured
+column plus the `--dsh-chat-user-width` drag preference persisted to
+localStorage) and renders the two edge strips. Upstream elects the controls
+through a factory slot and gates them on the active phase; this viewer mounts
+them unconditionally inside ChatView's root, and the strips' wheel forwarding
+targets the sibling marked `data-chat-scroll`.
+The committed width lives in memory; storage is best-effort persistence, so a
+failed write does not undo a drag or change subsequent cancellation behavior.
+`TurnNavigator.tsx` ports `ui-chat`'s turn rail (`TurnNavigator.tsx` with
+`turn-rail-items.ts`/`turn-navigation.ts`). `createTurnRailSelector` groups the loaded
+nodes by recorded turn instead of reading a host turn outline, and a mark
+whose turn starts above the paged window extends `start` rather than fetching
+a page — history is local here. The component measures the scrollport band
+itself, since the viewer has no composer or viewport publisher. Rows carry
+`data-chat-turn` through `chatNodeTurn`, the same resolver `flow.ts` groups
+processes with.
+Each view retains unchanged navigation arrays and caches previews by immutable
+node identity. Unrelated streaming updates therefore leave the rail's manual
+scroll position alone. Locations are rechecked on every snapshot to account for
+late turn attribution; the scroll observer stays attached and queued animation
+frames sample the latest committed navigation data.
+New navigation, search, paging, and return-to-latest actions clear older deferred
+landings and prepend corrections. The rail observes its actual viewport height
+through CSS transitions to keep the active mark visible, except while the reader's
+pointer is working the rail.
 Only explicitly closed turns whose activity is fully paged in default to the
 compact process presentation, including reasoning attached to the final answer;
 open and unknown turns remain expanded. Search

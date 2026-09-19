@@ -1,0 +1,76 @@
+/* Width handles (excerpted from dsh ui-conversation ConversationRoot.module.css):
+   10px col-resize strips beside the transcript, absolute in the ChatView .root
+   (NOT the scrollport: an absolute strip there would extend the scrollable
+   range). The inner edge sits 24px outside the content column and the strip
+   extends 10px outward; the outer edge is clamped to keep a 24px safe zone
+   against the column edges (sidebar side and scrollbar side stay drag-free).
+   When the margin cannot fit inset + strip + safe zone the computed width goes
+   negative and the strip resolves to zero — no mispositioned hit area on
+   narrow columns. Known half-scrollbar (~4px) centering offset vs the
+   gutter-reserved content box is accepted: it consumes part of the 10px
+   strip but remains within it. */
+.widthHandle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  /* Selected rows and other concrete content paint above the resting strip. */
+  z-index: 0;
+  width: min(
+    10px,
+    calc((100% - var(--dsh-chat-content-width)) / 2 - 24px - 24px)
+  );
+  cursor: col-resize;
+}
+
+.widthHandle[data-side='left'] {
+  right: calc(50% + var(--dsh-chat-content-width) / 2 + 24px);
+}
+
+.widthHandle[data-side='right'] {
+  left: calc(50% + var(--dsh-chat-content-width) / 2 + 24px);
+}
+
+/* The glow: a short 2px bar riding the pointer's Y, centered in the strip
+   (29px from the content column), not a full-height rule — a 16px solid core
+   centered on the pointer
+   (published by pointermove as --dsh-width-handle-pointer-y), fading to
+   transparent over 28px each side (72px total). A solid CORE, not a single
+   solid stop: a lone peak washes out over the fade. The resting scrollbar
+   tint keeps this secondary affordance quiet in both themes. Before the first
+   move the fallback centers the glow at 50% height. */
+.widthHandle::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  border-radius: 2px;
+  background: linear-gradient(
+    to bottom,
+    transparent calc(var(--dsh-width-handle-pointer-y, 50%) - 36px),
+    var(--dsw-alias-scrollbar-bg-l1) calc(var(--dsh-width-handle-pointer-y, 50%) - 8px),
+    var(--dsw-alias-scrollbar-bg-l1) calc(var(--dsh-width-handle-pointer-y, 50%) + 8px),
+    transparent calc(var(--dsh-width-handle-pointer-y, 50%) + 36px)
+  );
+  opacity: 0;
+  pointer-events: none;
+}
+
+.widthHandle[data-side='left']::after {
+  right: 4px;
+}
+
+.widthHandle[data-side='right']::after {
+  left: 4px;
+}
+
+.widthHandle:hover::after,
+.widthHandle[data-dragging]::after {
+  opacity: 1;
+}
+
+/* Lift only the active handle while a drag crosses other chrome; resting
+   strips keep z-index 0 so they never steal clicks from content. */
+.widthHandle[data-dragging] {
+  z-index: 8;
+}
