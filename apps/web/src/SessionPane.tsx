@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { ThinkingOrb } from 'thinking-orbs'
 import type {
   HarnessKind, SessionChildSummary, SessionSummary, SubagentRun, SubagentStatus,
 } from '@harness-trajectory/core'
@@ -13,6 +14,7 @@ import { HarnessMark, harnessMeta } from './harnesses.tsx'
 import { relativeTime } from './SessionList.tsx'
 import { SessionRuntime } from './session-runtime.ts'
 import { settingsStore } from './settings-store.ts'
+import { themeStore } from './theme.ts'
 import css from './app.module.css'
 
 export interface SessionPaneProps {
@@ -258,6 +260,7 @@ function SubagentCatalog({ rows, sessionLive, noun, onOpen }: {
 }
 
 export function SessionPane({ route, summary: listSummary, onNavigate, t, locale, durationStore, onPriceModel }: SessionPaneProps) {
+  const theme = useSnapshotSelector(themeStore, value => value)
   const kind = route.kind
   const id = route.id
   const file = route.file ?? null
@@ -364,7 +367,18 @@ export function SessionPane({ route, summary: listSummary, onNavigate, t, locale
           <h1 className={css.paneTitle} title={agentFile === null ? (summary?.title ?? id) : agentFile}>
             {agentFile === null ? (summary?.title ?? id) : agentTitle}
           </h1>
-          {sessionLive && <span className={css.live}>live</span>}
+          {sessionLive && (
+            <Tooltip label={locale === 'zh' ? '会话正在活动' : 'Session is active'} delayMs={500}>
+              <span className={css.live}>
+                <ThinkingOrb
+                  state="working"
+                  size={20}
+                  theme={theme === 'system' ? 'auto' : theme}
+                  aria-label={locale === 'zh' ? '会话正在活动' : 'Session is active'}
+                />
+              </span>
+            </Tooltip>
+          )}
           <span className={css.paneStatus} data-connected={state.connected || undefined}>
             {state.loading ? 'loading…' : state.connected ? 'following' : 'disconnected'}
           </span>

@@ -17,7 +17,8 @@
     "@harness-trajectory/ui": "workspace:*",
     "@tanstack/react-virtual": "^3.14.9",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "thinking-orbs": "^0.3.1"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",
