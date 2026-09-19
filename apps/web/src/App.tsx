@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { HARNESS_KINDS, type HarnessKind } from '@harness-trajectory/core'
 import {
   createTrajectoryDurationStore, createTrajectoryTranslate, icons, Tooltip, useSnapshotSelector,
-  type TrajectoryLocale,
 } from '@harness-trajectory/ui'
 import { useSessionListing } from './use-session-listing.ts'
 import { DragHandle } from './DragHandle.tsx'
@@ -18,6 +17,7 @@ import {
   sidebarStore, toggleGroupFold,
 } from './sidebar-store.ts'
 import { themeStore, type ThemePreference } from './theme.ts'
+import { createLocaleStore } from './locale.ts'
 import brandIcon from './assets/brand-icon.png'
 import css from './app.module.css'
 
@@ -142,10 +142,6 @@ function useHashRoute(): [Route | null, (route: Route | null) => void] {
   return [route, navigate]
 }
 
-function defaultLocale(): TrajectoryLocale {
-  return typeof navigator !== 'undefined' && navigator.language.toLowerCase().startsWith('zh') ? 'zh' : 'en'
-}
-
 function themeGlyph(theme: ThemePreference): string {
   return theme === 'dark' ? '☾' : theme === 'light' ? '☀' : '◐'
 }
@@ -179,7 +175,8 @@ export function App() {
   const [query, setQuery] = useState('')
   /** `query` as the listing sees it — debounced so typing never refetches. */
   const [listQuery, setListQuery] = useState('')
-  const [locale, setLocale] = useState<TrajectoryLocale>(defaultLocale)
+  const localeStore = useMemo(() => createLocaleStore(), [])
+  const locale = useSnapshotSelector(localeStore, value => value)
   const [settingsOpen, setSettingsOpen] = useState(false)
   /**
    * The cost cell's "price this model" click opens the rule dialog keyed on
@@ -310,7 +307,7 @@ export function App() {
               type="button"
               className={css.iconButton}
               aria-label="Language"
-              onClick={() => { setLocale(locale === 'en' ? 'zh' : 'en') }}
+              onClick={() => { localeStore.set(locale === 'en' ? 'zh' : 'en') }}
             >
               {locale === 'en' ? 'EN' : '中'}
             </button>
