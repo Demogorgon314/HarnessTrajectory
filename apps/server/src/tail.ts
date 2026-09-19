@@ -26,6 +26,89 @@ export function isCompressedTranscript(path: string): boolean {
   return path.endsWith(COMPRESSED_SUFFIX)
 }
 
+/**
+ * DeepSeek Harness's session log is a DIFFERENT container: `session[.vN].jsonl.zstd`
+ * holds CONCATENATED zstd frames — one checksummed frame per flush batch — and
+ * the file keeps growing while the session runs
+ * (session-persistence-jsonl/src/zstd.ts). `zstdDecompressSync` on the whole
+ * buffer decodes only the FIRST frame, so reads go through `scanZstdFrames`
+ * and decode frame by frame. The cursor lives in PHYSICAL bytes at a frame
+ * boundary: a torn final frame (a flush in flight, or a crash) is left
+ * unconsumed and retried once its bytes complete.
+ */
+export const DSH_COMPRESSED_SUFFIX = '.zstd'
+
+export function isDshFrameTranscript(path: string): boolean {
+  return path.endsWith(DSH_COMPRESSED_SUFFIX)
+}
+
+const ZSTD_MAGIC = 0xFD2FB528
+
+/** Byte range occupied by one structurally complete Zstandard frame. */
+export interface ZstdFrameRange {
+  /** Inclusive frame start. */
+  start: number
+  /** Exclusive frame end. */
+  end: number
+}
+
+/**
+ * Locate complete frames without decompressing their blocks, so a reader can
+ * consume appended data while the writer's last frame is still torn. A frame
+ * that fails structural validation throws; EOF inside the final frame simply
+ * stops the scan (its start is the next unconsumed byte).
+ */
+export function scanZstdFrames(buffer: Buffer): ZstdFrameRange[] {
+  const frames: ZstdFrameRange[] = []
+  let offset = 0
+  while (offset < buffer.length) {
+    const start = offset
+    if (buffer.length - offset < 4) break
+    if (buffer.readUInt32LE(offset) !== ZSTD_MAGIC) {
+      throw new Error(`corrupt Zstandard session log: invalid frame magic at byte ${offset}`)
+    }
+    offset += 4
+    if (offset === buffer.length) break
+    const descriptor = buffer.readUInt8(offset)
+    offset += 1
+    if ((descriptor & 0x18) !== 0) {
+      throw new Error(`corrupt Zstandard session log: reserved frame-header bit at byte ${offset - 1}`)
+    }
+    const contentSizeFlag = descriptor >>> 6
+    const singleSegment = (descriptor & 0x20) !== 0
+    const checksum = (descriptor & 0x04) !== 0
+    const dictionaryFlag = descriptor & 0x03
+    const dictionaryBytes = dictionaryFlag === 3 ? 4 : dictionaryFlag
+    const contentSizeBytes = contentSizeFlag === 0
+      ? (singleSegment ? 1 : 0)
+      : 1 << contentSizeFlag
+    const remainingHeaderBytes = (singleSegment ? 0 : 1) + dictionaryBytes + contentSizeBytes
+    if (buffer.length - offset < remainingHeaderBytes) break
+    offset += remainingHeaderBytes
+    for (;;) {
+      if (buffer.length - offset < 3) return frames
+      const blockHeader = buffer.readUIntLE(offset, 3)
+      offset += 3
+      const lastBlock = (blockHeader & 1) !== 0
+      const blockType = (blockHeader >>> 1) & 0x03
+      const blockSize = blockHeader >>> 3
+      if (blockType === 0x03) {
+        throw new Error(`corrupt Zstandard session log: reserved block type at byte ${offset - 3}`)
+      }
+      const payloadBytes = blockType === 0x01 ? 1 : blockSize
+      if (buffer.length - offset < payloadBytes) return frames
+      offset += payloadBytes
+      if (lastBlock) break
+    }
+    if (checksum) {
+      if (buffer.length - offset < 4) return frames
+      offset += 4
+    }
+    frames.push({ start, end: offset })
+  }
+  return frames
+}
+
 /** The `.jsonl` spelling of a transcript path (strips one `.zst`). */
 export function plainTranscriptPath(path: string): string {
   return isCompressedTranscript(path) ? path.slice(0, -COMPRESSED_SUFFIX.length) : path
@@ -124,6 +207,10 @@ function splitChunk(text: string, offset: number): ReadResult {
  * For `.jsonl.zst` the offsets are DECODED bytes: the file is decompressed
  * whole and the window sliced out of the result. Compressed rollouts are
  * immutable, so `from` is only ever 0 in practice.
+ *
+ * For `.jsonl.zstd` the offsets are PHYSICAL bytes like a plain file's, except
+ * they only ever sit on frame boundaries: the window's complete frames decode
+ * in order and a torn tail stays unconsumed.
  */
 export async function readLines(
   path: string,
@@ -131,6 +218,9 @@ export async function readLines(
   rest = '',
   to?: number,
 ): Promise<ReadResult> {
+  if (isDshFrameTranscript(path)) {
+    return readFrameLines(path, from, rest, to)
+  }
   if (isCompressedTranscript(path)) {
     const decoded = await decodeFile(path)
     const end = to === undefined ? decoded.length : Math.min(to, decoded.length)
@@ -168,6 +258,49 @@ export async function readLines(
 }
 
 /**
+ * Read one appended-frame window of a `.jsonl.zstd` dsh log: complete frames
+ * in `[from, end)` decode in file order and their decoded text feeds the same
+ * line splitter a plain read uses. The returned offset stops at the last
+ * complete frame's end — a torn or absent frame consumes nothing, so a
+ * progress-checking caller can tell a torn tail apart from new data.
+ */
+async function readFrameLines(
+  path: string,
+  from: number,
+  rest: string,
+  to?: number,
+): Promise<ReadResult> {
+  const handle = await open(path, 'r')
+  try {
+    const stat = await handle.stat()
+    const end = to === undefined ? stat.size : Math.min(to, stat.size)
+    if (end <= from) return { lines: [], offset: from, rest }
+    const buffer = Buffer.allocUnsafe(end - from)
+    let filled = 0
+    while (filled < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, filled, buffer.length - filled, from + filled)
+      if (bytesRead === 0) break
+      filled += bytesRead
+    }
+    const window = buffer.subarray(0, filled)
+    let text = rest
+    let consumed = 0
+    for (const frame of scanZstdFrames(window)) {
+      text += zlib.zstdDecompressSync(window.subarray(frame.start, frame.end)).toString('utf8')
+      consumed = frame.end
+    }
+    const split = splitLines(text)
+    return {
+      lines: split.lines.filter(line => line.trim() !== ''),
+      offset: from + consumed,
+      rest: split.rest,
+    }
+  } finally {
+    await handle.close()
+  }
+}
+
+/**
  * Read the decoded byte prefix of a transcript — a lineage base contributes
  * the slice `[0, endByteOffset)` of its decoded content
  * (`HistoryPosition.end_byte_offset`).
@@ -180,7 +313,7 @@ export async function readDecodedPrefix(path: string, endByteOffset: number | un
 
 /** Read only the first line of a file (bounded), for identity probing. */
 export async function readFirstLine(path: string, maxBytes = 256 * 1024): Promise<string> {
-  if (isCompressedTranscript(path)) {
+  if (isCompressedTranscript(path) || isDshFrameTranscript(path)) {
     return readFirstCompressedLine(path, maxBytes)
   }
   const handle = await open(path, 'r')

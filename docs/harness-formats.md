@@ -588,6 +588,122 @@ later reuses the same pass and replay-queues the backlog of streams already
 materialized; a new session registered while search is live materializes
 immediately.
 
+## DeepSeek Harness
+
+dsh keeps each session under
+`$DSH_HOME/sessions/<--encoded-cwd-->/<session-id>/` (`~/.dsh` when unset) as
+`session[.vN].jsonl[.zstd]` plus a `session.lock` lease that is never a
+transcript. Line 1 is a `{"type":"session"}` header; every later line is an
+event envelope `{type, seq, time, data, surfaceOp?, sourceEventSeqs?}`.
+`time`, `time0`, and `createdAt` are epoch MILLISECONDS — never ISO strings,
+never seconds; do not run them through `parseTime`.
+
+### Generations
+
+Each format generation is an immutable file of its own: `session.jsonl` is v0
+and `session.vN` is version N. A migrated session keeps every committed
+generation, and a seeded successor already carries its inherited prefix (the
+events up to `session/end-seed`), so the CURRENT generation — the numerically
+highest `N`, preferring `.zstd` over `.jsonl` for the same `N` — is the only
+file ever read; folding a predecessor too would count the history twice.
+`resolveDshLog` picks it per directory, `DshGenerations` dedups every
+generation path onto one registered file, and a newer generation's arrival
+migrates the entry inside the consume lock: offsets, metadata, and search
+watermarks reset and the successor replays from byte 0 with a `file reset`
+event. Watcher and poll paths resolve the directory's current generation
+first, so an event naming an old path still reaches the entry.
+
+### Concatenated zstd frames
+
+`.jsonl.zstd` is NOT Codex's `.zst`: the file is a growing sequence of
+independent checksummed zstd frames, one per flush batch
+(session-persistence-jsonl/src/zstd.ts). `zstdDecompressSync` decodes only
+the first frame, so `tail.ts` scans frame headers itself (magic → descriptor
+→ blocks → optional 4-byte checksum), decodes complete frames in order, and
+keeps the cursor in PHYSICAL bytes at frame boundaries. A torn final frame —
+a flush in flight or a crash — consumes nothing and is retried once its bytes
+complete; structurally corrupt data stops the scan rather than misreading.
+`readFirstLine` decodes just enough of the first frame to probe the header.
+Lines may span frames; the decoded text feeds the same splitter a plain read
+uses, so search line numbers stay the non-blank record index.
+
+### Events and classification
+
+v0/v1 stream deltas are PACKED: `reasoning-chunks` / `text-chunks` /
+`tool-call-chunks` rows carry `{seq0, time0, data:{index, dt, texts|args}}`
+and stand for N `assistant/chunk` events at `time0 + cumulative dt`; v2+
+moves the same records into `assistant/message.data.stream` /
+`assistant/attempt.data.stream` without seqs. `surfaceOp` is the bare string
+`'append'` by default; replace is spelled `{op:'replace', startSeq, endSeq}`
+in v3 and `{op:'replace', start, end}` in v0/v1 — read both.
+`sourceEventSeqs` may compress consecutive runs of ≥3 into `[start,end]`
+pairs mixed with plain numbers. `usage` buckets are DISJOINT: `inputTokens`
+excludes `cacheReadTokens`/`cacheWriteTokens`, and `reasoningTokens` ⊂
+`outputTokens`.
+
+`request/header` is logged AFTER `step/start` opens its request and applies
+to that request; an unchanged header is not re-logged, so a header-less step
+inherits the last effective config and prompt snapshot. `data.reason` is
+`initial`, `resume`, `change`, or `series`; only `initial` reports the first
+request's prompt as a change — a resumed or mid-stream first header restates
+the effective state without one. The prompt itself is
+`request/header.data.header.system` in v0/v1 and `system/message` surface
+nodes in v3; an `'append'` on a live non-empty prompt is an in-history
+update the NEXT header must not re-report, and an empty replacing node
+clears the prompt and re-anchors the next change at the replacement event.
+An effective prompt move also re-snapshots the request it lands inside —
+the in-flight request runs under the updated prompt even when the silent
+update logs no header, while already-settled requests keep the prompt they
+were made under.
+
+`run_code` nests its dispatched calls under `tool/ptc-dispatch-start` /
+`tool/ptc-dispatch` (legacy: `tool/code-dispatch*`): `parentCallId` +
+`subCallId` parent each sub-call's arguments, content, error, and timing to
+the outer `run_code` call rather than surfacing as top-level tools.
+`image/offload` is NOT log metadata: `targets[].seq` + `imageIndexes` durably
+marks image blocks on earlier `user/message`/`tool/result` nodes (indexes
+count every occurrence, already-offloaded included). The context synthesizer
+then replays each target as a surface replacement — like `surfaceRestore`,
+the projected copy takes a FRESH seq just past the offload event and becomes
+the original's `gone` boundary, so the retained content under the original
+seq still reconstructs what pre-offload requests saw while the live surface
+carries the model-visible placeholder text. The copy keeps its surface slot
+through the node's `pos` sort key — `seq`/`gone` bound history, `pos`
+orders display — so assemble shows it where the original sat rather than at
+its own seq. Later producer claims (replace ranges, `shadowedSeqs`) still
+name the ORIGINAL seq; the synth's `liveSeqs` map translates them onto
+whichever copy is currently live and releases the mapping only when that
+node truly leaves the surface — the bounded payload cache evicts separately
+and only forfeits future offload targeting. Fold billing and tool names are
+preserved.
+
+`dshUserClass` is structural: a `user/message` is `human` only when
+`source.kind === 'user'`; any other source kind is injected context, and a
+replace `surfaceOp` marks a compaction summary. Search indexes human prompts,
+committed assistant text/reasoning blocks, `tool/call` arguments, and
+`command/run` invocations (`name` + its `args` tail string); `tool/result`
+outputs, packed stream rows, and surface bookkeeping are never indexed.
+
+### Children and attachments
+
+A child session is a SEPARATE log under the same `<encoded-cwd>` parent whose
+header carries `origin:'subagent'` plus `parentSession`; a fork records
+`parentSession` without the origin and stays an independent session. The only
+binding a parent's transcript records is the exact result text
+`started subagent <childSessionId>` on a continuable background tool call —
+the meta scanner pairs it with the pending call's description. Parent and
+child logs are read in either order, so a late binding only adds identity
+(call id, description) — it never reopens a run the child already finished;
+only the child's own `turn/start` does that. A compressed
+child's first frame can still be torn at registration: the entry then lands
+as a main session and is re-homed when `probeDshHeader` later reads the
+completed header. `blobref:` image URLs resolve against the GLOBAL
+content-addressed store `$DSH_HOME/attachments/v1/objects/<2-hex>/<sha256>`
+(a sibling of `sessions/`, not per-session), and a hash that is not 64 hex
+chars resolves to nothing.
+
+Resume command: `dsh tui --resume <id>`.
+
 ## Request-input statistics (shared)
 
 ### Incremental parser extension points

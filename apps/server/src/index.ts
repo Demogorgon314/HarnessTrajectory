@@ -8,7 +8,7 @@ import { existsSync, watch, type FSWatcher } from 'node:fs'
 import { readdir, stat } from 'node:fs/promises'
 import { basename, dirname, join, relative, sep } from 'node:path'
 import {
-  asNumber, isRecord, parseJsonLine,
+  asNumber, isRecord, parseDshLine, parseJsonLine,
   type AgentFileMeta, type HarnessKind, type SessionDetail, type SessionFileRef,
   type SessionLiveEvent, type SessionSummary,
 } from '@harness-trajectory/core'
@@ -40,6 +40,7 @@ import {
 } from './harness/grok.ts'
 import { classifyKimiPath, kimiChildDir, readKimiTitle } from './harness/kimi.ts'
 import { classifyPiPath } from './harness/pi.ts'
+import { classifyDshPath, DshGenerations, dshAttachmentPath, type DshLogFile } from './harness/dsh.ts'
 import { readJsonRecord } from './harness/sidecar.ts'
 
 /** Keep the owning header even though it precedes the child's activity boundary. */
@@ -158,6 +159,16 @@ interface FileEntry extends SourceEntry {
   decodedSize?: number
   /** Codex only: a superseded same-thread rollout — never listed as a session. */
   superseded?: boolean
+
+  // -- Dsh generations --------------------------------------------------------
+  /** Dsh only: a newer generation resolved, waiting for the consume lock to re-point this entry. */
+  dshPending?: DshLogFile | undefined
+  /**
+   * Dsh only: the header line was not readable at registration (the first
+   * frame was still torn), so `ref.parentId` is unproven — the first consumed
+   * line settles it (`probeDshHeader`).
+   */
+  dshUnprobed?: boolean | undefined
 }
 
 type SessionRecord = SourceSession<FileEntry>
@@ -196,7 +207,11 @@ export function classifyPath(
   path: string,
 ): Classified | null {
   const codex = kind === 'codex'
-  if (!path.endsWith('.jsonl') && !(codex && path.endsWith('.jsonl.zst'))) return null
+  const dsh = kind === 'dsh'
+  const transcript = path.endsWith('.jsonl')
+    || (codex && path.endsWith('.jsonl.zst'))
+    || (dsh && path.endsWith('.jsonl.zstd'))
+  if (!transcript) return null
   const rel = relative(root, path)
   if (rel.startsWith('..')) return null
   const parts = rel.split(sep)
@@ -214,6 +229,8 @@ export function classifyPath(
       return classifyGrokPath(parts, basename(path, '.jsonl'))
     case 'pi':
       return classifyPiPath(parts, basename(path, '.jsonl'))
+    case 'dsh':
+      return classifyDshPath(parts, basename(path))
     default:
       return null
   }
@@ -247,6 +264,14 @@ export class SessionIndex extends EventEmitter implements SessionSource {
    * carry `reset` because the demote already cleared the session's pointer.
    */
   private readonly codexResets = new Set<string>()
+  /**
+   * Dsh session directory → its registered entry, so a walk/watch path that
+   * names a non-current generation resolves onto the same file and a newly
+   * published generation migrates the entry instead of double-registering.
+   * Generations are immutable once published — a successor's appearance is
+   * the only reason the resolved path ever changes.
+   */
+  private readonly dsh = new DshGenerations<FileEntry>()
   private readonly watchers: FSWatcher[] = []
   private readonly pending = new Map<string, NodeJS.Timeout>()
   private poll: NodeJS.Timeout | null = null
@@ -450,19 +475,29 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     let offset = 0
     let rest = ''
     let lineIndex = 0
+    let end = Math.min(INITIAL_CHUNK_BYTES, sizeLimit)
     while (offset < sizeLimit) {
       if (this.stopped || this.search !== search) return
       // A truncation/rewrite mid-pass resets the entry and re-queues every
       // line through the consume path; continuing here would double them.
       if (entry.searchFrom !== from || entry.lines < upto) return
-      const end = Math.min(offset + INITIAL_CHUNK_BYTES, sizeLimit)
       const result = await readLines(entry.path, offset, rest, end)
       for (const line of result.lines) {
         if (lineIndex >= from) search.queue(key, lineIndex, line)
         lineIndex += 1
       }
+      if (result.offset === offset) {
+        // A `.zstd` window ending mid-frame yields no progress: grow it while
+        // real bytes remain ahead — the same expansion consumeInitial uses.
+        // Only a still-torn tail at the plan's actual boundary is terminal.
+        if (end >= sizeLimit) return
+        end = Math.min(end + INITIAL_CHUNK_BYTES, sizeLimit)
+        await yieldTurn()
+        continue
+      }
       offset = result.offset
       rest = result.rest
+      end = Math.min(offset + INITIAL_CHUNK_BYTES, sizeLimit)
       await yieldTurn()
     }
     // The consume path owns the watermark from the first appended line on; a
@@ -491,9 +526,14 @@ export class SessionIndex extends EventEmitter implements SessionSource {
   }
 
   /**
-   * Absolute path of one agent blob (`agents/<agentId>/blobs/<hash>`), when the
-   * file id names a transcript of the session and the hash is well-formed. Kimi
-   * offloads media above ~4 KB into this per-agent, content-addressed store.
+   * Absolute path of one offloaded attachment blob.
+   *
+   * Kimi offloads media above ~4 KB into a per-agent store
+   * (`agents/<agentId>/blobs/<hash>`) beside the transcript. Dsh's store is
+   * global instead: `$DSH_HOME/attachments/v1/objects/<2-hex>/<sha256>`,
+   * derived from the dsh root's parent (the sessions dir and `attachments/`
+   * are siblings). Both stores are content-addressed, so the response is
+   * immutable.
    */
   blobPath(kind: HarnessKind, id: string, fileId: string, hash: string): string | null {
     if (!/^[0-9a-f]{16,64}$/.test(hash)) return null
@@ -501,6 +541,11 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     if (session === undefined) return null
     const entry = fileId === id ? session.main : (session.children.get(fileId) ?? null)
     if (entry === null || entry === undefined) return null
+    if (kind === 'dsh') {
+      const root = this.roots.find(candidate => candidate.kind === 'dsh')
+      if (root === undefined) return null
+      return dshAttachmentPath(dirname(root.dir), hash)
+    }
     return join(dirname(entry.path), 'blobs', hash)
   }
 
@@ -601,6 +646,19 @@ export class SessionIndex extends EventEmitter implements SessionSource {
       path = file.path
       compressed = file.compressed
       info = file
+    } else if (root.kind === 'dsh') {
+      // One session directory publishes several immutable generations; only
+      // the current (highest-version) log is a transcript of the session.
+      const resolved = await this.dsh.resolve(path)
+      if (resolved === null) return undefined
+      const prior = this.dsh.entry(path)
+      if (prior !== undefined) {
+        return prior.path === resolved.path
+          ? prior
+          : await this.migrateDshGeneration(prior, resolved, initial)
+      }
+      path = resolved.path
+      info = resolved
     } else {
       try {
         const found = await stat(path)
@@ -635,21 +693,31 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     }
     // Codex identity lives in `session_meta`; a Claude child names its parent in its first record.
     // Kimi needs no probe: `classifyPath` already derived both ids from the path.
-    if (root.kind === 'codex' || (root.kind === 'claude' && classified.role === 'child')) {
+    // A dsh child's header names its parent (`origin:"subagent"` + `parentSession`).
+    let dshUnprobed = false
+    if (root.kind === 'codex' || root.kind === 'dsh' || (root.kind === 'claude' && classified.role === 'child')) {
       try {
-        const head = readHead(root.kind, await readFirstLine(path))
+        const firstLine = await readFirstLine(path)
+        const head = readHead(root.kind, firstLine)
         if (root.kind === 'codex') {
           threadId = head.id ?? classified.threadUuid ?? rolloutId
           id = threadId ?? id
           parentId = head.parentId ?? undefined
           historyBase = head.historyBase ?? undefined
           historyStartOrdinal = head.historyStartOrdinal ?? undefined
+        } else if (root.kind === 'dsh') {
+          parentId = head.parentId ?? undefined
+          // A session file exists before its first frame completes, so a watch
+          // event can register it while the header is still unreadable. The
+          // first consumed line then settles the role (`probeDshHeader`).
+          dshUnprobed = parentId === undefined && parseDshLine(firstLine)?.tag !== 'header'
         } else if (parentId === undefined) {
           parentId = head.id ?? undefined
         }
       } catch {
         // Unreadable head: keep the path-derived identity.
         if (root.kind === 'codex') threadId = classified.threadUuid ?? rolloutId
+        else if (root.kind === 'dsh') dshUnprobed = true
       }
     }
     // Codex lineage: `history_base` names the older rollout this file's
@@ -724,6 +792,7 @@ export class SessionIndex extends EventEmitter implements SessionSource {
       basesConsumed: false,
       ...(root.kind === 'grok' ? { summaryTitle: grokSummaryTitle(grokSummary) } : {}),
       ...(grokUnresolved && role === 'main' ? { grokUnresolved: true } : {}),
+      ...(dshUnprobed ? { dshUnprobed: true } : {}),
       ...(root.kind === 'codex' ? {
         rootDir: root.dir,
         ...(rolloutId === undefined ? {} : { rolloutId }),
@@ -737,6 +806,7 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     }
     if (this.book.files.has(path)) return this.book.files.get(path)
     this.book.files.set(path, entry)
+    if (root.kind === 'dsh') this.dsh.note(path, entry)
     if (root.kind === 'codex') {
       this.codex.registered(entry)
       // Heads still waiting for this file as a lineage base re-resolve through it.
@@ -861,6 +931,26 @@ export class SessionIndex extends EventEmitter implements SessionSource {
   }
 
   /**
+   * Re-point an entry at a newer dsh generation (a resumed session migrated
+   * its log to `session.vN.jsonl[.zstd]`). Unlike a Codex representation swap
+   * the successor is NOT the same byte stream — it opens with a transformed
+   * inherited prefix — so the whole stream is reset and re-read, and the old
+   * generation's search rows are dropped. The swap itself is deferred to the
+   * consume lock (`dshPending`) so an in-flight read never sees the path move
+   * under its cursor.
+   */
+  private async migrateDshGeneration(
+    entry: FileEntry,
+    resolved: DshLogFile,
+    initial: boolean,
+  ): Promise<FileEntry> {
+    entry.dshPending = resolved
+    await this.consume(entry, resolved.size, resolved.mtimeMs, initial)
+    this.saveListing(entry)
+    return entry
+  }
+
+  /**
    * A rollout a head was waiting for is now on disk: re-resolve its base
    * chain and re-read the stream so the new slices land ahead of the head's
    * own records.
@@ -932,6 +1022,31 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     entry.grokUnresolved = false
     // Its lines were indexed under its own id; move them to the parent so a hit
     // opens the parent session with this transcript selected.
+    this.search?.rebind(searchKeyOf(entry))
+    const parent = this.book.sessionFor(entry.kind, parentId)
+    parent.children.set(entry.ref.id, entry)
+    this.book.emitTo(parent, { type: 'file', file: entry.ref })
+    this.book.emitTo(parent, { type: 'meta', summary: this.book.summarize(parent), children: this.book.childSummaries(parent) })
+    this.emit('change', entry.kind, parentId)
+  }
+
+  /**
+   * Move a dsh file that registered as a main session under the parent its
+   * header now names: registration probed the first line before the writer's
+   * first frame completed, so `origin:"subagent"` was unreadable. Mirror of
+   * `rehomeGrokChild` except the child keeps its scanner — a JSONL-only
+   * child's own title/model still flow through `mergeChildAgent`.
+   */
+  private rehomeDshChild(entry: FileEntry, parentId: string): void {
+    if (entry.ref.role !== 'main' || entry.sessionId === parentId) return
+    const previousKey = sessionKey(entry.kind, entry.sessionId)
+    const previous = this.book.sessions.get(previousKey)
+    if (previous !== undefined) {
+      if (previous.main === entry) previous.main = null
+      if (previous.main === null && previous.children.size === 0) this.book.sessions.delete(previousKey)
+    }
+    entry.ref = { ...entry.ref, role: 'child', parentId }
+    entry.sessionId = parentId
     this.search?.rebind(searchKeyOf(entry))
     const parent = this.book.sessionFor(entry.kind, parentId)
     parent.children.set(entry.ref.id, entry)
@@ -1122,11 +1237,16 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     let end = Math.min(INITIAL_CHUNK_BYTES, size)
     for (;;) {
       if (this.stopped) return
+      const before = entry.offset
       await this.consume(entry, end, mtimeMs, initial)
       // `offset` can land past `end` when a folded-in watch event was drained
       // with the file's real size; never let `end` fall behind it, or the
       // next slice would look like a truncation.
       if (entry.offset >= size) return
+      // A dsh `.zstd` cursor only advances to complete frame boundaries: a
+      // torn tail (a flush in flight or a crash) consumes nothing, and no
+      // larger window changes that — the next append is what completes it.
+      if (end >= size && entry.offset === before) return
       end = Math.min(Math.max(end, entry.offset) + INITIAL_CHUNK_BYTES, size)
       await yieldTurn()
     }
@@ -1171,6 +1291,25 @@ export class SessionIndex extends EventEmitter implements SessionSource {
    */
   private async consumeInner(entry: FileEntry, size: number, mtimeMs: number, initial = false): Promise<void> {
     const session = this.book.sessions.get(sessionKey(entry.kind, entry.sessionId))
+    // A newer dsh generation resolved while a consume may have been in flight:
+    // re-point the entry inside the lock, before the size/offset comparisons
+    // below would read the new file's stat against the old stream's cursor.
+    const pendingGeneration = entry.dshPending
+    if (pendingGeneration !== undefined) {
+      entry.dshPending = undefined
+      this.book.files.delete(entry.path)
+      this.search?.reset(entry.path)
+      entry.path = pendingGeneration.path
+      entry.ref = { ...entry.ref, path: pendingGeneration.path }
+      entry.offset = 0
+      entry.rest = ''
+      entry.lines = 0
+      entry.searchFrom = 0
+      if (entry.meta !== null) entry.meta = createMetaScanner('dsh', null)
+      this.book.files.set(pendingGeneration.path, entry)
+      this.dsh.note(pendingGeneration.path, entry)
+      if (session !== undefined) this.book.emitTo(session, { type: 'file', file: entry.ref, reset: true })
+    }
     // A lineage base registered after this head consumed: re-resolve the chain
     // under the consume lock and replay the whole stream.
     if (entry.basesStale === true) {
@@ -1262,6 +1401,19 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     // `index` advances `entry.lines`, so the first appended line's index is the
     // count as it stands here — the same one the search index gives the record.
     const startLine = entry.lines
+    // A dsh file registered while its first frame was still torn settles its
+    // role on the first consumed line: `origin:"subagent"` re-homes it under
+    // `parentSession`, anything else confirms it as a main file.
+    let target = session
+    if (entry.dshUnprobed === true && entry.lines === 0 && lines.length > 0) {
+      entry.dshUnprobed = undefined
+      const record = parseDshLine(lines[0] ?? '')
+      if (record?.tag === 'header' && record.header.origin === 'subagent'
+        && record.header.parentSession !== undefined) {
+        this.rehomeDshChild(entry, record.header.parentSession)
+        target = this.book.sessions.get(sessionKey(entry.kind, entry.sessionId))
+      }
+    }
     if (entry.meta !== null) {
       for (const line of lines) {
         // A child's inherited records (below `historyStartOrdinal`, possibly
@@ -1275,11 +1427,11 @@ export class SessionIndex extends EventEmitter implements SessionSource {
       }
     }
     this.index(entry, lines)
-    if (lines.length === 0 || session === undefined) return
-    this.applyChildListing(session)
+    if (lines.length === 0 || target === undefined) return
+    this.applyChildListing(target)
     if (!initial) {
-      this.book.emitTo(session, { type: 'lines', file: entry.ref, lines: [...lines], startLine })
-      this.book.emitTo(session, { type: 'meta', summary: this.book.summarize(session), children: this.book.childSummaries(session) })
+      this.book.emitTo(target, { type: 'lines', file: entry.ref, lines: [...lines], startLine })
+      this.book.emitTo(target, { type: 'meta', summary: this.book.summarize(target), children: this.book.childSummaries(target) })
     }
     this.emit('change', entry.kind, entry.sessionId)
   }
@@ -1348,7 +1500,9 @@ export class SessionIndex extends EventEmitter implements SessionSource {
       const watcher = watch(root.dir, { recursive: true, persistent: true }, (_event, filename) => {
         if (filename === null || filename === undefined) return
         const name = filename.toString()
-        if (!name.endsWith('.jsonl') && !(root.kind === 'codex' && name.endsWith('.jsonl.zst'))) return
+        if (!name.endsWith('.jsonl')
+          && !(root.kind === 'codex' && name.endsWith('.jsonl.zst'))
+          && !(root.kind === 'dsh' && name.endsWith('.jsonl.zstd'))) return
         this.schedule(root, join(root.dir, name))
       })
       watcher.on('error', (error) => {
@@ -1392,6 +1546,28 @@ export class SessionIndex extends EventEmitter implements SessionSource {
       }
       return
     }
+    // A watch event can name ANY generation file of the session directory;
+    // the entry lives under — and reads — only the current (highest) one.
+    if (root.kind === 'dsh') {
+      const resolved = await this.dsh.resolve(path)
+      if (resolved === null) return
+      const entry = this.dsh.entry(path)
+      if (entry === undefined) {
+        await this.register(root, path)
+        return
+      }
+      try {
+        if (entry.path !== resolved.path) {
+          await this.migrateDshGeneration(entry, resolved, false)
+        } else {
+          await this.consume(entry, resolved.size, resolved.mtimeMs)
+        }
+        this.saveListing(entry)
+      } catch {
+        // Deleted or momentarily unreadable; keep the last known state.
+      }
+      return
+    }
     const entry = this.book.files.get(path)
     if (entry === undefined) {
       await this.register(root, path)
@@ -1417,19 +1593,30 @@ export class SessionIndex extends EventEmitter implements SessionSource {
       for (const entry of [session.main, ...session.children.values()]) {
         if (entry === null) continue
         try {
-          // Codex: the poll sees the physical representation's size; the entry
-          // may point at a `.zst` whose decoded size is tracked separately, or
-          // a materialized `.jsonl` the watcher has not delivered yet.
-          const file = entry.kind === 'codex'
-            ? await resolveTranscriptFile(entry.path)
-            : await stat(entry.path).then(info => info.isFile()
-              ? { path: entry.path, compressed: false, size: info.size, mtimeMs: info.mtimeMs }
-              : null)
-          if (file === null) continue
-          if (file.path !== entry.path && entry.kind === 'codex') {
-            await this.migrateCodexRepresentation(entry, file.path, file, file.compressed, false)
-          } else if (file.size !== entry.physicalSize || (entry.compressed === true && file.mtimeMs !== entry.mtimeMs)) {
-            await this.consume(entry, file.size, file.mtimeMs)
+          // Dsh resolves the current generation: a resumed session's
+          // `session.vN` publish re-points the entry when the watcher missed it.
+          if (entry.kind === 'dsh') {
+            const resolved = await this.dsh.resolve(entry.path)
+            if (resolved !== null && resolved.path !== entry.path) {
+              await this.migrateDshGeneration(entry, resolved, false)
+            } else if (resolved !== null && resolved.size !== entry.physicalSize) {
+              await this.consume(entry, resolved.size, resolved.mtimeMs)
+            }
+          } else {
+            // Codex: the poll sees the physical representation's size; the entry
+            // may point at a `.zst` whose decoded size is tracked separately, or
+            // a materialized `.jsonl` the watcher has not delivered yet.
+            const file = entry.kind === 'codex'
+              ? await resolveTranscriptFile(entry.path)
+              : await stat(entry.path).then(info => info.isFile()
+                ? { path: entry.path, compressed: false, size: info.size, mtimeMs: info.mtimeMs }
+                : null)
+            if (file === null) continue
+            if (file.path !== entry.path && entry.kind === 'codex') {
+              await this.migrateCodexRepresentation(entry, file.path, file, file.compressed, false)
+            } else if (file.size !== entry.physicalSize || (entry.compressed === true && file.mtimeMs !== entry.mtimeMs)) {
+              await this.consume(entry, file.size, file.mtimeMs)
+            }
           }
           await this.refreshAgentMeta(session, entry)
           await this.syncKimiTitle(entry)
@@ -1553,7 +1740,8 @@ export async function walk(dir: string): Promise<string[]> {
     if (entry.isDirectory()) {
       if (entry.name === 'memory' || entry.name.startsWith('.')) continue
       paths.push(...await walk(path))
-    } else if (entry.isFile() && (entry.name.endsWith('.jsonl') || entry.name.endsWith('.jsonl.zst'))) {
+    } else if (entry.isFile() && (entry.name.endsWith('.jsonl')
+      || entry.name.endsWith('.jsonl.zst') || entry.name.endsWith('.jsonl.zstd'))) {
       paths.push(path)
     }
   }

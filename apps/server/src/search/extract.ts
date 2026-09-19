@@ -58,6 +58,13 @@
  *   `tool` as a call rendered from `tool` + `state.input` (camelCase arg
  *   keys — `filePath`, `oldString`, `newString`); tool outputs are never
  *   indexed.
+ * - **dsh**: the `{type, seq, time (epoch MS), data, surfaceOp?}` event
+ *   envelope; `session` headers and packed v0 stream rows are not events.
+ *   `user/message` indexes only under `dshUserClass === 'human'` (the shared
+ *   structural classifier — injected context and compaction summaries skip).
+ *   `assistant/message` indexes committed text/reasoning blocks; `tool/call`
+ *   and `command/run` index the calls. `tool/result` outputs, stream deltas,
+ *   and surface bookkeeping are never indexed.
  *
  * The rules that are the same everywhere: the human/injected split reuses the
  * classifier the meta scanner and the adapters use, image blocks are skipped,
@@ -74,8 +81,9 @@
 
 import {
   asArray, asNumber, asString, classifyInjectedUser, devinMessageClass, grokMessageClass,
-  codexHumanPromptText, codexReasoningText, isRecord, isPiHumanPrompt, kimiMessageClass, kimiTitleText,
-  parseDevinLine, parseGrokLine, parsePiLine, piContentText,
+  codexHumanPromptText, codexReasoningText, dshTextOf, dshUserClass, isRecord, isPiHumanPrompt,
+  kimiMessageClass, kimiTitleText,
+  parseDevinLine, parseDshLine, parseGrokLine, parsePiLine, piContentText,
   opencodeTextOf, opencodeUserClass, parseJsonLine, parseOpencodeLine, parseTime,
   GROK_SIDECAR_METHOD, type HarnessKind, type SearchRole,
 } from '@harness-trajectory/core'
@@ -227,6 +235,7 @@ export function extractSearchDocs(kind: HarnessKind, line: string): SearchDocDra
       case 'devin': return devinDocs(line)
       case 'pi': return piDocs(line)
       case 'opencode': return opencodeDocs(line)
+      case 'dsh': return dshDocs(line)
     }
   } catch {
     return []
@@ -642,6 +651,59 @@ function opencodeDocs(line: string): SearchDocDraft[] {
         default:
           break
       }
+      break
+    }
+    default:
+      break
+  }
+  return builder.docs
+}
+
+// -- DeepSeek Harness ----------------------------------------------------------
+
+/**
+ * The dsh event log: `time` is epoch MILLISECONDS. A `user/message` indexes
+ * only when `dshUserClass` says `human` (injected context and compaction
+ * summaries classify otherwise — the same classifier the adapter, synthesizer
+ * and meta scanner share). An `assistant/message` indexes its committed text
+ * and reasoning blocks; its embedded `tool-call` blocks mirror the durable
+ * `tool/call` rows and are indexed there instead of twice. A `command/run` is
+ * the session's `!name args` invocation. `tool/result` outputs, packed v0
+ * stream runs (delta mirrors of the committed messages), titles, retries,
+ * approvals and surface bookkeeping are never indexed.
+ */
+function dshDocs(line: string): SearchDocDraft[] {
+  const record = parseDshLine(line)
+  if (record === null || record.tag !== 'event') return []
+  const event = record.event
+  const builder = new DocBuilder(event.time)
+  switch (event.type) {
+    case 'user/message': {
+      if (dshUserClass(event) !== 'human') break
+      builder.add('human', dshTextOf(event.data['content']))
+      break
+    }
+    case 'assistant/message': {
+      const message = isRecord(event.data['message']) ? event.data['message'] : undefined
+      for (const block of asArray(message?.['content']) ?? []) {
+        if (!isRecord(block)) continue
+        const type = asString(block['type'])
+        if (type === 'text') builder.add('assistant', asString(block['text']) ?? '')
+        else if (type === 'reasoning') builder.add('other', asString(block['text']) ?? '')
+      }
+      break
+    }
+    case 'tool/call':
+      builder.add('tool', renderToolCall(
+        asString(event.data['name']) ?? 'tool',
+        event.data['arguments'],
+      ))
+      break
+    case 'command/run': {
+      // `args` is the typed tail string (" read-only"), so the invocation is
+      // simply `name` + `args` — no argument JSON to render.
+      const name = asString(event.data['name']) ?? 'command'
+      builder.add('tool', name + (asString(event.data['args']) ?? ''))
       break
     }
     default:

@@ -88,7 +88,9 @@ export function assemble(data: ContextTimeline, headers: ContextHeaders | null, 
     }
     nodes = picked
   }
-  nodes.sort((a, b) => a.seq - b.seq)
+  // `pos ?? seq`: an in-place replacement (a projected offload copy) sorts
+  // at the slot it took over, not at its own seq.
+  nodes.sort((a, b) => (a.pos ?? a.seq) - (b.pos ?? b.seq))
 
   let missingLive = 0
   if (data.droppedNodes > 0) {

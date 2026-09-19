@@ -5,7 +5,7 @@ import { MAX_DOC_CHARS, extractSearchDocs, type SearchDocDraft } from '../src/se
 const T0 = Date.parse('2026-09-14T10:00:00.000Z')
 const iso = (offsetMs: number) => new Date(T0 + offsetMs).toISOString()
 
-function docs(kind: 'claude' | 'codex' | 'kimi' | 'grok' | 'devin' | 'pi' | 'opencode', record: unknown): SearchDocDraft[] {
+function docs(kind: 'claude' | 'codex' | 'kimi' | 'grok' | 'devin' | 'pi' | 'opencode' | 'dsh', record: unknown): SearchDocDraft[] {
   return extractSearchDocs(kind, JSON.stringify(record))
 }
 
@@ -660,5 +660,55 @@ describe('extractSearchDocs — shared rules', () => {
       message: { role: 'user', content: `before${'\u0002'}marked${'\u0003'}after${'\u001f'}end` },
     })
     expect(doc?.text).toBe('before marked after end')
+  })
+})
+
+describe('extractSearchDocs — DeepSeek Harness', () => {
+  const event = (type: string, data: Record<string, unknown>, extra: Record<string, unknown> = {}) =>
+    ({ type, seq: 1, time: T0, data, ...extra })
+
+  it('indexes human prompts, committed assistant blocks, tool calls, and command runs', () => {
+    expect(docs('dsh', event('user/message', {
+      source: { kind: 'user' },
+      content: [{ type: 'text', text: 'Port the viewer to dsh' }],
+    }))).toEqual([{ role: 'human', text: 'Port the viewer to dsh', timeMs: T0 }])
+
+    expect(pairs(docs('dsh', event('assistant/message', {
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: 'planning' },
+          { type: 'text', text: 'the answer' },
+          { type: 'tool-call', id: 'call-1', name: 'Read', arguments: '{}' },
+        ],
+      },
+    })))).toEqual(['other: planning', 'assistant: the answer'])
+
+    expect(pairs(docs('dsh', event('tool/call', {
+      callId: 'call-1', name: 'Write', arguments: '{"file_path":"/f.ts","content":"code"}',
+    })))).toEqual(['tool: Write\nfile_path: /f.ts\ncontent: code'])
+
+    expect(pairs(docs('dsh', event('command/run', { name: 'compact', args: ' --keep 3' }))))
+      .toEqual(['tool: compact --keep 3'])
+  })
+
+  it('never indexes injected context, compaction summaries, tool outputs, or stream mirrors', () => {
+    // A non-`user` source kind is injected context.
+    expect(docs('dsh', event('user/message', {
+      source: { kind: 'context' }, content: [{ type: 'text', text: 'injected' }],
+    }))).toEqual([])
+    // A replace surfaceOp makes the message a compaction summary.
+    expect(docs('dsh', {
+      ...event('user/message', { source: { kind: 'user' }, content: [{ type: 'text', text: 'summary' }] }),
+      surfaceOp: { op: 'replace', startSeq: 1, endSeq: 6 },
+    })).toEqual([])
+    // Tool RESULTS are outputs: stdout lives in the trajectory view, not the index.
+    expect(docs('dsh', event('tool/result', {
+      message: { content: [{ type: 'tool-result', content: [{ type: 'text', text: 'stdout' }] }] },
+    }))).toEqual([])
+    // Packed v0 stream rows are delta mirrors of the committed messages.
+    expect(docs('dsh', { type: 'text-chunks', seq0: 1, time0: T0, data: { texts: ['delta'] } })).toEqual([])
+    expect(docs('dsh', event('session/title', { title: 'name' }))).toEqual([])
+    expect(extractSearchDocs('dsh', '{ not json')).toEqual([])
   })
 })

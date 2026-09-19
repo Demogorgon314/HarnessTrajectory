@@ -1,7 +1,7 @@
 # Harness Trajectory
 
 A local viewer for coding-agent sessions. It reads the transcripts that **Claude Code**,
-**Codex**, **Kimi Code**, **Grok Build**, **Devin CLI**, **pi**, and **OpenCode** write on your machine and renders each session
+**Codex**, **Kimi Code**, **Grok Build**, **Devin CLI**, **pi**, **OpenCode**, and **DeepSeek Harness** write on your machine and renders each session
 as a turn-by-turn trajectory with timing, token usage, subagents, and a context dashboard.
 Live sessions update as they run. Nothing leaves your machine.
 
@@ -100,7 +100,8 @@ card opens the rule editor directly.
 | `KIMI_CODE_HOME` | `~/.kimi-code` | Kimi Code home (`<home>/sessions`) |
 | `GROK_HOME` | `~/.grok` | Grok Build home (`<home>/sessions`) |
 | `PI_CODING_AGENT_DIR` | `~/.pi/agent` | pi agent home (`<home>/sessions` is scanned) |
-| `HARNESS_TRAJECTORY_{CLAUDE,CODEX,KIMI,GROK,PI}_ROOT` | derived | Point one harness at an arbitrary directory |
+| `DSH_HOME` | `~/.dsh` | DeepSeek Harness home (`<home>/sessions` is scanned; `<home>/attachments` resolves `blobref:` images) |
+| `HARNESS_TRAJECTORY_{CLAUDE,CODEX,KIMI,GROK,PI,DSH}_ROOT` | derived | Point one harness at an arbitrary directory |
 | `HARNESS_TRAJECTORY_DEVIN_DB` | `$XDG_DATA_HOME/devin/cli/sessions.db`, else `~/.local/share/devin/cli/sessions.db` | Devin CLI session store — read directly (read-only); no transcript files exist |
 | `HARNESS_TRAJECTORY_OPENCODE_DB` | `$XDG_DATA_HOME/opencode/opencode.db`, else `~/.local/share/opencode/opencode.db` | OpenCode V1 session store — read directly (read-only); no transcript files exist |
 | `HARNESS_TRAJECTORY_CACHE_DIR` | `$XDG_CACHE_HOME/harness-trajectory`, else `~/.cache/harness-trajectory` | Holds `search.sqlite` and `settings.json`, the only files the server writes |

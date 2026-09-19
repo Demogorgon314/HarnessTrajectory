@@ -469,6 +469,14 @@ export interface SessionCostUsage {
 /** One model-visible message on the surface, with its heuristic token price. */
 export interface SurfaceNode {
   seq: number
+  /**
+   * Surface-order key the assembled context sorts by. Stamped when an
+   * in-place replacement takes over a slot its own seq does not earn (a
+   * projected copy keeps the removed node's place); absent means the node
+   * orders by `seq`. History reconstruction still bounds on `seq`/`gone` —
+   * `pos` orders, it never bounds.
+   */
+  pos?: number
   time?: number
   cat: Category
   tokens: number

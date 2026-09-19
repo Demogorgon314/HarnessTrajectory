@@ -43,12 +43,22 @@ export function opencodeDbPath(env: NodeJS.ProcessEnv = process.env): string {
 }
 
 /**
+ * The DeepSeek Harness home (`$DSH_HOME`, or `~/.dsh`): parent of `sessions/`
+ * (the transcript root) and `attachments/` (the global `blobref:` store).
+ */
+export function dshHome(env: NodeJS.ProcessEnv = process.env): string {
+  return resolve(env['DSH_HOME'] ?? join(homedir(), '.dsh'))
+}
+
+/**
  * Resolve transcript roots, honouring the same overrides the harnesses use
  * (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `KIMI_CODE_HOME`, `GROK_HOME`,
- * `PI_CODING_AGENT_DIR`) plus explicit `HARNESS_TRAJECTORY_*` overrides.
+ * `PI_CODING_AGENT_DIR`, `DSH_HOME`) plus explicit `HARNESS_TRAJECTORY_*`
+ * overrides.
  *
  * Defaults: `~/.claude/projects`, `~/.codex/sessions` + `~/.codex/archived_sessions`,
- * `~/.kimi-code/sessions`, `~/.grok/sessions`, `~/.pi/agent/sessions`.
+ * `~/.kimi-code/sessions`, `~/.grok/sessions`, `~/.pi/agent/sessions`,
+ * `~/.dsh/sessions`.
  */
 export function defaultRoots(env: NodeJS.ProcessEnv = process.env): HarnessRoot[] {
   const home = homedir()
@@ -70,5 +80,6 @@ export function defaultRoots(env: NodeJS.ProcessEnv = process.env): HarnessRoot[
     { kind: 'kimi', dir: resolve(env['HARNESS_TRAJECTORY_KIMI_ROOT'] ?? join(kimiHome, 'sessions')) },
     { kind: 'grok', dir: resolve(env['HARNESS_TRAJECTORY_GROK_ROOT'] ?? join(grokHome, 'sessions')) },
     { kind: 'pi', dir: resolve(env['HARNESS_TRAJECTORY_PI_ROOT'] ?? join(piAgentDir, 'sessions')) },
+    { kind: 'dsh', dir: resolve(env['HARNESS_TRAJECTORY_DSH_ROOT'] ?? join(dshHome(env), 'sessions')) },
   ]
 }

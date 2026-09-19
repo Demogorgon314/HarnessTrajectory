@@ -1,11 +1,11 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as zlib from 'node:zlib'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   compressedTranscriptPath, plainTranscriptPath, readDecodedPrefix, readFirstLine, readLines,
-  resolveTranscriptFile, utf8IncompleteTail, zstdSupported,
+  resolveTranscriptFile, scanZstdFrames, utf8IncompleteTail, zstdSupported,
 } from '../src/tail.ts'
 
 const dirs: string[] = []
@@ -136,5 +136,87 @@ describe.skipIf(!zstdSupported())('compressed transcripts (.jsonl.zst)', () => {
     expect(resolved?.compressed).toBe(false)
     expect(compressedTranscriptPath(plain)).toBe(compressed)
     expect(plainTranscriptPath(compressed)).toBe(plain)
+  })
+})
+
+describe.skipIf(!zstdSupported())('dsh frame transcripts (.jsonl.zstd)', () => {
+  /** One independently decodable, checksummed frame — what the writer appends per flush. */
+  function frame(body: string): Buffer {
+    return zlib.zstdCompressSync(Buffer.from(body, 'utf8'), {
+      params: { [zlib.constants.ZSTD_c_checksumFlag]: 1 },
+    })
+  }
+
+  it('scans complete checksummed frames and stops before a torn tail', () => {
+    const one = frame('a\n')
+    const two = frame('b\n')
+    const buffer = Buffer.concat([one, two, two.subarray(0, 6)])
+    const frames = scanZstdFrames(buffer)
+    expect(frames).toEqual([
+      { start: 0, end: one.length },
+      { start: one.length, end: one.length + two.length },
+    ])
+  })
+
+  it('rejects a corrupt frame structure instead of misreading it', () => {
+    const garbage = Buffer.concat([frame('a\n'), Buffer.from('not a frame')])
+    expect(() => scanZstdFrames(garbage)).toThrow(/magic/)
+  })
+
+  it('decodes EVERY concatenated frame, not just the first', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'harness-trajectory-tail-'))
+    dirs.push(dir)
+    const one = JSON.stringify({ type: 'session', id: 's-1' })
+    const two = JSON.stringify({ type: 'user/message', n: 1 })
+    const path = join(dir, 'session.jsonl.zstd')
+    await writeFile(path, Buffer.concat([frame(`${one}\n`), frame(`${two}\n`)]))
+    const all = await readLines(path, 0)
+    expect(all.lines).toEqual([one, two])
+    // The cursor is PHYSICAL bytes: the end of the file.
+    expect(all.offset).toBe((await stat(path)).size)
+  })
+
+  it('leaves a torn final frame unconsumed and resumes once it completes', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'harness-trajectory-tail-'))
+    dirs.push(dir)
+    const one = JSON.stringify({ type: 'session', id: 's-1' })
+    const two = JSON.stringify({ type: 'user/message', n: 1 })
+    const first = frame(`${one}\n`)
+    const second = frame(`${two}\n`)
+    const path = join(dir, 'session.jsonl.zstd')
+    // The second flush is only half on disk.
+    await writeFile(path, Buffer.concat([first, second.subarray(0, 8)]))
+    const partial = await readLines(path, 0)
+    expect(partial.lines).toEqual([one])
+    expect(partial.offset).toBe(first.length)
+    // A repeat read over the same torn tail makes no progress.
+    const stalled = await readLines(path, partial.offset, partial.rest)
+    expect(stalled.lines).toEqual([])
+    expect(stalled.offset).toBe(first.length)
+    // The flush finishes; the resumed read picks up exactly the new line.
+    await writeFile(path, Buffer.concat([first, second]))
+    const resumed = await readLines(path, stalled.offset, stalled.rest)
+    expect(resumed.lines).toEqual([two])
+    expect(resumed.offset).toBe(first.length + second.length)
+  })
+
+  it('reads the first decoded line through the first frame', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'harness-trajectory-tail-'))
+    dirs.push(dir)
+    const header = JSON.stringify({ type: 'session', id: 's-1' })
+    const path = join(dir, 'session.jsonl.zstd')
+    await writeFile(path, Buffer.concat([frame(`${header}\n`), frame('{}\n')]))
+    expect(await readFirstLine(path)).toBe(header)
+  })
+
+  it('reassembles a line split across two frames', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'harness-trajectory-tail-'))
+    dirs.push(dir)
+    const line = JSON.stringify({ type: 'user/message', text: 'split' })
+    const half = Math.ceil(line.length / 2)
+    const path = join(dir, 'session.jsonl.zstd')
+    await writeFile(path, Buffer.concat([frame(line.slice(0, half)), frame(`${line.slice(half)}\n`)]))
+    const all = await readLines(path, 0)
+    expect(all.lines).toEqual([line])
   })
 })

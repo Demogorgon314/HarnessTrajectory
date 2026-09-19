@@ -2,6 +2,7 @@ import type { HarnessKind, SessionFileRef } from '@harness-trajectory/core'
 import { createClaudeSynthesizer } from './claude.ts'
 import { createCodexSynthesizer } from './codex.ts'
 import { createDevinSynthesizer } from './devin.ts'
+import { createDshSynthesizer } from './dsh.ts'
 import { createGrokSynthesizer } from './grok.ts'
 import { createKimiSynthesizer } from './kimi.ts'
 import { createOpencodeSynthesizer } from './opencode.ts'
@@ -13,6 +14,7 @@ export {
   createClaudeSynthesizer,
   createCodexSynthesizer,
   createDevinSynthesizer,
+  createDshSynthesizer,
   createGrokSynthesizer,
   createKimiSynthesizer,
   createOpencodeSynthesizer,
@@ -28,5 +30,6 @@ export function createSynthesizer(kind: HarnessKind, file: SessionFileRef): Even
     case 'devin': return createDevinSynthesizer(file)
     case 'pi': return createPiSynthesizer(file)
     case 'opencode': return createOpencodeSynthesizer(file)
+    case 'dsh': return createDshSynthesizer(file)
   }
 }

@@ -6,7 +6,9 @@
 
 import {
   agentMentions, asArray, asNumber, asString, classifyInjectedUser, devinMessageClass, grokMessageClass, GrokPromptChunks,
-  codexHumanPromptText, isRecord, isPiHumanPrompt, kimiMessageClass, kimiTitleText, parseDevinLine, parseGrokLine,
+  codexHumanPromptText, dshSubagentIdOf, dshTextOf, dshToolResultOf, dshUserClass, isRecord, isPiHumanPrompt,
+  kimiMessageClass, kimiTitleText,
+  parseDevinLine, parseDshLine, parseGrokLine,
   opencodeTextOf, opencodeUserClass, parseJsonLine, parseOpencodeLine, parsePiLine, parseTime, piContentText,
   titleFrom, type AgentFileMeta, type HarnessKind,
 } from '@harness-trajectory/core'
@@ -76,7 +78,7 @@ export interface MetaScanner {
  * Bump when any scanner's logic changes: cached listing states from an older
  * version are discarded and the transcripts they covered are re-read.
  */
-export const META_SCANNER_VERSION = 6
+export const META_SCANNER_VERSION = 8
 
 /**
  * Serialized scanner payload for the listing cache: the public `state` plus
@@ -167,6 +169,7 @@ export function createMetaScanner(
     case 'devin': return devinMetaScanner(summary ?? null)
     case 'pi': return piMetaScanner()
     case 'opencode': return opencodeMetaScanner(summary ?? null)
+    case 'dsh': return dshMetaScanner()
   }
 }
 
@@ -716,6 +719,103 @@ function opencodeMetaScanner(session: Record<string, unknown> | null): MetaScann
   }
 }
 
+/**
+ * Dsh listing scanner: time, cwd, `session/title`, the first `request/header`
+ * model, the human-prompt count through the shared `dshUserClass` classifier,
+ * and the spawn map the Agent Network reads — a `tool/result` whose text is
+ * exactly `started subagent <childSessionId>` binds a child, described by the
+ * call's `description` argument. Times are epoch MILLISECONDS — noted
+ * directly, never `parseTime`.
+ */
+function dshMetaScanner(): MetaScanner {
+  const state = emptyMeta()
+  /** `tool/call` id → subagent task caption, pending until its result lands. */
+  const pendingCalls = new Map<string, string>()
+  const noteDshTime = (value: number): void => {
+    if (state.startedAt === null || value < state.startedAt) state.startedAt = value
+    if (state.lastTime === null || value > state.lastTime) state.lastTime = value
+  }
+  return {
+    state,
+    // A call awaiting its result across a restart keeps its description.
+    save() {
+      return [...pendingCalls.entries()]
+    },
+    load(saved) {
+      for (const pair of asArray(saved) ?? []) {
+        if (!Array.isArray(pair) || pair.length !== 2) continue
+        const callId = asString(pair[0])
+        const description = asString(pair[1])
+        if (callId === undefined || description === undefined) continue
+        pendingCalls.set(callId, description)
+      }
+    },
+    push(line) {
+      const record = parseDshLine(line)
+      if (record === null) return
+      if (record.tag === 'header') {
+        state.cwd ??= record.header.cwd ?? null
+        if (record.header.createdAt !== null) noteDshTime(record.header.createdAt)
+        return
+      }
+      if (record.tag === 'run') {
+        noteDshTime(record.run.time0)
+        return
+      }
+      const event = record.event
+      noteDshTime(event.time)
+      switch (event.type) {
+        case 'session/title': {
+          const title = asString(event.data['title'])
+          if (title !== undefined && title !== '') state.aiTitle = title
+          break
+        }
+        case 'request/header': {
+          const header = isRecord(event.data['header']) ? event.data['header'] : undefined
+          const config = isRecord(header?.['config']) ? header['config'] : undefined
+          state.model ??= asString(config?.['model']) ?? null
+          break
+        }
+        case 'user/message': {
+          if (dshUserClass(event) !== 'human') break
+          state.promptCount += 1
+          const text = dshTextOf(event.data['content'])
+          if (state.title === null && text.trim() !== '') state.title = titleFrom(text)
+          break
+        }
+        case 'tool/call': {
+          const callId = asString(event.data['callId'])
+          if (callId === undefined) break
+          // `arguments` is a JSON string on the wire; `description` is the
+          // subagent task caption the spawn listing displays.
+          const rawArgs = event.data['arguments']
+          const args = isRecord(rawArgs)
+            ? rawArgs
+            : (asString(rawArgs) === undefined ? undefined : parseJsonLine(asString(rawArgs) ?? ''))
+          const description = isRecord(args) ? asString(args['description']) : undefined
+          if (description !== undefined) pendingCalls.set(callId, description)
+          break
+        }
+        case 'tool/result': {
+          const { callId, result } = dshToolResultOf(event.data)
+          const childId = dshSubagentIdOf(dshTextOf(result?.['content']))
+          if (childId === undefined) break
+          const description = callId === undefined ? undefined : pendingCalls.get(callId)
+          if (callId !== undefined) pendingCalls.delete(callId)
+          state.agents.set(childId, {
+            agentId: childId,
+            ...(callId === undefined ? {} : { toolUseId: callId }),
+            ...(description === undefined ? {} : { description }),
+          })
+          break
+        }
+        default:
+          break
+      }
+    },
+  }
+}
+
 /** Read identity facts from the first record of a transcript. */
 export function readHead(kind: HarnessKind, firstLine: string): FileHead {
   // Kimi identity is path-derived (`session_<id>/agents/<agentId>/wire.jsonl`); nothing to probe.
@@ -726,6 +826,16 @@ export function readHead(kind: HarnessKind, firstLine: string): FileHead {
   // OpenCode's likewise (`opencode://sessions/<id>` — the source derives children from `parent_id`).
   if (kind === 'kimi' || kind === 'grok' || kind === 'devin' || kind === 'pi' || kind === 'opencode') {
     return { id: null, parentId: null }
+  }
+  // A dsh child's header carries `origin:"subagent"` + `parentSession`; a fork
+  // carries `parentSession` WITHOUT the origin and stays a session of its own.
+  if (kind === 'dsh') {
+    const record = parseDshLine(firstLine)
+    if (record === null || record.tag !== 'header') return { id: null, parentId: null }
+    return {
+      id: null,
+      parentId: record.header.origin === 'subagent' ? record.header.parentSession ?? null : null,
+    }
   }
   const record = parseJsonLine(firstLine)
   if (!isRecord(record)) return { id: null, parentId: null }

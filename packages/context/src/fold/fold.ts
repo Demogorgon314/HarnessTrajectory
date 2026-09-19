@@ -772,6 +772,14 @@ function applySurface(
       if (n.seq === op.end) { ei = i; break }
     }
     if (si >= 0 && ei >= si) {
+      // The splice already seats the node at the span's index; `pos` makes
+      // that order survive the client's seq sort — the node's own seq only
+      // bounds which requests see it (e.g. an offload's projected copy).
+      const first = st.surface[si]
+      if (first !== undefined) {
+        const pos = first.pos ?? first.seq
+        if (pos !== ev.seq) node.pos = pos
+      }
       const removed = st.surface.splice(si, ei - si + 1, node)
       archiveRemoved(st, removed, ev.seq)
       for (const r of removed) st.sums[r.cat] -= r.tokens
@@ -1656,8 +1664,8 @@ function detailCollectionsOf(state: TimelineState, bounds: FoldBounds): Omit<Con
   // drops their identity while their tokens keep counting (sums cover the
   // full surface) — the browser's section would show a token sum with zero
   // listable items. Skill content behaves the same way; pin both categories
-  // into the served list. The overflow slice precedes the tail by position,
-  // so the concatenation stays seq-ordered.
+  // into the served list. The overflow slice precedes the tail by surface
+  // position, so the concatenation stays in display order.
   const overflowCount = Math.max(0, state.surface.length - bounds.maxNodes)
   const overflow = state.surface.slice(0, overflowCount)
   const tail = state.surface.slice(overflowCount)

@@ -1,6 +1,6 @@
 # harness-trajectory — agent guide
 
-Local viewer for Claude Code, Codex, Kimi Code, Grok Build, Devin CLI, pi, and OpenCode sessions.
+Local viewer for Claude Code, Codex, Kimi Code, Grok Build, Devin CLI, pi, OpenCode, and DeepSeek Harness sessions.
 Trajectory is ported from deepseek-harness; Context is ported from dsh-context.
 Transcripts stay local. Harness roots are read-only.
 

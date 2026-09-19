@@ -158,7 +158,8 @@ export function joinNodesOf(
 ): ConversationNodeLike[] {
   const calls = new Map<string, { name: string; argsRaw: string }>()
   const out: ConversationNodeLike[] = []
-  const surfaces: SurfaceNode[] = [...timeline.nodes, ...timeline.archive].sort((a, b) => a.seq - b.seq)
+  const surfaces: SurfaceNode[] = [...timeline.nodes, ...timeline.archive]
+    .sort((a, b) => (a.pos ?? a.seq) - (b.pos ?? b.seq))
   // Pass 1: every tool call the log carried, by call id.
   for (const node of surfaces) {
     if (node.cat !== 'assistant') continue

@@ -15,7 +15,8 @@ export interface AgentSpawn {
    * Claude: the `agentId` (child file basename is `agent-<agentId>`);
    * Codex: the child thread id; Kimi: the `agents/<agentId>` directory name
    * (`task.started.info.agentId`); Grok: the `subagent_spawned.subagent_id`,
-   * which is also the child session id and its top-level directory name.
+   * which is also the child session id and its top-level directory name;
+   * dsh: the child session id (what `started subagent <id>` binds).
    */
   key: string
   /** Task description shown as the node caption. */
@@ -66,12 +67,13 @@ export type SynthesizerFactory = (file: SessionFileRef) => EventSynthesizer
  *
  * Only Claude needs a transform (its child files are named `agent-<agentId>`).
  * Codex child files are keyed by their thread id, KIMI child files by their
- * `agents/<agentId>` directory name, and GROK child files by their own
+ * `agents/<agentId>` directory name, GROK child files by their own
  * top-level session directory name — which is exactly the `subagent_id` the
- * parent's `subagent_spawned` records (GROK-FORMAT §D.2/§D.4) and exactly the
- * id the server hands back as `file.id` — so all three fall through to
+ * parent's `subagent_spawned` records (GROK-FORMAT §D.2/§D.4) — and dsh child
+ * files by the child session id, which is exactly the id the parent's
+ * `started subagent <id>` result binds. All four fall through to
  * `file.id` unchanged. Keep it that way: a transform here would break the Agent
- * Network's parent→child join for Kimi and Grok.
+ * Network's parent→child join for Kimi, Grok, and dsh.
  */
 export function childKeyOf(kind: HarnessKind, file: SessionFileRef): string {
   if (kind === 'claude') {

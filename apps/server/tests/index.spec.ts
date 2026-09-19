@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto'
 import { mkdtemp, mkdir, rm, utimes, writeFile, appendFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -124,6 +125,36 @@ function grokPrompt(text: string, promptIndex: number, offset: number, sessionId
   }, offset, sessionId, { promptId: `prompt-${promptIndex}` })
 }
 
+const DSH_MAIN = 'session-main-0001'
+const DSH_CHILD = 'session-child-0002'
+
+/** One independently decodable, checksummed Zstandard frame — what the writer appends per flush. */
+function dshFrame(body: string): Buffer {
+  return zlib.zstdCompressSync(Buffer.from(body, 'utf8'), {
+    params: { [zlib.constants.ZSTD_c_checksumFlag]: 1 },
+  })
+}
+
+function dshFrames(...bodies: string[]): Buffer {
+  return Buffer.concat(bodies.map(dshFrame))
+}
+
+/** The `type:"session"` header line; `time` fields are epoch MILLISECONDS. */
+function dshHeader(id: string, extra: Record<string, unknown> = {}) {
+  return { type: 'session', version: 3, id, createdAt: T0, cwd: '/work/dsh', isSeeded: false, ...extra }
+}
+
+function dshEvent(type: string, seq: number, offset: number, data: Record<string, unknown> = {}) {
+  return { type, seq, time: T0 + offset, data }
+}
+
+function dshUser(text: string, seq: number, offset: number) {
+  return dshEvent('user/message', seq, offset, {
+    source: { kind: 'user' },
+    content: [{ type: 'text', text }],
+  })
+}
+
 /** The nine always-present `summary.json` keys (GROK-FORMAT §B.1), plus whatever a case needs. */
 function grokSummary(id: string, cwd: string, extra: Record<string, unknown> = {}): string {
   return JSON.stringify({
@@ -209,6 +240,24 @@ describe('classifyPath', () => {
     expect(classifyPath('grok', root, `${dir}/terminal/updates.jsonl`)).toBeNull()
   })
 
+  it('recognizes dsh generation logs only inside a session directory', () => {
+    const root = '/r'
+    expect(classifyPath('dsh', root, '/r/--work--/session-a1/session.jsonl.zstd'))
+      .toEqual({ id: 'session-a1', role: 'main' })
+    expect(classifyPath('dsh', root, '/r/--work--/session-a1/session.v3.jsonl.zstd'))
+      .toEqual({ id: 'session-a1', role: 'main' })
+    expect(classifyPath('dsh', root, '/r/--work--/session-a1/session.jsonl'))
+      .toEqual({ id: 'session-a1', role: 'main' })
+    // The session lease and side stores are not transcripts; neither is a log
+    // at the wrong depth or under another harness's suffix rules.
+    expect(classifyPath('dsh', root, '/r/--work--/session-a1/session.lock')).toBeNull()
+    expect(classifyPath('dsh', root, '/r/--work--/session-a1/notes.jsonl')).toBeNull()
+    expect(classifyPath('dsh', root, '/r/--work--/session.jsonl.zstd')).toBeNull()
+    expect(classifyPath('dsh', root, '/r/a/b/session-a1/session.jsonl.zstd')).toBeNull()
+    expect(classifyPath('dsh', root, '/r/--work--/session-a1/session.jsonl.zst')).toBeNull()
+    expect(classifyPath('claude', root, '/r/-slug/session-a1/session.jsonl.zstd')).toBeNull()
+  })
+
   it('recognizes pi sessions by the encoded-cwd directory and a first-underscore id split', () => {
     const root = '/r'
     expect(classifyPath('pi', root, '/r/--work-project--/2026-09-14T10-00-00-000Z_abc123.jsonl'))
@@ -235,6 +284,7 @@ describe('defaultRoots', () => {
       KIMI_CODE_HOME: join('/h', '.kimi-code'),
       GROK_HOME: join('/h', '.grok'),
       PI_CODING_AGENT_DIR: join('/h', '.pi', 'agent'),
+      DSH_HOME: join('/h', '.dsh'),
     })).toEqual([
       { kind: 'claude', dir: join('/h', '.claude', 'projects') },
       { kind: 'codex', dir: join('/h', '.codex', 'sessions') },
@@ -242,6 +292,7 @@ describe('defaultRoots', () => {
       { kind: 'kimi', dir: join('/h', '.kimi-code', 'sessions') },
       { kind: 'grok', dir: join('/h', '.grok', 'sessions') },
       { kind: 'pi', dir: join('/h', '.pi', 'agent', 'sessions') },
+      { kind: 'dsh', dir: join('/h', '.dsh', 'sessions') },
     ])
     expect(defaultRoots({
       HARNESS_TRAJECTORY_CLAUDE_ROOT: join('/roots', 'c'),
@@ -250,8 +301,9 @@ describe('defaultRoots', () => {
       HARNESS_TRAJECTORY_KIMI_ROOT: join('/roots', 'k'),
       HARNESS_TRAJECTORY_GROK_ROOT: join('/roots', 'g'),
       HARNESS_TRAJECTORY_PI_ROOT: join('/roots', 'p'),
+      HARNESS_TRAJECTORY_DSH_ROOT: join('/roots', 'd'),
     }).map(root => root.dir))
-      .toEqual([join('/roots', 'c'), join('/roots', 'x'), join('/roots', 'xa'), join('/roots', 'k'), join('/roots', 'g'), join('/roots', 'p')])
+      .toEqual([join('/roots', 'c'), join('/roots', 'x'), join('/roots', 'xa'), join('/roots', 'k'), join('/roots', 'g'), join('/roots', 'p'), join('/roots', 'd')])
     // An empty `GROK_HOME` is not an override: grok itself falls back to the home default.
     expect(defaultRoots({ GROK_HOME: '' }).find(root => root.kind === 'grok')?.dir.endsWith(join('.grok', 'sessions'))).toBe(true)
   })
@@ -563,6 +615,62 @@ describe('meta scanners', () => {
     ]
     for (const line of lines) expect(() => { scanner.push(line) }).not.toThrow()
     expect(scanner.state).toMatchObject({ title: null, promptCount: 0 })
+  })
+
+  it('summarizes a dsh transcript: cwd, millisecond times, model, titles, prompts, and spawn facts', () => {
+    const scanner = createMetaScanner('dsh')
+    const lines = jsonl([
+      dshHeader(DSH_MAIN),
+      dshEvent('request/header', 1, 10, { header: { config: { model: 'deepseek-v4' } } }),
+      dshUser('Add dsh support', 2, 20),
+      dshEvent('session/title', 3, 30, { title: 'dsh session' }),
+      // `arguments` is a JSON STRING on the wire; `description` is the spawn caption.
+      dshEvent('tool/call', 4, 40, { callId: 'call-1', name: 'subagent', arguments: '{"description":"Scout the repo"}' }),
+      dshEvent('tool/result', 5, 50, {
+        message: {
+          source: { callId: 'call-1' },
+          content: [{
+            type: 'tool-result', toolCallId: 'call-1',
+            content: [{ type: 'text', text: `started subagent ${DSH_CHILD}` }],
+          }],
+        },
+      }),
+      // A non-`user` source kind is injected context, and a replace surfaceOp
+      // is a compaction summary — neither is a human prompt.
+      dshEvent('user/message', 6, 60, { source: { kind: 'context' }, content: [{ type: 'text', text: 'injected' }] }),
+      {
+        ...dshUser('previous summary', 7, 70),
+        surfaceOp: { op: 'replace', startSeq: 1, endSeq: 6 },
+      },
+    ])
+    for (const line of lines.split('\n').filter(line => line !== '')) scanner.push(line)
+    expect(scanner.state).toMatchObject({
+      title: 'Add dsh support', aiTitle: 'dsh session', cwd: '/work/dsh', model: 'deepseek-v4',
+      promptCount: 1, startedAt: T0, lastTime: T0 + 70,
+    })
+    expect(scanner.state.agents.get(DSH_CHILD)).toEqual({
+      agentId: DSH_CHILD, toolUseId: 'call-1', description: 'Scout the repo',
+    })
+  })
+
+  it('keeps a pending dsh tool call description across a listing-cache resume', () => {
+    const first = createMetaScanner('dsh')
+    first.push(JSON.stringify(
+      dshEvent('tool/call', 1, 10, { callId: 'call-1', name: 'subagent', arguments: '{"description":"Scout the repo"}' }),
+    ))
+    const saved = serializeMeta(first)
+    const resumed = createMetaScanner('dsh')
+    expect(hydrateMeta(resumed, saved ?? '')).toBe(true)
+    resumed.push(JSON.stringify(dshEvent('tool/result', 2, 20, {
+      message: {
+        source: { callId: 'call-1' },
+        content: [{
+          type: 'tool-result', toolCallId: 'call-1',
+          content: [{ type: 'text', text: `started subagent ${DSH_CHILD}` }],
+        }],
+      },
+    })))
+    expect(resumed.state.agents.get(DSH_CHILD)).toMatchObject({ description: 'Scout the repo' })
   })
 })
 
@@ -1351,6 +1459,224 @@ describe('SessionIndex Codex lineage and compression', () => {
     indexer.stop()
     store.close()
   })
+})
+
+describe.skipIf(!zstdSupported())('SessionIndex — dsh', () => {
+  let dir: string
+  let index: SessionIndex | undefined
+
+  /** `<root>/sessions/<encoded-cwd>/<session-id>/` — the sessions root mirrors `$DSH_HOME/sessions`. */
+  const sessionDir = (id: string) => join(dir, 'dsh', 'sessions', '--work-dsh--', id)
+  const dshRoot = () => join(dir, 'dsh', 'sessions')
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'harness-trajectory-dsh-'))
+  })
+
+  afterEach(async () => {
+    index?.stop()
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  async function startIndex(): Promise<SessionIndex> {
+    index = new SessionIndex({ roots: [{ kind: 'dsh', dir: dshRoot() }], watch: false })
+    await index.start()
+    return index
+  }
+
+  /** All `lines` payloads of a replay, flattened in order. */
+  async function replayLines(idx: SessionIndex, id: string): Promise<unknown[]> {
+    const records: unknown[] = []
+    await idx.readAll('dsh', id, event => {
+      if (event.type === 'lines') for (const line of event.lines) records.push(JSON.parse(line))
+    })
+    return records
+  }
+
+  it('registers one session for a directory holding several generations', async () => {
+    const home = sessionDir(DSH_MAIN)
+    await mkdir(home, { recursive: true })
+    // The v0 log and the seeded v3 successor sit side by side; only the
+    // current (highest-version) generation is the session's transcript.
+    await writeFile(join(home, 'session.jsonl.zstd'), dshFrames(jsonl([
+      dshHeader(DSH_MAIN, { version: 0 }), dshUser('Old generation', 1, 10),
+    ])))
+    await writeFile(join(home, 'session.v3.jsonl.zstd'), dshFrames(jsonl([
+      dshHeader(DSH_MAIN, { isSeeded: true }), dshUser('Current generation', 1, 10),
+    ])))
+    await startIndex()
+    expect(index?.list().filter(session => session.kind === 'dsh')).toHaveLength(1)
+    const session = index?.get('dsh', DSH_MAIN)
+    expect(session).toMatchObject({ title: 'Current generation', cwd: '/work/dsh', promptCount: 1 })
+    const texts = (await replayLines(index!, DSH_MAIN))
+      .map(record => (record as { type: string }).type)
+    expect(texts).toEqual(['session', 'user/message'])
+  })
+
+  it('binds a subagent child through its header and stamps the spawn description', async () => {
+    const main = sessionDir(DSH_MAIN)
+    const child = sessionDir(DSH_CHILD)
+    await mkdir(main, { recursive: true })
+    await mkdir(child, { recursive: true })
+    await writeFile(join(main, 'session.v3.jsonl.zstd'), dshFrames(jsonl([
+      dshHeader(DSH_MAIN),
+      dshUser('Top-level work', 1, 10),
+      dshEvent('tool/call', 2, 20, { callId: 'call-1', name: 'subagent', arguments: '{"description":"Scout the repo"}' }),
+      dshEvent('tool/result', 3, 30, {
+        message: {
+          source: { callId: 'call-1' },
+          content: [{
+            type: 'tool-result', toolCallId: 'call-1',
+            content: [{ type: 'text', text: `started subagent ${DSH_CHILD}` }],
+          }],
+        },
+      }),
+    ])))
+    await writeFile(join(child, 'session.v3.jsonl.zstd'), dshFrames(jsonl([
+      dshHeader(DSH_CHILD, { origin: 'subagent', parentSession: DSH_MAIN }),
+      dshUser('child prompt', 1, 25),
+    ])))
+    await startIndex()
+    const session = index?.get('dsh', DSH_MAIN)
+    expect(session).toMatchObject({ childCount: 1 })
+    expect(session?.files.map(file => file.role)).toEqual(['main', 'child'])
+    expect(session?.files[1]).toMatchObject({
+      id: DSH_CHILD, parentId: DSH_MAIN,
+      agent: { agentId: DSH_CHILD, description: 'Scout the repo', toolUseId: 'call-1' },
+    })
+    // The child is not a session of its own.
+    expect(index?.get('dsh', DSH_CHILD)).toBeUndefined()
+    // A fork names `parentSession` WITHOUT the subagent origin — it stays a session.
+    const fork = sessionDir('session-fork-0003')
+    await mkdir(fork, { recursive: true })
+    await writeFile(join(fork, 'session.v3.jsonl.zstd'), dshFrames(jsonl([
+      dshHeader('session-fork-0003', { parentSession: DSH_MAIN }),
+      dshUser('fork prompt', 1, 40),
+    ])))
+    await index?.refreshPath(join(fork, 'session.v3.jsonl.zstd'))
+    expect(index?.get('dsh', 'session-fork-0003')).toMatchObject({ title: 'fork prompt' })
+  })
+
+  it('re-points the entry at a newly published generation with a file reset', async () => {
+    const home = sessionDir(DSH_MAIN)
+    await mkdir(home, { recursive: true })
+    const v0 = join(home, 'session.jsonl.zstd')
+    await writeFile(v0, dshFrames(jsonl([
+      dshHeader(DSH_MAIN, { version: 0 }), dshUser('Before migration', 1, 10),
+    ])))
+    const idx = await startIndex()
+    const events: SessionLiveEvent[] = []
+    const unsubscribe = idx.subscribe('dsh', DSH_MAIN, event => events.push(event))
+    expect(idx.get('dsh', DSH_MAIN)?.files[0]?.path).toBe(v0)
+    // A resume publishes the seeded successor: a transformed prefix plus new records.
+    const v3 = join(home, 'session.v3.jsonl.zstd')
+    await writeFile(v3, dshFrames(jsonl([
+      dshHeader(DSH_MAIN, { isSeeded: true }), dshUser('Inherited prompt', 1, 10),
+      dshUser('After migration', 2, 20),
+    ])))
+    // The watch event names the NEW file; the entry migrates to it.
+    await idx.refreshPath(v3)
+    expect(idx.get('dsh', DSH_MAIN)?.files[0]?.path).toBe(v3)
+    const resets = events.filter(event => event.type === 'file' && event.reset === true)
+    expect(resets).toHaveLength(1)
+    const lines = await replayLines(idx, DSH_MAIN)
+    expect(lines.map(record => (record as { type: string }).type))
+      .toEqual(['session', 'user/message', 'user/message'])
+    unsubscribe()
+  })
+
+  it('migrates to a generation published while the entry was registered', async () => {
+    const home = sessionDir(DSH_MAIN)
+    await mkdir(home, { recursive: true })
+    // Only v0 exists at registration; v3 lands later, named by a stale-path refresh.
+    const v0 = join(home, 'session.jsonl.zstd')
+    await writeFile(v0, dshFrames(jsonl([dshHeader(DSH_MAIN), dshUser('v0 prompt', 1, 10)])))
+    const idx = await startIndex()
+    const v3 = join(home, 'session.v3.jsonl.zstd')
+    await writeFile(v3, dshFrames(jsonl([
+      dshHeader(DSH_MAIN, { isSeeded: true }), dshUser('v3 prompt', 1, 10),
+    ])))
+    // The refresh names the OLD path (a watcher may fire on either file).
+    await idx.refreshPath(v0)
+    expect(idx.get('dsh', DSH_MAIN)?.files[0]?.path).toBe(v3)
+    const lines = await replayLines(idx, DSH_MAIN)
+    expect((lines[1] as { data?: { content?: { text?: string }[] } }).data?.content?.[0]?.text)
+      .toBe('v3 prompt')
+  })
+
+  it('re-homes a file registered before its first frame completed', async () => {
+    const main = sessionDir(DSH_MAIN)
+    const child = sessionDir(DSH_CHILD)
+    await mkdir(main, { recursive: true })
+    await mkdir(child, { recursive: true })
+    await writeFile(join(main, 'session.v3.jsonl.zstd'), dshFrames(jsonl([
+      dshHeader(DSH_MAIN), dshUser('parent prompt', 1, 10),
+    ])))
+    const childPath = join(child, 'session.v3.jsonl.zstd')
+    // The watcher fires on file creation: the first frame is still torn.
+    const frame = dshFrame(jsonl([
+      dshHeader(DSH_CHILD, { origin: 'subagent', parentSession: DSH_MAIN }),
+      dshUser('child prompt', 1, 20),
+    ]))
+    await writeFile(childPath, frame.subarray(0, 8))
+    const idx = await startIndex()
+    // Registered as a main session: the header was unreadable.
+    expect(idx.get('dsh', DSH_CHILD)).toBeDefined()
+    // The flush completes; the first consumed line settles the role.
+    await writeFile(childPath, frame)
+    await idx.refreshPath(childPath)
+    expect(idx.get('dsh', DSH_CHILD)).toBeUndefined()
+    const parent = idx.get('dsh', DSH_MAIN)
+    expect(parent?.files.map(file => file.role)).toEqual(['main', 'child'])
+    expect(parent?.files[1]).toMatchObject({ id: DSH_CHILD, parentId: DSH_MAIN })
+  })
+
+  it('resolves blobref hashes against the global attachment store', async () => {
+    const home = sessionDir(DSH_MAIN)
+    await mkdir(home, { recursive: true })
+    await writeFile(join(home, 'session.v3.jsonl.zstd'), dshFrames(jsonl([
+      dshHeader(DSH_MAIN), dshUser('look at this', 1, 10),
+    ])))
+    const idx = await startIndex()
+    const hash = 'a'.repeat(64)
+    // `<root>/sessions` → `<dshHome>/attachments/v1/objects/<2-hex>/<sha256>`.
+    expect(idx.blobPath('dsh', DSH_MAIN, DSH_MAIN, hash))
+      .toBe(join(dir, 'dsh', 'attachments', 'v1', 'objects', 'aa', hash))
+    expect(idx.blobPath('dsh', DSH_MAIN, DSH_MAIN, 'not-a-hash')).toBeNull()
+    expect(idx.blobPath('dsh', 'missing', 'missing', hash)).toBeNull()
+  })
+
+  it('backfills search across a zstd frame larger than the read window', async () => {
+    const home = sessionDir(DSH_MAIN)
+    await mkdir(home, { recursive: true })
+    // One frame bigger than the 8 MiB read window: incompressible padding
+    // keeps its compressed size above INITIAL_CHUNK_BYTES, so a bounded read
+    // ending inside it yields zero progress without being a torn tail.
+    const pad = randomBytes(9 * 1024 * 1024).toString('base64')
+    const head = jsonl([dshHeader(DSH_MAIN), dshUser('early needle', 1, 10)])
+    const tail = jsonl([
+      dshEvent('turn/start', 2, 20, { pad }),
+      dshUser('late needle', 3, 30),
+    ])
+    await writeFile(join(home, 'session.jsonl.zstd'), dshFrames(head, tail))
+    const idx = await startIndex()
+    const store = new SearchStore({ path: ':memory:' })
+    const search = new SearchIndexer({ store, extract: extractSearchDocs, maxAgeDays: 0 })
+    try {
+      // Search attaches mid-run: historical lines are re-read from disk
+      // through bounded windows instead of the consume path.
+      await idx.enableSearch(search)
+      search.flush()
+      const rows = store.db.prepare(
+        'select docs.line, texts.text from docs join texts on texts.id = docs.text order by docs.line',
+      ).all() as { line: number; text: Uint8Array }[]
+      expect(rows.map(row => [row.line, unpackText(row.text)]))
+        .toEqual([[1, 'early needle'], [3, 'late needle']])
+    } finally {
+      search.stop()
+      store.close()
+    }
+  }, 30000)
 })
 
 describe('SessionIndex start can be cancelled', () => {
