@@ -817,26 +817,7 @@ function dshMetaScanner(): MetaScanner {
 }
 
 /** Read identity facts from the first record of a transcript. */
-export function readHead(kind: HarnessKind, firstLine: string): FileHead {
-  // Kimi identity is path-derived (`session_<id>/agents/<agentId>/wire.jsonl`); nothing to probe.
-  // Grok's is too (`<encoded-cwd>/<session-id>/updates.jsonl`), and its parent link lives in the
-  // parent's `subagents/<id>/meta.json`, not in the first record (GROK-FORMAT §D.4).
-  // Devin's likewise (`devin://sessions/<id>` — the source derives chains, not the head).
-  // pi's too (`<encoded-cwd>/<ts>_<id>.jsonl`; `parentSession` is fork lineage, not a child link).
-  // OpenCode's likewise (`opencode://sessions/<id>` — the source derives children from `parent_id`).
-  if (kind === 'kimi' || kind === 'grok' || kind === 'devin' || kind === 'pi' || kind === 'opencode') {
-    return { id: null, parentId: null }
-  }
-  // A dsh child's header carries `origin:"subagent"` + `parentSession`; a fork
-  // carries `parentSession` WITHOUT the origin and stays a session of its own.
-  if (kind === 'dsh') {
-    const record = parseDshLine(firstLine)
-    if (record === null || record.tag !== 'header') return { id: null, parentId: null }
-    return {
-      id: null,
-      parentId: record.header.origin === 'subagent' ? record.header.parentSession ?? null : null,
-    }
-  }
+export function readHead(kind: 'claude' | 'codex', firstLine: string): FileHead {
   const record = parseJsonLine(firstLine)
   if (!isRecord(record)) return { id: null, parentId: null }
   if (kind === 'codex') {

@@ -17,8 +17,9 @@
 
 import { readdir, stat } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
+import { parseDshLine } from '@harness-trajectory/core'
 import type { Classified } from './classified.ts'
-import { zstdSupported } from '../tail.ts'
+import { readFirstLine, zstdSupported } from '../tail.ts'
 
 /** One generation file: `session.jsonl[.zstd]` is v0, `session.vN.jsonl[.zstd]` is version N. */
 const LOG_NAME = /^session(?:\.v(\d+))?\.jsonl(\.zstd)?$/
@@ -79,16 +80,16 @@ export async function resolveDshLog(dir: string): Promise<DshLogFile | null> {
 }
 
 /**
- * Generation lifecycle bookkeeping for `SessionIndex`, the dsh counterpart of
- * `CodexRollouts`: session-directory → live-entry registry plus current-
- * generation resolution. Every entry point (startup sweep, watcher, poll)
- * must resolve the session directory and dedupe against the same entry, so
- * both concerns live here. The consume lock, stream reset, search rebinding,
- * and subscriber events stay in `SessionIndex`.
+ * Owns directory identity, pending generation changes and header confirmation.
+ * SessionIndex applies transitions under its consume lock and owns the shared
+ * cursors, session membership, search rebinding and subscriber events.
+ * This state is ephemeral: restart resolves the current path and probes its
+ * header before restoring that path's listing cursor.
  */
-export class DshGenerations<E> {
+export class DshGenerations<E extends object> {
   /** Session directory → the entry currently reading it. */
   private readonly byDir = new Map<string, E>()
+  private readonly states = new WeakMap<E, DshSessionState>()
 
   /** The current (highest-version) generation of `path`'s session directory. */
   resolve(path: string): Promise<DshLogFile | null> {
@@ -100,9 +101,65 @@ export class DshGenerations<E> {
     return this.byDir.get(dirname(path))
   }
 
-  /** Record `entry` as the live reader of `path`'s session directory. */
-  note(path: string, entry: E): void {
+  /** Register once, after probing the current file and before consuming it. */
+  register(path: string, entry: E, identity: DshIdentity): void {
     this.byDir.set(dirname(path), entry)
+    this.states.set(entry, { path, awaitingHeader: !identity.confirmed, pending: undefined })
+  }
+
+  /** Stage a path change without moving the active reader's cursor. */
+  stage(entry: E, generation: DshLogFile): void {
+    const state = this.states.get(entry)
+    if (state !== undefined && state.path !== generation.path) state.pending = generation
+  }
+
+  /** Commit a staged change only under the caller's consume lock. */
+  takePending(entry: E): DshLogFile | undefined {
+    const state = this.states.get(entry)
+    const pending = state?.pending
+    if (state === undefined || pending === undefined) return undefined
+    state.pending = undefined
+    state.path = pending.path
+    return pending
+  }
+
+  /** A torn first frame settles identity on its first complete non-blank record. */
+  parentFromLines(entry: E, startLine: number, lines: readonly string[]): string | undefined {
+    const state = this.states.get(entry)
+    const first = lines[0]
+    if (state === undefined || !state.awaitingHeader || first === undefined) return undefined
+    // A restored cursor may already be past an invalid/missing header. Later
+    // records cannot establish identity on behalf of that first record.
+    if (startLine !== 0) return undefined
+    state.awaitingHeader = false
+    return dshIdentity(first).parentId
+  }
+}
+
+interface DshSessionState {
+  path: string
+  awaitingHeader: boolean
+  pending: DshLogFile | undefined
+}
+
+export interface DshIdentity {
+  confirmed: boolean
+  parentId?: string
+}
+
+function dshIdentity(line: string): DshIdentity {
+  const record = parseDshLine(line)
+  if (record?.tag !== 'header') return { confirmed: false }
+  const parentId = record.header.origin === 'subagent' ? record.header.parentSession : undefined
+  return { confirmed: true, ...(parentId === undefined ? {} : { parentId }) }
+}
+
+/** Missing or incomplete headers keep path-derived identity until consumption. */
+export async function readDshIdentity(path: string): Promise<DshIdentity> {
+  try {
+    return dshIdentity(await readFirstLine(path))
+  } catch {
+    return { confirmed: false }
   }
 }
 

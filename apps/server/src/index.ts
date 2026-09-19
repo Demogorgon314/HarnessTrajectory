@@ -8,7 +8,7 @@ import { existsSync, watch, type FSWatcher } from 'node:fs'
 import { readdir, stat } from 'node:fs/promises'
 import { basename, dirname, join, relative, sep } from 'node:path'
 import {
-  asNumber, isRecord, parseDshLine, parseJsonLine,
+  asNumber, isRecord, parseJsonLine,
   type AgentFileMeta, type HarnessKind, type SessionDetail, type SessionFileRef,
   type SessionLiveEvent, type SessionSummary,
 } from '@harness-trajectory/core'
@@ -41,7 +41,9 @@ import {
 } from './harness/grok.ts'
 import { classifyKimiPath, kimiChildDir, readKimiTitle } from './harness/kimi.ts'
 import { classifyPiPath } from './harness/pi.ts'
-import { classifyDshPath, DshGenerations, dshAttachmentPath, type DshLogFile } from './harness/dsh.ts'
+import {
+  classifyDshPath, DshGenerations, dshAttachmentPath, readDshIdentity, type DshLogFile,
+} from './harness/dsh.ts'
 import { readJsonRecord } from './harness/sidecar.ts'
 
 /** Keep the owning header even though it precedes the child's activity boundary. */
@@ -160,16 +162,6 @@ interface FileEntry extends SourceEntry {
   decodedSize?: number
   /** Codex only: a superseded same-thread rollout — never listed as a session. */
   superseded?: boolean
-
-  // -- Dsh generations --------------------------------------------------------
-  /** Dsh only: a newer generation resolved, waiting for the consume lock to re-point this entry. */
-  dshPending?: DshLogFile | undefined
-  /**
-   * Dsh only: the header line was not readable at registration (the first
-   * frame was still torn), so `ref.parentId` is unproven — the first consumed
-   * line settles it (`probeDshHeader`).
-   */
-  dshUnprobed?: boolean | undefined
 }
 
 type SessionRecord = SourceSession<FileEntry>
@@ -680,8 +672,9 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     // Codex identity lives in `session_meta`; a Claude child names its parent in its first record.
     // Kimi needs no probe: `classifyPath` already derived both ids from the path.
     // A dsh child's header names its parent (`origin:"subagent"` + `parentSession`).
-    let dshUnprobed = false
-    if (root.kind === 'codex' || root.kind === 'dsh' || (root.kind === 'claude' && classified.role === 'child')) {
+    const dshIdentity = root.kind === 'dsh' ? await readDshIdentity(path) : undefined
+    if (dshIdentity !== undefined) parentId = dshIdentity.parentId
+    if (root.kind === 'codex' || (root.kind === 'claude' && classified.role === 'child')) {
       try {
         const firstLine = await readFirstLine(path)
         const head = readHead(root.kind, firstLine)
@@ -691,19 +684,12 @@ export class SessionIndex extends EventEmitter implements SessionSource {
           parentId = head.parentId ?? undefined
           historyBase = head.historyBase ?? undefined
           historyStartOrdinal = head.historyStartOrdinal ?? undefined
-        } else if (root.kind === 'dsh') {
-          parentId = head.parentId ?? undefined
-          // A session file exists before its first frame completes, so a watch
-          // event can register it while the header is still unreadable. The
-          // first consumed line then settles the role (`probeDshHeader`).
-          dshUnprobed = parentId === undefined && parseDshLine(firstLine)?.tag !== 'header'
         } else if (parentId === undefined) {
           parentId = head.id ?? undefined
         }
       } catch {
         // Unreadable head: keep the path-derived identity.
         if (root.kind === 'codex') threadId = classified.threadUuid ?? rolloutId
-        else if (root.kind === 'dsh') dshUnprobed = true
       }
     }
     // Codex lineage: `history_base` names the older rollout this file's
@@ -778,7 +764,6 @@ export class SessionIndex extends EventEmitter implements SessionSource {
       basesConsumed: false,
       ...(root.kind === 'grok' ? { summaryTitle: grokSummaryTitle(grokSummary) } : {}),
       ...(grokUnresolved && role === 'main' ? { grokUnresolved: true } : {}),
-      ...(dshUnprobed ? { dshUnprobed: true } : {}),
       ...(root.kind === 'codex' ? {
         rootDir: root.dir,
         ...(rolloutId === undefined ? {} : { rolloutId }),
@@ -792,7 +777,7 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     }
     if (this.book.files.has(path)) return this.book.files.get(path)
     this.book.files.set(path, entry)
-    if (root.kind === 'dsh') this.dsh.note(path, entry)
+    if (dshIdentity !== undefined) this.dsh.register(path, entry, dshIdentity)
     if (root.kind === 'codex') {
       this.codex.registered(entry)
       // Heads still waiting for this file as a lineage base re-resolve through it.
@@ -922,7 +907,7 @@ export class SessionIndex extends EventEmitter implements SessionSource {
    * the successor is NOT the same byte stream — it opens with a transformed
    * inherited prefix — so the whole stream is reset and re-read, and the old
    * generation's search rows are dropped. The swap itself is deferred to the
-   * consume lock (`dshPending`) so an in-flight read never sees the path move
+   * consume lock so an in-flight read never sees the path move
    * under its cursor.
    */
   private async migrateDshGeneration(
@@ -930,7 +915,7 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     resolved: DshLogFile,
     initial: boolean,
   ): Promise<FileEntry> {
-    entry.dshPending = resolved
+    this.dsh.stage(entry, resolved)
     await this.consume(entry, resolved.size, resolved.mtimeMs, initial)
     this.saveListing(entry)
     return entry
@@ -1280,9 +1265,12 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     // A newer dsh generation resolved while a consume may have been in flight:
     // re-point the entry inside the lock, before the size/offset comparisons
     // below would read the new file's stat against the old stream's cursor.
-    const pendingGeneration = entry.dshPending
+    const pendingGeneration = this.dsh.takePending(entry)
     if (pendingGeneration !== undefined) {
-      entry.dshPending = undefined
+      // Coalesced consume stats can belong to the predecessor. A generation
+      // change must use the successor's own physical byte boundary.
+      size = pendingGeneration.size
+      mtimeMs = pendingGeneration.mtimeMs
       this.book.files.delete(entry.path)
       this.search?.reset(entry.path)
       entry.path = pendingGeneration.path
@@ -1293,7 +1281,6 @@ export class SessionIndex extends EventEmitter implements SessionSource {
       entry.searchFrom = 0
       if (entry.meta !== null) entry.meta = createMetaScanner('dsh', null)
       this.book.files.set(pendingGeneration.path, entry)
-      this.dsh.note(pendingGeneration.path, entry)
       if (session !== undefined) this.book.emitTo(session, { type: 'file', file: entry.ref, reset: true })
     }
     // A lineage base registered after this head consumed: re-resolve the chain
@@ -1391,14 +1378,10 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     // role on the first consumed line: `origin:"subagent"` re-homes it under
     // `parentSession`, anything else confirms it as a main file.
     let target = session
-    if (entry.dshUnprobed === true && entry.lines === 0 && lines.length > 0) {
-      entry.dshUnprobed = undefined
-      const record = parseDshLine(lines[0] ?? '')
-      if (record?.tag === 'header' && record.header.origin === 'subagent'
-        && record.header.parentSession !== undefined) {
-        this.rehomeDshChild(entry, record.header.parentSession)
-        target = this.book.sessions.get(sessionKey(entry.kind, entry.sessionId))
-      }
+    const dshParent = this.dsh.parentFromLines(entry, startLine, lines)
+    if (dshParent !== undefined) {
+      this.rehomeDshChild(entry, dshParent)
+      target = this.book.sessions.get(sessionKey(entry.kind, entry.sessionId))
     }
     if (entry.meta !== null) {
       for (const line of lines) {

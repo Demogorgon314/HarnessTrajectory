@@ -3,16 +3,18 @@ import { mkdtemp, mkdir, rm, utimes, writeFile, appendFile } from 'node:fs/promi
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as zlib from 'node:zlib'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { GROK_SIDECAR_METHOD, type SessionLiveEvent } from '@harness-trajectory/core'
 import { SessionIndex, classifyPath, lineTime, lineTimes, mergeChronologically, scopeToFile } from '../src/index.ts'
 import { zstdSupported } from '../src/tail.ts'
+import * as tail from '../src/tail.ts'
 import { createMetaScanner, emptyMeta, listingScannerFor, mergeChildAgent, serializeMeta, hydrateMeta } from '../src/meta.ts'
 import { defaultRoots } from '../src/roots.ts'
 import { ListingCache } from '../src/listing-cache.ts'
 import { SearchIndexer } from '../src/search/indexer.ts'
 import { SearchStore, unpackText } from '../src/search/store.ts'
 import { extractSearchDocs } from '../src/search/extract.ts'
+import { search as querySearch } from '../src/search/query.ts'
 
 function jsonl(records: readonly unknown[]): string {
   return records.map(record => JSON.stringify(record)).join('\n') + '\n'
@@ -1629,6 +1631,130 @@ describe.skipIf(!zstdSupported())('SessionIndex — dsh', () => {
     const parent = idx.get('dsh', DSH_MAIN)
     expect(parent?.files.map(file => file.role)).toEqual(['main', 'child'])
     expect(parent?.files[1]).toMatchObject({ id: DSH_CHILD, parentId: DSH_MAIN })
+  })
+
+  it('keeps successor byte bounds when a larger predecessor refresh is queued during consumption', async () => {
+    const home = sessionDir(DSH_MAIN)
+    await mkdir(home, { recursive: true })
+    const v0 = join(home, 'session.jsonl')
+    await writeFile(v0, jsonl([dshHeader(DSH_MAIN)]))
+    const idx = await startIndex()
+    await appendFile(v0, jsonl([dshUser('old '.repeat(1000), 1, 10)]))
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    const readLines = tail.readLines
+    const spy = vi.spyOn(tail, 'readLines').mockImplementationOnce(async (...args) => {
+      entered.resolve()
+      await release.promise
+      return readLines(...args)
+    })
+    const consuming = idx.refreshPath(v0)
+    try {
+      await entered.promise
+      await idx.refreshPath(v0)
+      const v3 = join(home, 'session.v3.jsonl')
+      const successor = jsonl([dshHeader(DSH_MAIN), dshUser('successor', 1, 10)])
+      await writeFile(v3, successor)
+      await idx.refreshPath(v3)
+      release.resolve()
+      await consuming
+      expect(idx.get('dsh', DSH_MAIN)).toMatchObject({ bytes: Buffer.byteLength(successor), promptCount: 1 })
+      expect(await replayLines(idx, DSH_MAIN)).toEqual(successor.trim().split('\n').map(line => JSON.parse(line)))
+    } finally {
+      release.resolve()
+      await consuming
+      spy.mockRestore()
+    }
+  })
+
+  it('retains unresolved child identity across cache restore and a generation change', async () => {
+    const home = sessionDir(DSH_CHILD)
+    await mkdir(home, { recursive: true })
+    await mkdir(sessionDir(DSH_MAIN), { recursive: true })
+    const parentHeader = dshHeader(DSH_MAIN)
+    await writeFile(join(sessionDir(DSH_MAIN), 'session.jsonl'), jsonl([parentHeader]))
+    const v0 = join(home, 'session.jsonl.zstd')
+    const records = [
+      dshHeader(DSH_CHILD, { origin: 'subagent', parentSession: DSH_MAIN }),
+      dshUser('child after migration', 1, 20),
+    ]
+    await writeFile(v0, dshFrame(jsonl(records)).subarray(0, 8))
+    const listing = new ListingCache({ path: join(dir, 'listing.sqlite') })
+    try {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        index?.stop()
+        index = new SessionIndex({ roots: [{ kind: 'dsh', dir: dshRoot() }], watch: false, listing })
+        await index.start()
+      }
+      const idx = index
+      if (idx === undefined) throw new Error('Index did not start')
+      // A restored cursor before a torn frame still retries its unread bytes.
+      expect(idx.sweepStats()).toEqual({ read: 1, cached: 1 })
+      expect(idx.get('dsh', DSH_CHILD)).toBeDefined()
+      const v3 = join(home, 'session.v3.jsonl.zstd')
+      await writeFile(v3, dshFrames(jsonl(records)))
+      await idx.refreshPath(v0)
+      expect(idx.get('dsh', DSH_CHILD)).toBeUndefined()
+      expect(idx.get('dsh', DSH_MAIN)?.files).toEqual([
+        expect.objectContaining({ id: DSH_MAIN, role: 'main' }),
+        expect.objectContaining({ id: DSH_CHILD, role: 'child', parentId: DSH_MAIN, path: v3 }),
+      ])
+      expect(await replayLines(idx, DSH_MAIN)).toEqual([parentHeader, ...records])
+    } finally {
+      index?.stop()
+      listing.close()
+    }
+  })
+
+  it('restores cached cursors, replaces a generation with compressed data, and keeps search/live/replay lines aligned', async () => {
+    const home = sessionDir(DSH_MAIN)
+    await mkdir(home, { recursive: true })
+    const v0 = join(home, 'session.jsonl')
+    await writeFile(v0, jsonl([dshHeader(DSH_MAIN), dshUser('obsolete needle', 1, 10)]))
+    const listing = new ListingCache({ path: join(dir, 'listing.sqlite') })
+    const store = new SearchStore({ path: ':memory:' })
+    const search = new SearchIndexer({ store, extract: extractSearchDocs, maxAgeDays: 0 })
+    const restart = async () => {
+      index?.stop()
+      const fresh = new SessionIndex({ roots: [{ kind: 'dsh', dir: dshRoot() }], watch: false, listing, search })
+      index = fresh
+      await fresh.start()
+      search.finishBackfill(fresh.livePaths())
+      return fresh
+    }
+    try {
+      await restart()
+      const idx = await restart()
+      expect(idx.sweepStats()).toEqual({ read: 0, cached: 1 })
+      const events: SessionLiveEvent[] = []
+      idx.subscribe('dsh', DSH_MAIN, event => events.push(event))
+      await appendFile(v0, '\n' + jsonl([dshUser('appended needle', 2, 20)]))
+      await idx.refreshPath(v0)
+      search.flush()
+      expect(querySearch(store, { q: 'appended needle' }).groups[0]?.hits[0]?.line).toBe(2)
+      expect(events.find(event => event.type === 'lines')).toMatchObject({ startLine: 2 })
+      events.length = 0
+      const v3 = join(home, 'session.v3.jsonl.zstd')
+      const records = [dshHeader(DSH_MAIN, { isSeeded: true }), dshUser('replacement needle', 1, 10)]
+      await writeFile(v3, dshFrames(jsonl(records)))
+      await idx.refreshPath(v0)
+      search.flush()
+      expect(querySearch(store, { q: 'obsolete needle' }).totalHits).toBe(0)
+      expect(querySearch(store, { q: 'appended needle' }).totalHits).toBe(0)
+      expect(querySearch(store, { q: 'replacement needle' }).groups[0]?.hits[0]).toMatchObject({ fileId: DSH_MAIN, line: 1 })
+      expect(events.filter(event => event.type === 'file' && event.reset)).toHaveLength(1)
+      expect(events.find(event => event.type === 'lines')).toMatchObject({ startLine: 0, lines: records.map(record => JSON.stringify(record)) })
+      expect(await replayLines(idx, DSH_MAIN)).toEqual(records)
+      const restored = await restart()
+      expect(restored.sweepStats()).toEqual({ read: 0, cached: 1 })
+      expect(restored.get('dsh', DSH_MAIN)).toMatchObject({ promptCount: 1, title: 'replacement needle' })
+      expect(await replayLines(restored, DSH_MAIN)).toEqual(records)
+    } finally {
+      index?.stop()
+      search.stop()
+      store.close()
+      listing.close()
+    }
   })
 
   it('resolves blobref hashes against the global attachment store', async () => {

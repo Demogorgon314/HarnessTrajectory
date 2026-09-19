@@ -614,6 +614,15 @@ watermarks reset and the successor replays from byte 0 with a `file reset`
 event. Watcher and poll paths resolve the directory's current generation
 first, so an event naming an old path still reaches the entry.
 
+`DshGenerations` owns the directory registry, pending generation and unconfirmed
+header identity. `SessionIndex` applies the transition under its consume lock,
+using the successor's own physical size rather than a size coalesced from old
+generation notifications. Shared cursors, session membership, search resets and
+events remain index responsibilities. Pending changes and header confirmation
+are not serialized: restart resolves and probes the current file before restoring
+its listing cursor. A generation change retains an unresolved identity until the
+first complete record can confirm it.
+
 ### Concatenated zstd frames
 
 `.jsonl.zstd` is NOT Codex's `.zst`: the file is a growing sequence of
@@ -700,8 +709,8 @@ child logs are read in either order, so a late binding only adds identity
 (call id, description) — it never reopens a run the child already finished;
 only the child's own `turn/start` does that. A compressed
 child's first frame can still be torn at registration: the entry then lands
-as a main session and is re-homed when `probeDshHeader` later reads the
-completed header. `blobref:` image URLs resolve against the GLOBAL
+as a main session and is re-homed when `DshGenerations` confirms the
+completed header during consumption. `blobref:` image URLs resolve against the GLOBAL
 content-addressed store `$DSH_HOME/attachments/v1/objects/<2-hex>/<sha256>`
 (a sibling of `sessions/`, not per-session), and a hash that is not 64 hex
 chars resolves to nothing.
