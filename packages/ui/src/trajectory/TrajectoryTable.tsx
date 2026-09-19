@@ -247,6 +247,13 @@ function markdownLabels(t: TrajectoryTranslate): MarkdownLabels {
   return {
     code: { copyLabel: t('copy'), copiedLabel: t('copied') },
     footnotes: t('markdown.footnotes'),
+    mermaid: {
+      diagram: t('markdown.diagram'), source: t('markdown.source'),
+      loading: t('markdown.diagramLoading'), error: t('markdown.diagramError'),
+      expand: t('markdown.expandDiagram'), close: t('markdown.close'), zoom: t('markdown.zoom'),
+      zoomIn: t('markdown.zoomIn'), zoomOut: t('markdown.zoomOut'),
+      resetZoom: t('markdown.resetZoom'), download: t('markdown.download'),
+    },
   }
 }
 

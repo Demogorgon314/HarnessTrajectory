@@ -387,6 +387,17 @@ export const commonZh = {
   'json.collapseNode': '收起 JSON 节点',
   'json.expandNode': '展开 JSON 节点',
   'markdown.footnotes': '脚注',
+  'markdown.diagram': '图表',
+  'markdown.source': '源码',
+  'markdown.diagramLoading': '正在渲染图表…',
+  'markdown.diagramError': '无法渲染图表，已显示源码。',
+  'markdown.expandDiagram': '放大图表',
+  'markdown.close': '关闭',
+  'markdown.zoom': '缩放',
+  'markdown.zoomIn': '放大',
+  'markdown.zoomOut': '缩小',
+  'markdown.resetZoom': '适应窗口',
+  'markdown.download': '下载 SVG',
 } as const
 
 export const commonEn: Record<CommonKey, string> = {
@@ -402,6 +413,17 @@ export const commonEn: Record<CommonKey, string> = {
   'json.collapseNode': 'Collapse JSON node',
   'json.expandNode': 'Expand JSON node',
   'markdown.footnotes': 'Footnotes',
+  'markdown.diagram': 'Diagram',
+  'markdown.source': 'Source',
+  'markdown.diagramLoading': 'Rendering diagram…',
+  'markdown.diagramError': 'Unable to render diagram. Source shown below.',
+  'markdown.expandDiagram': 'Expand diagram',
+  'markdown.close': 'Close',
+  'markdown.zoom': 'Zoom',
+  'markdown.zoomIn': 'Zoom in',
+  'markdown.zoomOut': 'Zoom out',
+  'markdown.resetZoom': 'Fit to view',
+  'markdown.download': 'Download SVG',
 }
 
 export type TrajectoryLocale = 'en' | 'zh'

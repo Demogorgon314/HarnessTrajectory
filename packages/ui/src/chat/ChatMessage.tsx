@@ -2,6 +2,7 @@ import { memo, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { asString, type AssistantBlock, type ContentBlock, type ConversationNode, type ToolCallBlock } from '@harness-trajectory/core'
 import { TrajectoryImages, type MessageImageLoader } from '../images.tsx'
 import { MarkdownText } from '../primitives/markdown/MarkdownText.tsx'
+import { mermaidLabels } from '../primitives/markdown/MermaidBlock.tsx'
 import { IconApiOutline14, IconChevronDownOutline14, IconChevronRightOutline14, IconCheckOutline16, IconCopyOutline16, IconContextInjectionOutline16 } from '../primitives/icons/index.tsx'
 import { FileTypeIcon } from '../primitives/FileTypeIcon.tsx'
 import { StateDot } from '../primitives/StateDot.tsx'
@@ -39,7 +40,8 @@ function Prose({ text, context, streaming = false, compact = false }: {
   const markdownLabels = useMemo(() => ({
     code: { copyLabel: labels.copy, copiedLabel: labels.copied },
     footnotes: labels.footnotes,
-  }), [labels])
+    mermaid: mermaidLabels[context.locale],
+  }), [labels, context.locale])
   return <MarkdownText text={text} streaming={streaming} labels={markdownLabels} variant={compact ? 'compact' : 'body'} />
 }
 

@@ -1,0 +1,75 @@
+.dialog {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100dvh;
+  max-width: none;
+  max-height: none;
+  margin: 0;
+  padding: 56px 32px 92px;
+  box-sizing: border-box;
+  border: 0;
+  background: transparent;
+  color: var(--dsw-alias-label-primary);
+  overflow: hidden;
+}
+.dialog::backdrop { background: rgb(0 0 0 / 90%); }
+.viewport {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  overflow: auto;
+  overscroll-behavior: contain;
+  touch-action: none;
+}
+.image {
+  display: block;
+  flex: none;
+  margin: auto;
+  max-width: none;
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-base);
+  user-select: none;
+  cursor: grab;
+}
+.image:active { cursor: grabbing; }
+.image:not([style]) { max-width: 100%; max-height: 100%; object-fit: contain; }
+.actions { position: absolute; top: 12px; right: 12px; display: flex; gap: 8px; }
+.dialog .button, .dialog .percentage {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 40px;
+  min-width: 40px;
+  padding: 0;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 999px;
+  corner-shape: round;
+  background: var(--dsw-alias-markdown-code-block-banner);
+  color: inherit;
+  text-decoration: none;
+  cursor: pointer;
+  font: 20px/1 var(--dsw-font-family);
+  box-shadow: 0 2px 8px rgb(0 0 0 / 15%);
+}
+.button:hover, .percentage:hover { background: var(--dsw-alias-markdown-code-block); }
+.button:focus-visible, .percentage:focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }
+.button:disabled { opacity: 0.4; cursor: default; }
+.zoomBar {
+  position: absolute;
+  bottom: 32px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 999px;
+  corner-shape: round;
+  background: var(--dsw-alias-markdown-code-block-banner);
+  box-shadow: 0 4px 12px rgb(0 0 0 / 20%);
+}
+.zoomBar .button { height: 36px; min-width: 36px; border: 0; box-shadow: none; }
+.dialog .percentage { min-width: 64px; height: 36px; border: 0; box-shadow: none; font-size: 14px; font-variant-numeric: tabular-nums; }
+@media (max-width: 640px) { .dialog { padding-inline: 16px; } }

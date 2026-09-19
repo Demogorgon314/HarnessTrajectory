@@ -18,6 +18,8 @@ export type RichMode = 'raw' | 'md'
 interface MarkdownChrome {
   code: { copyLabel: string; copiedLabel: string }
   footnotes: string
+  mermaid: { diagram: string; source: string; loading: string; error: string; expand: string; close: string; zoom: string;
+    zoomIn: string; zoomOut: string; resetZoom: string; download: string }
 }
 
 const { IconCheckOutline16, IconCopyOutline16 } = icons
@@ -110,6 +112,13 @@ export function makeRichText(kit: ViewKit): RichKit {
     const mdLabels = useMemo<MarkdownChrome>(() => ({
       code: { copyLabel: t('rich.md.copy'), copiedLabel: t('rich.md.copied') },
       footnotes: t('rich.md.footnotes'),
+      mermaid: {
+        diagram: t('rich.md.diagram'), source: t('rich.md.source'),
+        loading: t('rich.md.diagramLoading'), error: t('rich.md.diagramError'),
+        expand: t('rich.md.expandDiagram'), close: t('rich.md.close'), zoom: t('rich.md.zoom'),
+        zoomIn: t('rich.md.zoomIn'), zoomOut: t('rich.md.zoomOut'),
+        resetZoom: t('rich.md.resetZoom'), download: t('rich.md.download'),
+      },
     }), [t])
     if (props.mode === 'md') {
       return <div className="lc-ts-desc-md"><Markdown text={props.text} labels={mdLabels} /></div>

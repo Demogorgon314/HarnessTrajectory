@@ -1,0 +1,52 @@
+.block {
+  margin: 16px 0;
+  min-width: 0;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 12px;
+  overflow: hidden;
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-bg-base);
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 12px;
+  font: 11px/18px var(--dsw-font-family);
+  background: var(--dsw-alias-markdown-code-block-banner);
+}
+.title { margin-inline-end: auto; color: var(--dsw-alias-label-secondary); font-family: var(--ds-font-family-code); }
+.toolbar button {
+  border: 0;
+  padding: 2px 4px;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.toolbar button:hover { background: var(--dsw-alias-markdown-code-block); }
+.toolbar button:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+.expand, .expand span { display: inline-flex; align-items: center; justify-content: center; }
+.toolbar .expand { width: 24px; height: 24px; }
+.surface {
+  padding: 16px;
+  text-align: center;
+}
+/* Inline diagrams show the complete overview, never upscaling small images.
+   The fullscreen preview provides zoom and pan for inspecting fine details. */
+.surface img { display: block; margin: auto; width: auto; max-width: 100%; height: auto; }
+.loading { display: grid; min-height: 160px; place-items: center; }
+.loading, .status { color: var(--dsw-alias-label-secondary); font-size: 12px; }
+.status { padding: 12px 16px; }
+.block .source {
+  margin: 0;
+  padding: 16px;
+  overflow: auto;
+  white-space: pre;
+  background: var(--dsw-alias-markdown-code-block);
+  font: var(--dsw-font-markdown-code-block);
+}
+.source code { padding: 0; background: none; font: inherit; }

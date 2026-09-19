@@ -39,6 +39,10 @@ both ported to run on top of plain transcript files instead of a runtime.
   messages, results), context events (compactions, injections, model switches), file
   activity, and an agent network graph.
 - Light / dark / system themes. English and Chinese copy.
+- **Mermaid diagrams** in Markdown replies and detail views: local rendering after
+  streaming completes, source/copy controls, and a fullscreen preview with pan,
+  pinch/keyboard zoom, fit-to-view, and SVG download. Invalid
+  diagrams remain readable as source. Rendering loads only near the viewport.
 
 ## Quick start
 

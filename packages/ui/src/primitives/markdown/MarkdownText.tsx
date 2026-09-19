@@ -160,6 +160,8 @@ class StreamingRenderer {
  * single streaming gate — they apply to settled renders only, because a
  * streaming message's vocabulary is not final and frozen cached elements
  * must not bake in handlers that could go stale.
+ * Settled Mermaid fences render locally as diagrams when near the viewport;
+ * streaming fences stay as code, and failed diagrams retain their source.
  * @returns A GFM document with TeX math rendered through KaTeX; raw HTML,
  * relative links, and unsafe protocols are disabled, while absolute HTTP(S)
  * images render directly.
