@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>Harness Trajectory · 图标设计草案</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f4f3ef;color:#202725;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}main{max-width:1180px;margin:auto;padding:48px 36px}header{display:flex;justify-content:space-between;align-items:end;gap:24px;margin-bottom:32px}.eyebrow{font:11px ui-monospace,monospace;letter-spacing:2px;color:#748078;text-transform:uppercase}h1{font-size:38px;font-weight:550;letter-spacing:-1.6px;margin:12px 0}p{font-size:13px;line-height:1.8;color:#717872;margin:0}button,a{font:inherit}button{cursor:pointer}.controls{display:flex;gap:6px;flex-shrink:0}button.control{border:1px solid #d8dbd5;background:transparent;color:inherit;padding:9px 14px;border-radius:7px;font-size:12px}button[aria-pressed=true]{background:#202725;color:#fff;border-color:#202725}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}.card{border:1px solid #dcded8;border-radius:12px;overflow:hidden;background:#fcfcf9;transition:border-color .15s}.card.selected{border-color:#527967;box-shadow:0 0 0 1px #527967}.choose{display:block;border:0;background:transparent;width:100%;color:inherit;text-align:left;padding:0}.stage{height:176px;display:flex;align-items:center;justify-content:center;background:#fafaf7;position:relative}.stage>svg{width:108px;height:108px}.number{position:absolute;top:16px;left:18px;font:11px ui-monospace,monospace;color:#87928c}.hint{position:absolute;right:16px;top:14px;font-size:10px;color:#527967;background:#e7eee8;padding:4px 7px;border-radius:4px}.info{padding:17px 19px 14px;border-top:1px solid #e7e9e2}h2{font-size:15px;font-weight:550;margin:0 0 6px}.english{font:10px ui-monospace,monospace;letter-spacing:1px;color:#88928b;margin-left:8px}.info p{font-size:12px;min-height:43px}.sizes{display:flex;align-items:center;gap:16px;margin-top:12px;height:32px}.sizes span{font:10px ui-monospace,monospace;color:#8a928c;margin-left:auto}.download{display:block;text-align:right;padding:0 19px 14px;color:#727e75;font-size:11px;text-decoration:none}.download:hover{text-decoration:underline}.dark .stage{background:#111c24;color:#71d1f4}.mono .stage{color:#202725;background:#fafaf7}.preview{display:grid;grid-template-columns:1fr 1fr;margin-top:28px;border:1px solid #dcded8;border-radius:12px;overflow:hidden}.lockup{background:#101c24;color:#71d1f4;min-height:150px;display:flex;align-items:center;justify-content:center;gap:16px}.lockup svg{width:56px;height:56px}.wordmark{color:#ecf1f1;font-size:22px;font-weight:500;letter-spacing:-.7px}.wordmark small{display:block;color:#8399a4;font:10px ui-monospace,monospace;letter-spacing:1.5px;margin-top:9px}.applications{background:#eaece6;padding:24px 30px}.browser{background:#fafbf8;border:1px solid #d8ddd5;border-radius:8px;padding:12px 16px;font-size:12px;display:flex;align-items:center;gap:10px;color:#5b675e}.browser svg{width:16px;height:16px;color:#2d7863}.sidebar{margin-top:18px;display:flex;gap:11px;align-items:center;font-size:14px}.sidebar svg{width:24px;height:24px;color:#2d7863}footer{display:flex;justify-content:space-between;margin-top:20px;font-size:11px;color:#8a938b}.choose:focus-visible,button:focus-visible,a:focus-visible{outline:3px solid #479aba;outline-offset:-3px}@media(max-width:760px){main{padding:28px 18px}header{display:block}.controls{margin-top:18px}.grid{grid-template-columns:repeat(2,1fr)}h1{font-size:30px}.preview{grid-template-columns:1fr}.english{display:block;margin:5px 0}.info p{min-height:65px}footer{gap:20px}}@media(max-width:420px){.grid{grid-template-columns:1fr}.info p{min-height:0}}
+.choose[aria-pressed=true]{background:transparent;color:inherit}
+</style>
+</head>
+<body class="dark">
+<main>
+<header><div><div class="eyebrow">Identity exploration / 01</div><h1>Harness Trajectory</h1><p>让执行过程，有一个可辨认的形状。六个方向，点击查看实际尺寸与品牌组合。</p></div><div class="controls" aria-label="预览配色"><button class="control" aria-pressed="true" data-theme="dark">冰蓝 / 深底</button><button class="control" aria-pressed="false" data-theme="mono">单色 / 浅底</button></div></header>
+<section class="grid" aria-label="六个图标方案"></section>
+<section class="preview" aria-label="选中方案应用预览"><div class="lockup"><span id="large-mark"></span><div class="wordmark">Harness Trajectory<small>EVERY STEP, IN CONTEXT.</small></div></div><div class="applications"><div class="browser"><span id="tab-mark"></span>Harness Trajectory <span style="margin-left:auto;color:#a0aaa2">×</span></div><div class="sidebar"><span id="sidebar-mark"></span>Harness Trajectory</div><p id="selection" style="font-size:11px;margin-top:9px"></p></div></section>
+<footer><span>SVG 原生矢量 · 16 / 24 / 32 px 实际尺寸 · 可下载各方案</span><span>设计草案 / September 2026</span></footer>
+</main>
+<script>
+// All previews and downloads share the same geometry.
+const designs = [
+  {id:'01',name:'折返轨迹',en:'TRACE',description:'连续路径两次折返，向右上方展开。圆点标记起点，保留探索与推进的节奏。',body:'<path d="M25 75V56Q25 50 31 50H64Q72 50 72 42V25"/><circle cx="25" cy="75" r="6" fill="currentColor" stroke="none"/>',recommended:true},
+  {id:'02',name:'路径 H',en:'HARNESS',description:'两条立柱由斜向路径连接。把 Harness 的首字母融进执行轨迹，轮廓更有力量。',body:'<path d="M27 76V25M73 76V25M27 62L73 39"/>'},
+  {id:'03',name:'分支轨迹',en:'BRANCH',description:'一条主线，一次分支。对应主会话与子 agent，结构清晰，强调协作。',body:'<path d="M30 75V25M30 60H48Q70 60 70 38V25"/><circle cx="30" cy="75" r="6" fill="currentColor" stroke="none"/>'},
+  {id:'04',name:'回放切片',en:'REPLAY',description:'两个错位的实体切片，留出向前的负空间。强调记录、回看与时间推进。',body:'<path d="M22 24H38L59 50L38 76H22L43 50Z M50 24H66L87 50L66 76H50L71 50Z" fill="currentColor" stroke="none"/>'},
+  {id:'05',name:'步进序列',en:'STEPS',description:'离散节点沿转折递进，把一串事件压缩成简单符号。更轻快，也更偏数据。',body:'<g fill="currentColor" stroke="none"><circle cx="24" cy="74" r="7"/><circle cx="24" cy="50" r="7"/><circle cx="48" cy="50" r="7"/><circle cx="72" cy="50" r="7"/><circle cx="72" cy="26" r="7"/></g>'},
+  {id:'06',name:'上下文轨道',en:'CONTEXT',description:'开放圆弧包围一个焦点，向外延伸。把轨迹和上下文两个视角收进同一枚图形。',body:'<path d="M76 51A26 26 0 1 1 50 24H76"/><circle cx="50" cy="50" r="7" fill="currentColor" stroke="none"/>'}
+];
+function svg(design,size){return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${design.body}</svg>`}
+const grid=document.querySelector('.grid');
+designs.forEach((design,index)=>{
+ const card=document.createElement('article');card.className='card';
+ card.innerHTML=`<button class="choose" aria-pressed="false" aria-label="选择 ${design.name}"><div class="stage"><span class="number">${design.id}</span>${design.recommended?'<span class="hint">首选方向</span>':''}${svg(design,108)}</div><div class="info"><h2>${design.name}<span class="english">${design.en}</span></h2><p>${design.description}</p><div class="sizes">${[16,24,32].map(size=>svg(design,size)).join('')}<span>16 / 24 / 32</span></div></div></button><a class="download" download="harness-trajectory-${design.en.toLowerCase()}.svg">下载 SVG ↗</a>`;
+ card.querySelector('a').href=URL.createObjectURL(new Blob([svg(design,100)],{type:'image/svg+xml'}));
+ card.querySelector('button').addEventListener('click',()=>select(index));grid.append(card);
+});
+function select(index){const design=designs[index];document.querySelectorAll('.card').forEach((card,i)=>{card.classList.toggle('selected',i===index);card.querySelector('button').setAttribute('aria-pressed',String(i===index))});document.querySelector('#large-mark').innerHTML=svg(design,56);document.querySelector('#tab-mark').innerHTML=svg(design,16);document.querySelector('#sidebar-mark').innerHTML=svg(design,24);document.querySelector('#selection').textContent=`${design.id} / ${design.name} · 浏览器标签 16px · 侧栏 24px`}
+document.querySelectorAll('[data-theme]').forEach(button=>button.addEventListener('click',()=>{document.body.className=button.dataset.theme;document.querySelectorAll('[data-theme]').forEach(item=>item.setAttribute('aria-pressed',String(item===button)))}));
+select(0);
+</script>
+</body>
+</html>

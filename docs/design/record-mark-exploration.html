@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>Harness Trajectory · 展开的记录</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f4f3ef;color:#202725;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}main{max-width:1180px;margin:auto;padding:48px 36px}header{display:flex;justify-content:space-between;align-items:end;gap:24px;margin-bottom:32px}.eyebrow{font:11px ui-monospace,monospace;letter-spacing:2px;color:#748078;text-transform:uppercase}h1{font-size:38px;font-weight:550;letter-spacing:-1.6px;margin:12px 0}p{font-size:13px;line-height:1.8;color:#717872;margin:0}button,a{font:inherit}button{cursor:pointer}.controls{display:flex;gap:6px;flex-shrink:0}button.control{border:1px solid #d8dbd5;background:transparent;color:inherit;padding:9px 14px;border-radius:7px;font-size:12px}button[aria-pressed=true]{background:#202725;color:#fff;border-color:#202725}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}.card{border:1px solid #dcded8;border-radius:12px;overflow:hidden;background:#fcfcf9;transition:border-color .15s}.card.selected{border-color:#527967;box-shadow:0 0 0 1px #527967}.choose{display:block;border:0;background:transparent;width:100%;color:inherit;text-align:left;padding:0}.stage{height:176px;display:flex;align-items:center;justify-content:center;background:#fafaf7;position:relative}.stage>svg{width:108px;height:108px}.number{position:absolute;top:16px;left:18px;font:11px ui-monospace,monospace;color:#87928c}.hint{position:absolute;right:16px;top:14px;font-size:10px;color:#527967;background:#e7eee8;padding:4px 7px;border-radius:4px}.info{padding:17px 19px 14px;border-top:1px solid #e7e9e2}h2{font-size:15px;font-weight:550;margin:0 0 6px}.english{font:10px ui-monospace,monospace;letter-spacing:1px;color:#88928b;margin-left:8px}.info p{font-size:12px;min-height:43px}.sizes{display:flex;align-items:center;gap:16px;margin-top:12px;height:32px}.sizes span{font:10px ui-monospace,monospace;color:#8a928c;margin-left:auto}.download{display:block;text-align:right;padding:0 19px 14px;color:#727e75;font-size:11px;text-decoration:none}.download:hover{text-decoration:underline}.dark .stage{background:#111c24;color:#71d1f4}.mono .stage{color:#202725;background:#fafaf7}.preview{display:grid;grid-template-columns:1fr 1fr;margin-top:28px;border:1px solid #dcded8;border-radius:12px;overflow:hidden}.lockup{background:#101c24;color:#71d1f4;min-height:150px;display:flex;align-items:center;justify-content:center;gap:16px}.lockup svg{width:56px;height:56px}.wordmark{color:#ecf1f1;font-size:22px;font-weight:500;letter-spacing:-.7px}.wordmark small{display:block;color:#8399a4;font:10px ui-monospace,monospace;letter-spacing:1.5px;margin-top:9px}.applications{background:#eaece6;padding:24px 30px}.browser{background:#fafbf8;border:1px solid #d8ddd5;border-radius:8px;padding:12px 16px;font-size:12px;display:flex;align-items:center;gap:10px;color:#5b675e}.browser svg{width:16px;height:16px;color:#2d7863}.sidebar{margin-top:18px;display:flex;gap:11px;align-items:center;font-size:14px}.sidebar svg{width:24px;height:24px;color:#2d7863}footer{display:flex;justify-content:space-between;margin-top:20px;font-size:11px;color:#8a938b}.choose:focus-visible,button:focus-visible,a:focus-visible{outline:3px solid #479aba;outline-offset:-3px}@media(max-width:760px){main{padding:28px 18px}header{display:block}.controls{margin-top:18px}.grid{grid-template-columns:repeat(2,1fr)}h1{font-size:30px}.preview{grid-template-columns:1fr}.english{display:block;margin:5px 0}.info p{min-height:65px}footer{gap:20px}}@media(max-width:420px){.grid{grid-template-columns:1fr}.info p{min-height:0}}
+.choose[aria-pressed=true]{background:transparent;color:inherit}
+.dark .stage{color:#81c8b4;background:#142824}.hint{color:#426e5d}.stage>svg{width:124px;height:124px}.lockup{background:#142824;color:#81c8b4}.wordmark small{color:#8ca89c}.browser svg,.sidebar svg{color:#397b66}.info p{min-height:44px}.stage{height:188px}
+</style>
+</head>
+<body class="dark">
+<main>
+<header><div><div class="eyebrow">Identity exploration / 02 — The open record</div><h1>展开的记录。</h1><p>记录有秩序，执行有变化。让一行记录走出排列，成为可追踪的过程。</p></div><div class="controls" aria-label="预览配色"><button class="control" aria-pressed="true" data-theme="dark">青绿 / 深底</button><button class="control" aria-pressed="false" data-theme="mono">单色 / 浅底</button></div></header>
+<section class="grid" aria-label="六个图标方案"></section>
+<section class="preview" aria-label="选中方案应用预览"><div class="lockup"><span id="large-mark"></span><div class="wordmark">Harness Trajectory<small>READ THE RECORD. SEE THE PROCESS.</small></div></div><div class="applications"><div class="browser"><span id="tab-mark"></span>Harness Trajectory <span style="margin-left:auto;color:#a0aaa2">×</span></div><div class="sidebar"><span id="sidebar-mark"></span>Harness Trajectory</div><p id="selection" style="font-size:11px;margin-top:9px"></p></div></section>
+<footer><span>SVG 原生矢量 · 16 / 24 / 32 px 实际尺寸 · 可下载各方案</span><span>设计草案 / September 2026</span></footer>
+</main>
+<script>
+// All previews and downloads share the same geometry.
+const designs = [
+  {id:'01',name:'展开',en:'UNFOLD',description:'三行记录，中间一行向上折出。平切端点与微圆转角，让秩序中出现一次变化。',body:'<path d="M18 27H45M18 73H55M18 50H60Q70 50 70 40V27H83"/>',recommended:true},
+  {id:'02',name:'页边',en:'MARGIN',description:'记录穿过页边界，向外展开。左侧保留文档的稳定感，右侧留下观察的开口。',body:'<path d="M53 20H24V80H53M40 40H59L77 22M40 60H77"/>'},
+  {id:'03',name:'抽出',en:'EXTRACT',description:'两条记录保持水平，一条向右上抬起。像从会话中抽出关键一步，轮廓更简洁。',body:'<path d="M18 29H45M18 51H55L79 27M18 73H66"/>'},
+  {id:'04',name:'层叠',en:'LAYERS',description:'把记录画成展开的薄页。上层打开、下层承接，强调上下文之间的关联。',body:'<path d="M20 40L50 25L80 40L50 55Z M20 56L50 71L80 56M20 72L50 87L80 72" transform="translate(0 -6)"/>'},
+  {id:'05',name:'切口',en:'APERTURE',description:'用实体承载记录，以留白切出三行。最后一行打开边界，小尺寸下更有重量。',body:'<path fill="currentColor" stroke="none" d="M20 18H72Q80 18 80 26V74Q80 82 72 82H20Z M31 31V39H64V31Z M31 47V55H64V47Z M31 63V71H80V63Z" fill-rule="evenodd"/>'},
+  {id:'06',name:'逐项',en:'EVENTS',description:'离散记录围绕一条展开路径排列。更直接地表达事件序列与被追踪的一步。',body:'<path d="M35 27H53M35 73H64M35 50H62Q74 50 74 38V23"/><g fill="currentColor" stroke="none"><rect x="17" y="23" width="8" height="8"/><rect x="17" y="46" width="8" height="8"/><rect x="17" y="69" width="8" height="8"/></g>'}
+];
+function svg(design,size){return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="8" stroke-linecap="butt" stroke-linejoin="round" aria-hidden="true">${design.body}</svg>`}
+const grid=document.querySelector('.grid');
+designs.forEach((design,index)=>{
+ const card=document.createElement('article');card.className='card';
+ card.innerHTML=`<button class="choose" aria-pressed="false" aria-label="选择 ${design.name}"><div class="stage"><span class="number">${design.id}</span>${design.recommended?'<span class="hint">首选方向</span>':''}${svg(design,108)}</div><div class="info"><h2>${design.name}<span class="english">${design.en}</span></h2><p>${design.description}</p><div class="sizes">${[16,24,32].map(size=>svg(design,size)).join('')}<span>16 / 24 / 32</span></div></div></button><a class="download" download="harness-trajectory-${design.en.toLowerCase()}.svg">下载 SVG ↗</a>`;
+ card.querySelector('a').href=URL.createObjectURL(new Blob([svg(design,100)],{type:'image/svg+xml'}));
+ card.querySelector('button').addEventListener('click',()=>select(index));grid.append(card);
+});
+function select(index){const design=designs[index];document.querySelectorAll('.card').forEach((card,i)=>{card.classList.toggle('selected',i===index);card.querySelector('button').setAttribute('aria-pressed',String(i===index))});document.querySelector('#large-mark').innerHTML=svg(design,56);document.querySelector('#tab-mark').innerHTML=svg(design,16);document.querySelector('#sidebar-mark').innerHTML=svg(design,24);document.querySelector('#selection').textContent=`${design.id} / ${design.name} · 浏览器标签 16px · 侧栏 24px`}
+document.querySelectorAll('[data-theme]').forEach(button=>button.addEventListener('click',()=>{document.body.className=button.dataset.theme;document.querySelectorAll('[data-theme]').forEach(item=>item.setAttribute('aria-pressed',String(item===button)))}));
+select(0);
+</script>
+</body>
+</html>

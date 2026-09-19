@@ -128,9 +128,10 @@
 }
 
 .brandMark {
-  color: var(--dsw-alias-state-business-primary);
-  font-size: 20px;
-  line-height: 1;
+  display: block;
+  flex: none;
+  width: 24px;
+  height: 24px;
 }
 
 .brandName {
@@ -176,12 +177,10 @@
 
 /* Rail logo swap: the toggle rests as the brand mark and hovering reveals the panel icon. */
 .railMark {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--dsw-alias-state-business-primary);
-  font-size: 22px;
-  line-height: 1;
+  display: block;
+  flex: none;
+  width: 28px;
+  height: 28px;
 }
 
 .sidebar[data-collapsed] .toggle .panelIcon {

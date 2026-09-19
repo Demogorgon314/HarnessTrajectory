@@ -18,6 +18,7 @@ import {
   sidebarStore, toggleGroupFold,
 } from './sidebar-store.ts'
 import { themeStore, type ThemePreference } from './theme.ts'
+import brandIcon from './assets/brand-icon.png'
 import css from './app.module.css'
 
 const { IconPanelLeftOutline16, IconSettingsOutline16 } = icons
@@ -270,7 +271,7 @@ export function App() {
         <header className={css.brand}>
           {wide && (
             <span className={css.brandIdentity}>
-              <span className={css.brandMark} aria-hidden="true">⟿</span>
+              <img className={css.brandMark} src={brandIcon} alt="" width={24} height={24} />
               <span className={css.brandName}>Harness Trajectory</span>
             </span>
           )}
@@ -283,7 +284,7 @@ export function App() {
               aria-expanded={!collapsed}
               onClick={toggleSidebar}
             >
-              {!wide && <span className={css.railMark} aria-hidden="true">⟿</span>}
+              {!wide && <img className={css.railMark} src={brandIcon} alt="" width={28} height={28} />}
               <IconPanelLeftOutline16 className={css.panelIcon} size={wide ? 16 : 18} />
             </button>
           </Tooltip>
