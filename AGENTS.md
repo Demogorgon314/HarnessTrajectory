@@ -62,6 +62,7 @@ pnpm pack:cli                     # build and pack the npm CLI tarball
 | `apps/server/src/settings.ts` | `settings.json` persistence and settings controller |
 | `apps/server/src/listing-cache.ts` | Restart cursors and serialized scanner state |
 | `apps/web/src/harnesses.tsx` | Harness UI registry, logos, resume commands |
+| `src-tauri/`, `scripts/desktop/` | macOS desktop shell and packaging; see [desktop guide](docs/desktop.md) |
 
 `apps/web` is the Vite/React shell, sidebar, and routes. `packages/context` is an
 Apache-2.0 port: retain LICENSE and NOTICE. Preserve all vendored attribution.

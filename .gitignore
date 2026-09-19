@@ -8,3 +8,9 @@ dist/
 coverage/
 .idea/
 .playwright-cli/
+src-tauri/target/
+src-tauri/gen/
+src-tauri/icons/generated/
+src-tauri/binaries/
+src-tauri/resources/
+.desktop-cache/

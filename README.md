@@ -82,6 +82,20 @@ pnpm build
 pnpm start      # http://127.0.0.1:5170
 ```
 
+### macOS desktop app
+
+The Tauri desktop app bundles the viewer and Node runtime; installed apps require
+macOS 13.5+ and do not need a separate Node installation. From a checkout with
+Rust and full Xcode 26 or newer installed:
+
+```sh
+pnpm desktop:dev      # build assets and launch the native debug app
+pnpm desktop:build    # package a .app and .dmg for this Mac's architecture
+```
+
+Output: `src-tauri/target/release/bundle/`. See [desktop development and packaging](docs/desktop.md)
+for architecture, Intel builds, verification, and signing requirements.
+
 ### Configuration
 
 Transcript roots are discovered from the harness home directories. Environment variables

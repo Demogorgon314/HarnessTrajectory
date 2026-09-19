@@ -1,0 +1,21 @@
+{
+  "fill": { "solid": "srgb:0.02000,0.04500,0.10000,1.00000" },
+  "groups": [
+    {
+      "layers": [
+        {
+          "image-name": "brand-icon.png",
+          "name": "Trajectory",
+          "glass": false,
+          "position": {
+            "scale": 0.8165869218500797,
+            "translation-in-points": [0, 0]
+          }
+        }
+      ],
+      "shadow": { "kind": "neutral", "opacity": 0 },
+      "translucency": { "enabled": false, "value": 0 }
+    }
+  ],
+  "supported-platforms": { "squares": "shared" }
+}

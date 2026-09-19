@@ -56,24 +56,19 @@ button.leading {
 
 .iconIdle {
   display: inline-flex;
-  opacity: 1;
-  transition: opacity 100ms ease;
 }
 
+/* Swap glyphs without an overlapping crossfade, including inside WKWebView. */
 .chevronHover {
-  position: absolute;
-  inset: 0;
-  margin: auto;
-  opacity: 0;
-  transition: opacity 100ms ease;
+  display: none;
 }
 
 .row:hover .iconIdle {
-  opacity: 0;
+  display: none;
 }
 
 .row:hover .chevronHover {
-  opacity: 1;
+  display: block;
 }
 
 .title {

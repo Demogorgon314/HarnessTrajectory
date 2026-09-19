@@ -5,6 +5,7 @@ import { existsSync, statSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { serve } from '@hono/node-server'
+import { Hono } from 'hono'
 import { createApp } from './app.ts'
 import { listingDbPath, searchDbPath, searchEnabled } from './cache.ts'
 import { DevinSource } from './devin/source.ts'
@@ -16,6 +17,7 @@ import { CompositeSource, type SessionSource } from './source.ts'
 import { browserUrl, openBrowser, shouldOpenBrowser } from './open-browser.ts'
 import { SearchLifecycle } from './search/lifecycle.ts'
 import { SettingsController, readSettings, settingsPath } from './settings.ts'
+import { createDesktopAccess, DESKTOP_PORT, DESKTOP_READY_PREFIX, shutdownOnParentExit } from './desktop.ts'
 
 function argValue(flag: string): string | undefined {
   const index = process.argv.indexOf(flag)
@@ -62,8 +64,11 @@ settings (search retention days, default 90) live in settings.json there and
 are editable in the UI.`)
     return
   }
-  const port = Number(argValue('--port') ?? process.env['HARNESS_TRAJECTORY_PORT'] ?? 5170)
-  const hostname = argValue('--host') ?? process.env['HARNESS_TRAJECTORY_HOST'] ?? '127.0.0.1'
+  const desktop = process.argv.includes('--desktop') ? createDesktopAccess() : undefined
+  const port = desktop === undefined
+    ? Number(argValue('--port') ?? process.env['HARNESS_TRAJECTORY_PORT'] ?? 5170)
+    : Number(argValue('--port') ?? DESKTOP_PORT)
+  const hostname = desktop === undefined ? argValue('--host') ?? process.env['HARNESS_TRAJECTORY_HOST'] ?? '127.0.0.1' : '127.0.0.1'
   const roots = defaultRoots()
   // `node:sqlite` still prints one ExperimentalWarning on first import; that is
   // fine and deliberately not suppressed, since silencing warnings globally
@@ -126,9 +131,11 @@ are editable in the UI.`)
   })
   const staticDir = findStaticDir()
   const app = createApp({ index: source, staticDir, search: () => search.current(), settings })
-  const open = shouldOpenBrowser()
-  serve({ fetch: app.fetch, port, hostname }, (info) => {
+  const open = desktop === undefined && shouldOpenBrowser()
+  const httpApp = desktop === undefined ? app : new Hono().use('*', desktop.middleware).route('/', app)
+  const server = serve({ fetch: httpApp.fetch, port, hostname }, (info) => {
     const url = browserUrl(info.address, info.port)
+    if (desktop !== undefined) console.log(DESKTOP_READY_PREFIX + JSON.stringify({ url: desktop.launchUrl(url) }))
     console.log(`[harness-trajectory] listening on ${url}`)
     if (staticDir === undefined) {
       console.log('[harness-trajectory] no built web UI found; run `pnpm --filter @harness-trajectory/web dev` for the dev server')
@@ -174,7 +181,12 @@ are editable in the UI.`)
     console.error('[harness-trajectory] startup scan failed:', error)
     process.exit(1)
   })
+  let stopping = false
   const shutdown = async () => {
+    if (stopping) return
+    stopping = true
+    // Stop accepting requests before closing the stores used by those requests.
+    server.close()
     if (progressTimer !== null) clearInterval(progressTimer)
     await search.close()
     source.stop()
@@ -183,6 +195,7 @@ are editable in the UI.`)
   }
   process.on('SIGINT', shutdown)
   process.on('SIGTERM', shutdown)
+  if (desktop !== undefined) shutdownOnParentExit(process.stdin, () => { void shutdown() })
 }
 
 main().catch((error: unknown) => {

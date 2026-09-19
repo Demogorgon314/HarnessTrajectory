@@ -38,7 +38,7 @@
 }
 .disclosure[open]:not([data-keep-preview]) > summary .preview { display: none; }
 .disclosure[open] > summary .idleIcon { display: none; }
-.disclosure[open] > summary .openIcon { opacity: 1; }
+.disclosure[open] > summary .openIcon { display: block; }
 .process > summary { list-style: none; }
 .process > summary::-webkit-details-marker { display: none; }
 .process[open] > summary { margin-bottom: 16px; }
