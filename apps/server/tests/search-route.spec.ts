@@ -73,6 +73,7 @@ describe('GET /api/search', () => {
       search: service.indexer,
     })
     await index.start()
+    service.indexer.finishBackfill(index.livePaths())
   })
 
   afterEach(async () => {

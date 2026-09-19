@@ -27,13 +27,15 @@ import {
   type SessionLiveEvent, type SessionSummary,
 } from '@harness-trajectory/core'
 import type { MetaScanner } from './meta.ts'
-import type { SearchIndexer } from './search/indexer.ts'
 import type { SearchFileKey } from './search/store.ts'
 
 /** Chunk size of one `lines` live/replay event. */
 export const CHUNK_LINES = 400
 
 export type Subscriber = (event: SessionLiveEvent) => void
+
+/** Replay waits for returned promises; synchronous consumers may ignore the result. */
+export type ReplaySink = (event: SessionLiveEvent) => unknown
 
 export function sessionKey(kind: HarnessKind, id: string): string {
   return `${kind} ${id}`
@@ -76,13 +78,15 @@ export interface SessionSource extends EventEmitter {
    * Replay the existing content of every file of a session as `file`/`lines`
    * events (main + children merged chronologically), then a `meta` event. With
    * `fileId`, only that child transcript is replayed, served as the main file
-   * of its own view.
+   * of its own view. Await each emission for backpressure and stop when the
+   * signal aborts. Capture replay boundaries before awaiting the consumer.
    */
   readAll(
     kind: HarnessKind,
     id: string,
-    emit: (event: SessionLiveEvent) => void,
+    emit: ReplaySink,
     fileId?: string,
+    signal?: AbortSignal,
   ): Promise<void>
   /** Receive live `file`/`lines`/`meta` events for one session. */
   subscribe(kind: HarnessKind, id: string, subscriber: Subscriber): () => void
@@ -98,9 +102,9 @@ export interface SessionSource extends EventEmitter {
   blobPath?(kind: HarnessKind, id: string, fileId: string, hash: string): string | null
   /**
    * The paths this source feeds to the search index, read after `start()`
-   * resolves. A {@link CompositeSource} aggregates them so one
+   * resolves. SearchLifecycle aggregates them so one
    * `finishBackfill` sees every source's live set. Sources sharing the
-   * index MUST NOT call `finishBackfill` themselves — the composite owns
+   * index MUST NOT call `finishBackfill` themselves — SearchLifecycle owns
    * the aggregate backfill lifecycle (a member's early finish would stamp
    * the watermarks of sources that have not started yet).
    */
@@ -291,7 +295,6 @@ export class CompositeSource extends EventEmitter implements SessionSource {
 
   constructor(
     private readonly sources: readonly SessionSource[],
-    private readonly search?: SearchIndexer,
   ) {
     super()
     for (const source of sources) {
@@ -312,13 +315,11 @@ export class CompositeSource extends EventEmitter implements SessionSource {
   }
 
   /**
-   * Start every source, then close the search backfill once with the UNION of
-   * live paths — each member's own sweep is assumed `deferBackfill`-deferred,
-   * so a DB source's virtual paths are never dropped by the fs index's prune.
+   * Start every source. SearchLifecycle coordinates discovery instead when
+   * search can be enabled, so startup and later toggles share one barrier.
    */
   async start(): Promise<void> {
     for (const source of this.sources) await source.start()
-    this.search?.finishBackfill(this.livePaths())
   }
 
   livePaths(): string[] {
@@ -345,10 +346,11 @@ export class CompositeSource extends EventEmitter implements SessionSource {
   async readAll(
     kind: HarnessKind,
     id: string,
-    emit: (event: SessionLiveEvent) => void,
+    emit: ReplaySink,
     fileId?: string,
+    signal?: AbortSignal,
   ): Promise<void> {
-    await this.sourceFor(kind)?.readAll(kind, id, emit, fileId)
+    await this.sourceFor(kind)?.readAll(kind, id, emit, fileId, signal)
   }
 
   subscribe(kind: HarnessKind, id: string, subscriber: Subscriber): () => void {
@@ -463,6 +465,25 @@ export interface LineChunk {
   lines: string[]
   /** 0-based index of `lines[0]` among the file's non-blank lines; negative when synthetic. */
   startLine: number
+}
+
+/** Publish a captured replay with at most one emission awaiting the consumer. */
+export async function emitReplay(
+  files: readonly SessionFileRef[],
+  sources: readonly LineSource[],
+  meta: Extract<SessionLiveEvent, { type: 'meta' }>,
+  emit: ReplaySink,
+  signal?: AbortSignal,
+): Promise<void> {
+  for (const file of files) {
+    if (signal?.aborted) return
+    await emit({ type: 'file', file })
+  }
+  for (const chunk of mergeChronologically(sources)) {
+    if (signal?.aborted) return
+    await emit({ type: 'lines', file: chunk.ref, lines: chunk.lines, startLine: chunk.startLine })
+  }
+  if (!signal?.aborted) await emit(meta)
 }
 
 /**

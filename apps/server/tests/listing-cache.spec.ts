@@ -143,6 +143,7 @@ describe('ListingCache + SessionIndex', () => {
     })
     index = fresh
     await fresh.start()
+    search?.finishBackfill(fresh.livePaths())
     return fresh
   }
 

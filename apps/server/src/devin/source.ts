@@ -82,8 +82,8 @@ import {
 import { createMetaScanner } from '../meta.ts'
 import type { SearchIndexer } from '../search/indexer.ts'
 import {
-  CHUNK_LINES, lineTimes, mergeChronologically, SessionBook, searchKeyOf, standaloneRef,
-  type LineSource, type SessionSource, type SourceEntry, type SourceSession, type Subscriber,
+  CHUNK_LINES, emitReplay, lineTimes, SessionBook, searchKeyOf, standaloneRef,
+  type LineSource, type SessionSource, type ReplaySink, type SourceEntry, type SourceSession, type Subscriber,
 } from '../source.ts'
 import { DevinDb, type DevinNodeRow, type DevinSessionRow } from './db.ts'
 
@@ -627,9 +627,11 @@ export class DevinSource extends EventEmitter implements SessionSource {
   async readAll(
     kind: HarnessKind,
     id: string,
-    emit: (event: SessionLiveEvent) => void,
+    emit: ReplaySink,
     fileId?: string,
+    signal?: AbortSignal,
   ): Promise<void> {
+    if (signal?.aborted) return
     if (kind !== KIND) return
     const state = this.states.get(id)
     const main = state?.session.main
@@ -645,7 +647,6 @@ export class DevinSource extends EventEmitter implements SessionSource {
       entries = [child]
       refOf = entry => standaloneRef(entry.ref)
     }
-    for (const entry of entries) emit({ type: 'file', file: refOf(entry) })
     const sources: LineSource[] = []
     if (fileId === undefined) {
       // Facts + tool state are synthetic: they belong to no line of the stream,
@@ -665,10 +666,11 @@ export class DevinSource extends EventEmitter implements SessionSource {
       const lines = replayed.get(entry.path) ?? []
       sources.push({ ref: refOf(entry), lines, times: lineTimes(lines) })
     }
-    for (const chunk of mergeChronologically(sources)) {
-      emit({ type: 'lines', file: chunk.ref, lines: chunk.lines, startLine: chunk.startLine })
-    }
-    emit({ type: 'meta', summary: this.book.summarize(session), children: this.book.childSummaries(session) })
+    await emitReplay(
+      entries.map(refOf), sources,
+      { type: 'meta', summary: this.book.summarize(session), children: this.book.childSummaries(session) },
+      emit, signal,
+    )
   }
 
   // -- discovery -----------------------------------------------------------

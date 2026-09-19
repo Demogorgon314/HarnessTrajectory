@@ -7,9 +7,10 @@ import { Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import {
   HARNESS_KINDS, SEARCH_DEFAULT_LIMIT, SEARCH_INDEXING_IDLE, SEARCH_MAX_LIMIT, SEARCH_MIN_QUERY_LENGTH,
-  type HarnessKind, type SearchResponse, type SessionListPage, type SessionLiveEvent, type SessionSummary,
+  type HarnessKind, type SearchResponse, type SessionListPage, type SessionSummary,
 } from '@harness-trajectory/core'
-import { scopeToFile, summaryOrderKey, type SessionSource } from './index.ts'
+import { summaryOrderKey, type SessionSource } from './source.ts'
+import { streamSession } from './session-stream.ts'
 import { search, type SearchService } from './search/index.ts'
 import type { SettingsController } from './settings.ts'
 
@@ -261,48 +262,7 @@ export function createApp({ index, staticDir, search: searchService, settings }:
     if (fileId !== undefined && !index.hasChild(kind, id, fileId)) {
       return c.json({ error: 'child transcript not found' }, 404)
     }
-    return streamSSE(c, async (stream) => {
-      let closed = false
-      let counter = 0
-      const queue: SessionLiveEvent[] = []
-      let replaying = true
-      const send = async (event: SessionLiveEvent): Promise<void> => {
-        if (closed) return
-        counter += 1
-        await stream.writeSSE({ event: event.type, data: JSON.stringify(event), id: String(counter) })
-      }
-      const unsubscribe = index.subscribe(kind, id, (raw) => {
-        const event = fileId === undefined ? raw : scopeToFile(raw, fileId)
-        if (event === null) return
-        if (replaying) queue.push(event)
-        else void send(event)
-      })
-      stream.onAbort(() => {
-        closed = true
-        unsubscribe()
-      })
-      try {
-        const pending: Promise<void>[] = []
-        await index.readAll(kind, id, (event) => { pending.push(send(event)) }, fileId)
-        await Promise.all(pending)
-        replaying = false
-        for (const event of queue.splice(0)) await send(event)
-        await send({ type: 'ready' })
-        // Chrome's EventSource stops draining a large replay (~2 MB buffered) until the
-        // next write reaches the socket, so a multi-MB session used to settle only at
-        // the next keepalive — in 15 s multiples. A short burst of fast pings right
-        // after `ready` unsticks it; idle streams then fall back to the cheap cadence.
-        let burst = 20
-        while (!closed) {
-          await stream.sleep(burst > 0 ? 250 : 15_000)
-          if (burst > 0) burst -= 1
-          if (!closed) await stream.writeSSE({ event: 'ping', data: '' })
-        }
-      } finally {
-        closed = true
-        unsubscribe()
-      }
-    })
+    return streamSSE(c, stream => streamSession(index, kind, id, stream, fileId))
   })
 
   if (staticDir !== undefined && existsSync(staticDir)) {

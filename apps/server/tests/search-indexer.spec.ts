@@ -50,7 +50,7 @@ describe('SearchIndexer with SessionIndex', () => {
     const fresh = new SessionIndex({ roots: roots(), watch: false, now: () => T0 + 60_000, search: indexer })
     index = fresh
     await fresh.start()
-    // The backfill flush already ran inside `start`; nothing is left pending.
+    indexer.finishBackfill(fresh.livePaths())
     return fresh
   }
 
@@ -73,6 +73,7 @@ describe('SearchIndexer with SessionIndex', () => {
   afterEach(async () => {
     index?.stop()
     index = null
+    indexer.stop()
     store.close()
     await rm(dir, { recursive: true, force: true })
   })
@@ -319,6 +320,7 @@ describe('SessionIndex search hot-enable', () => {
     const live = new SessionIndex({ roots: roots(), watch: false, now: () => T0 + 60_000, search: indexer })
     index = live
     await live.start()
+    indexer.finishBackfill(live.livePaths())
     expect(store.docCount()).toBe(2)
 
     // Toggle off, then back on: the pass sees full coverage and reads nothing.
@@ -636,6 +638,7 @@ describe('SessionIndex backfill sweep', () => {
       backfillConcurrency: 1,
     })
     await index.start()
+    indexer.finishBackfill(index.livePaths())
     expect(order).toEqual(['new-one', 'mid-one', 'old-one'])
     index.stop()
     store.close()
@@ -652,6 +655,7 @@ describe('SessionIndex backfill sweep', () => {
       search: indexer,
     })
     await index.start()
+    indexer.finishBackfill(index.livePaths())
     expect(index.list()).toHaveLength(12)
     expect(indexer.stats()).toEqual({ pendingFiles: 0, ready: true, filesDone: 12, filesTotal: 12 })
     expect(search(store, { q: 'prompt of s-7' }).totalHits).toBe(1)

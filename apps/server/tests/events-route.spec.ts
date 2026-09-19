@@ -7,10 +7,11 @@
 import { mkdir, mkdtemp, rm, writeFile, appendFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SessionLiveEvent } from '@harness-trajectory/core'
 import { createApp } from '../src/app.ts'
 import { SessionIndex } from '../src/index.ts'
+import type { Subscriber } from '../src/source.ts'
 
 const T0 = Date.parse('2026-09-14T10:00:00.000Z')
 const iso = (offsetMs: number) => new Date(T0 + offsetMs).toISOString()
@@ -95,6 +96,84 @@ describe('GET /api/sessions/:kind/:id/events', () => {
     const first = events.find(event => event.type === 'lines')
     expect(JSON.parse(first?.type === 'lines' ? first.lines[0] ?? '{}' : '{}'))
       .toMatchObject({ uuid: 'u-0' })
+  })
+
+  it('pauses replay at the consumer and keeps appends outside its captured boundary', async () => {
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    const events: SessionLiveEvent[] = []
+    const live: SessionLiveEvent[] = []
+    const unsubscribe = index.subscribe('claude', 'main-1', event => { live.push(event) })
+    const pending = index.readAll('claude', 'main-1', async event => {
+      events.push(event)
+      if (event.type === 'lines' && event.startLine === 0) {
+        entered.resolve()
+        await release.promise
+      }
+    })
+    await entered.promise
+    expect(numbering(events, 'main-1')).toEqual([[0, 400]])
+    const path = join(dir, 'claude', '-slug', 'main-1.jsonl')
+    await appendFile(path, jsonl([claudeUser('while replay is paused', 'main-1', 99_000)]))
+    await index.refreshPath(path)
+    expect(numbering(events, 'main-1')).toEqual([[0, 400]])
+    expect(numbering(live, 'main-1')).toEqual([[900, 1]])
+    release.resolve()
+    await pending
+    expect(numbering(events, 'main-1')).toEqual([[0, 400], [400, 400], [800, 100]])
+    unsubscribe()
+  })
+
+  it('stops producing replay chunks when the consumer cancels', async () => {
+    const abort = new AbortController()
+    const events: SessionLiveEvent[] = []
+    await index.readAll('claude', 'main-1', event => {
+      events.push(event)
+      if (event.type === 'lines') abort.abort()
+    }, undefined, abort.signal)
+    expect(events.map(event => event.type)).toEqual(['file', 'lines'])
+    expect(numbering(events, 'main-1')).toEqual([[0, 400]])
+  })
+
+  it('cancels source replay and unsubscribes when an HTTP reader disconnects', async () => {
+    const finished = Promise.withResolvers<void>()
+    const started = Promise.withResolvers<void>()
+    let signal: AbortSignal | undefined
+    const original = index.readAll.bind(index)
+    vi.spyOn(index, 'readAll').mockImplementation(async (...args) => {
+      signal = args[4]
+      started.resolve()
+      try { await original(...args) } finally { finished.resolve() }
+    })
+    const unsubscribe = vi.fn()
+    vi.spyOn(index, 'subscribe').mockReturnValue(unsubscribe)
+    const response = await createApp({ index }).request('/api/sessions/claude/main-1/events')
+    await started.promise
+    await response.body?.cancel()
+    await finished.promise
+    expect(signal?.aborted).toBe(true)
+    expect(unsubscribe).toHaveBeenCalled()
+  })
+
+  it('disconnects an overflowing live queue so the viewer can recover through replay', async () => {
+    const finished = Promise.withResolvers<void>()
+    let subscriber: Subscriber | undefined
+    const unsubscribe = vi.fn()
+    vi.spyOn(index, 'subscribe').mockImplementation((_kind, _id, next) => {
+      subscriber = next
+      return unsubscribe
+    })
+    vi.spyOn(index, 'readAll').mockImplementation(async (_kind, _id, _emit, _file, signal) => {
+      await new Promise<void>(resolve => { signal?.addEventListener('abort', () => { resolve() }, { once: true }) })
+      finished.resolve()
+    })
+    const response = await createApp({ index }).request('/api/sessions/claude/main-1/events')
+    const file = index.get('claude', 'main-1')?.files[0]
+    if (file === undefined || subscriber === undefined) throw new Error('stream not opened')
+    subscriber({ type: 'lines', file, startLine: 900, lines: ['x'.repeat(5 * 1024 * 1024)] })
+    await finished.promise
+    expect(unsubscribe).toHaveBeenCalled()
+    await response.body?.cancel()
   })
 
   it('continues the numbering into live appends and restarts it after a truncation', async () => {

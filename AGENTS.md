@@ -114,7 +114,10 @@ Logo credits live in the web registry and README license section.
   background backfill (`SessionIndex.enableSearch` re-reads historical lines from disk,
   `DevinSource.enableSearch` re-derives them from the store; both resume from the
   `beginFile` watermarks), disabling detaches the indexer and preserves the database
-  on disk. Toggles serialize through one promise chain in `main.ts`.
+  on disk. `search/lifecycle.ts` owns service creation, discovery/backfill coordination,
+  and closure. Sources borrow the indexer; only the lifecycle finishes aggregate backfill.
+  Disabling detaches immediately and closes after in-flight work settles; replacement
+  backfills wait for discovery and retirement of the preceding service.
   `SessionIndex.enableSearch` anchors every file's watermark synchronously before
   the indexer goes live; an append mid-pass then flows only through the consume
   path and is never queued twice.

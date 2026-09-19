@@ -49,8 +49,8 @@ import {
 import { createMetaScanner } from '../meta.ts'
 import type { SearchIndexer } from '../search/indexer.ts'
 import {
-  CHUNK_LINES, lineTimes, mergeChronologically, SessionBook, searchKeyOf, standaloneRef,
-  type LineSource, type SessionSource, type SourceEntry, type SourceSession, type Subscriber,
+  CHUNK_LINES, emitReplay, lineTimes, SessionBook, searchKeyOf, standaloneRef,
+  type LineSource, type SessionSource, type ReplaySink, type SourceEntry, type SourceSession, type Subscriber,
 } from '../source.ts'
 import { OpencodeDb, type OpencodeSessionRow } from './db.ts'
 import {
@@ -141,7 +141,7 @@ export class OpencodeSource extends EventEmitter implements SessionSource {
     if (this.db === null) this.openDb()
     await this.sweep()
     // Search injected at construction: backfill before start resolves —
-    // CompositeSource's finishBackfill lands after every source's start.
+    // SearchLifecycle's finishBackfill lands after every source's start.
     if (this.search !== undefined) await this.backfillSearch(this.streams.values())
     if (!this.watchEnabled) return
     if (this.poll === null) {
@@ -355,9 +355,11 @@ export class OpencodeSource extends EventEmitter implements SessionSource {
   async readAll(
     kind: HarnessKind,
     id: string,
-    emit: (event: SessionLiveEvent) => void,
+    emit: ReplaySink,
     fileId?: string,
+    signal?: AbortSignal,
   ): Promise<void> {
+    if (signal?.aborted) return
     if (kind !== KIND) return
     this.materializeRoot(id)
     const session = this.book.sessions.get(`${KIND} ${id}`)
@@ -373,7 +375,6 @@ export class OpencodeSource extends EventEmitter implements SessionSource {
       entries = [child]
       refOf = entry => standaloneRef(entry.ref)
     }
-    for (const entry of entries) emit({ type: 'file', file: refOf(entry) })
     const sources: LineSource[] = []
     if (fileId === undefined) {
       const root = this.streams.get(id)
@@ -398,10 +399,11 @@ export class OpencodeSource extends EventEmitter implements SessionSource {
       }
       sources.push({ ref: refOf(entry), lines: replay.stream, times: lineTimes(replay.stream) })
     }
-    for (const chunk of mergeChronologically(sources)) {
-      emit({ type: 'lines', file: chunk.ref, lines: chunk.lines, startLine: chunk.startLine })
-    }
-    emit({ type: 'meta', summary: this.book.summarize(session), children: this.book.childSummaries(session) })
+    await emitReplay(
+      entries.map(refOf), sources,
+      { type: 'meta', summary: this.book.summarize(session), children: this.book.childSummaries(session) },
+      emit, signal,
+    )
   }
 
   /** One store poll (tests and manual refresh; the interval calls it too). */

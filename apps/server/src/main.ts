@@ -5,7 +5,6 @@ import { existsSync, statSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { serve } from '@hono/node-server'
-import type { ServerSettings } from '@harness-trajectory/core'
 import { createApp } from './app.ts'
 import { listingDbPath, searchDbPath, searchEnabled } from './cache.ts'
 import { DevinSource } from './devin/source.ts'
@@ -15,7 +14,7 @@ import { OpencodeSource } from './opencode/source.ts'
 import { defaultRoots, devinDbPath, opencodeDbPath } from './roots.ts'
 import { CompositeSource, type SessionSource } from './source.ts'
 import { browserUrl, openBrowser, shouldOpenBrowser } from './open-browser.ts'
-import { createSearchService, type SearchService } from './search/index.ts'
+import { SearchLifecycle } from './search/lifecycle.ts'
 import { SettingsController, readSettings, settingsPath } from './settings.ts'
 
 function argValue(flag: string): string | undefined {
@@ -69,76 +68,9 @@ are editable in the UI.`)
   // `node:sqlite` still prints one ExperimentalWarning on first import; that is
   // fine and deliberately not suppressed, since silencing warnings globally
   // would hide real ones.
-  let search: SearchService | undefined
   const dbPath = searchDbPath()
   const settingsFile = settingsPath()
   const startupSettings = readSettings(settingsFile)
-  // The persisted toggle decides; the env var forces search on for a launch
-  // without touching the file. There is deliberately no env "force off":
-  // `0`/`false` simply mean "no override", exactly what unset meant before.
-  if (searchEnabled() || startupSettings.contentSearch) {
-    try {
-      search = createSearchService({ path: dbPath, maxAgeDays: startupSettings.searchMaxAgeDays })
-    } catch (error) {
-      console.error('[harness-trajectory] search index unavailable:', error)
-    }
-  }
-  // The Content search toggle takes effect immediately: enabling creates the
-  // service and backfills in the background; disabling stops indexing and
-  // leaves the file on disk. The state flips synchronously so the settings
-  // response reports it; the expensive backfill chains here so a fast
-  // on→off→on sequence cannot interleave two passes.
-  let searchChain: Promise<void> = Promise.resolve()
-  const applySearchToggle = (value: ServerSettings): void => {
-    if (value.contentSearch && search === undefined) {
-      let service: SearchService
-      try {
-        service = createSearchService({ path: dbPath, maxAgeDays: value.searchMaxAgeDays })
-      } catch (error) {
-        // Degrade the way startup does: the persisted value stays on, the
-        // response reports searchEnabled: false, and the next launch retries.
-        console.error('[harness-trajectory] search index unavailable:', error)
-        return
-      }
-      search = service
-      console.log('[harness-trajectory] content search enabled; indexing in the background')
-      searchChain = searchChain.then(async () => {
-        if (search !== service) return
-        const enableStarted = Date.now()
-        try {
-          await index.enableSearch(service.indexer)
-          // Toggled off while the filesystem pass was running: the service is
-          // closed — attaching it to the DB sources or finishing its backfill
-          // now would touch a dead store and stick them with a closed indexer.
-          if (search !== service) return
-          devin.enableSearch(service.indexer)
-          await opencode.enableSearch(service.indexer)
-          // Same toggle-off window as above: the OpenCode backfill awaits
-          // between streams, so the service may have closed mid-pass.
-          if (search !== service) return
-          service.indexer.finishBackfill(source.livePaths())
-          let bytes = 0
-          try {
-            bytes = statSync(dbPath).size
-          } catch {
-            // In-memory or not yet flushed to disk.
-          }
-          console.log(`[harness-trajectory] search index: ${service.store.fileCount()} files, `
-            + `${service.store.docCount()} docs, ${Date.now() - enableStarted}ms, ${(bytes / 1e6).toFixed(1)} MB`)
-        } catch (error) {
-          console.error('[harness-trajectory] search backfill failed:', error)
-        }
-      })
-    } else if (!value.contentSearch && search !== undefined) {
-      index.disableSearch()
-      devin.disableSearch()
-      opencode.disableSearch()
-      search.close()
-      search = undefined
-      console.log('[harness-trajectory] content search disabled; the index file stays on disk')
-    }
-  }
-  const settings = new SettingsController(settingsFile, () => search?.indexer, applySearchToggle)
   // The listing cache makes restarts cheap: unchanged transcripts are not
   // re-read at all, grown ones resume at the persisted byte offset.
   let listing: ListingCache | undefined
@@ -151,32 +83,48 @@ are editable in the UI.`)
   const index = new SessionIndex({
     roots,
     ...(listing === undefined ? {} : { listing }),
-    ...(search === undefined ? {} : { search: search.indexer }),
-    // The composite closes the search backfill once every source has swept.
-    deferBackfill: true,
   })
   // DevinSource is attached unconditionally: a missing sessions.db degrades
   // to an empty source that retries on every poll, so a Devin CLI installed
   // or first-run while the viewer is up shows its sessions without a restart.
   const devin = new DevinSource({
     dbPath: devinDb,
-    ...(search === undefined ? {} : { search: search.indexer }),
   })
   // OpencodeSource is attached unconditionally too: a missing opencode.db
   // degrades to an empty source that retries on every poll.
   const opencodeDb = opencodeDbPath()
   const opencode = new OpencodeSource({
     dbPath: opencodeDb,
-    ...(search === undefined ? {} : { search: search.indexer }),
   })
-  const source: SessionSource = new CompositeSource([index, devin, opencode], search?.indexer)
+  const sources = [index, devin, opencode]
+  const source: SessionSource = new CompositeSource(sources)
+  const search = new SearchLifecycle(sources, {
+    path: dbPath,
+    onError: error => { console.error('[harness-trajectory] search failed:', error) },
+    onReady: service => {
+      let bytes = 0
+      try {
+        bytes = statSync(dbPath).size
+      } catch {
+        // In-memory or not yet flushed to disk.
+      }
+      console.log(`[harness-trajectory] search index: ${service.store.fileCount()} files, `
+        + `${service.store.docCount()} docs, ${(bytes / 1e6).toFixed(1)} MB`)
+    },
+  })
+  // The environment override affects this launch without changing persisted settings.
+  search.setEnabled(searchEnabled() || startupSettings.contentSearch, startupSettings.searchMaxAgeDays)
+  const settings = new SettingsController(
+    settingsFile, () => search.current()?.indexer,
+    value => { search.setEnabled(value.contentSearch, value.searchMaxAgeDays) },
+  )
   console.log(`  devin: ${devinDb}${existsSync(devinDb) ? '' : ' (waiting for sessions.db)'}`)
   console.log(`  opencode: ${opencodeDb}${existsSync(opencodeDb) ? '' : ' (waiting for opencode.db)'}`)
   source.on('error', (error: unknown) => {
     console.error('[harness-trajectory] watcher error:', error)
   })
   const staticDir = findStaticDir()
-  const app = createApp({ index: source, staticDir, search: () => search, settings })
+  const app = createApp({ index: source, staticDir, search: () => search.current(), settings })
   const open = shouldOpenBrowser()
   serve({ fetch: app.fetch, port, hostname }, (info) => {
     const url = browserUrl(info.address, info.port)
@@ -193,7 +141,7 @@ are editable in the UI.`)
     })
   })
   for (const root of roots) console.log(`  ${root.kind}: ${root.dir}`)
-  if (search === undefined) {
+  if (search.current() === undefined) {
     console.log('[harness-trajectory] search disabled (enable "Content search" in Settings, or set HARNESS_TRAJECTORY_SEARCH=1)')
   } else {
     const days = startupSettings.searchMaxAgeDays
@@ -203,42 +151,33 @@ are editable in the UI.`)
   const started = Date.now()
   let lastProgress = ''
   const logSearchProgress = (): void => {
-    if (search === undefined) return
-    const stats = search.indexer.stats()
+    const service = search.current()
+    if (service === undefined) return
+    const stats = service.indexer.stats()
     if (stats.filesTotal === 0 && !stats.ready) return
     const line = `[harness-trajectory] startup scan ${stats.filesDone}/${stats.filesTotal} files, `
-      + `${search.store.docCount()} docs`
+      + `${service.store.docCount()} docs`
     if (line === lastProgress) return
     lastProgress = line
     console.log(line)
   }
-  const progressTimer = search === undefined ? null : setInterval(logSearchProgress, 1000)
-  source.start().then(() => {
+  const progressTimer = search.current() === undefined ? null : setInterval(logSearchProgress, 1000)
+  search.start().then(() => {
     if (progressTimer !== null) clearInterval(progressTimer)
     const sessions = source.list()
     const sweep = index.sweepStats()
     const cached = listing === undefined ? '' : ` (${sweep.cached} cached, ${sweep.read} re-read)`
     console.log(`[harness-trajectory] indexed ${sessions.length} sessions in ${Date.now() - started}ms${cached}`)
-    if (search === undefined) return
-    logSearchProgress()
-    let bytes = 0
-    try {
-      bytes = statSync(dbPath).size
-    } catch {
-      // In-memory or not yet flushed to disk.
-    }
-    console.log(`[harness-trajectory] search index: ${search.store.fileCount()} files, `
-      + `${search.store.docCount()} docs, ${Date.now() - started}ms, ${(bytes / 1e6).toFixed(1)} MB`)
   }, (error: unknown) => {
     if (progressTimer !== null) clearInterval(progressTimer)
     console.error('[harness-trajectory] startup scan failed:', error)
     process.exit(1)
   })
-  const shutdown = () => {
+  const shutdown = async () => {
     if (progressTimer !== null) clearInterval(progressTimer)
+    await search.close()
     source.stop()
     listing?.close()
-    search?.close()
     process.exit(0)
   }
   process.on('SIGINT', shutdown)

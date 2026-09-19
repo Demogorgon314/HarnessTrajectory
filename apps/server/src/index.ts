@@ -20,8 +20,8 @@ import type { ListingCache } from './listing-cache.ts'
 import type { HarnessRoot } from './roots.ts'
 import type { SearchIndexer } from './search/indexer.ts'
 import {
-  lineTimes, mergeChronologically, scopeToFile, searchKeyOf,
-  SessionBook, sessionKey, standaloneRef, type SourceEntry, type SourceSession,
+  emitReplay, lineTimes, scopeToFile, searchKeyOf,
+  SessionBook, sessionKey, standaloneRef, type ReplaySink, type SourceEntry, type SourceSession,
   type SessionSource, type Subscriber,
 } from './source.ts'
 import {
@@ -190,12 +190,6 @@ export interface SessionIndexOptions {
   listing?: ListingCache
   /** Files registered concurrently during the startup sweep; 1 for a strict order. */
   backfillConcurrency?: number
-  /**
-   * Composed sources only: leave `search.finishBackfill` to the composite so
-   * every source's live paths — including a DB source's virtual ones — are
-   * counted before stale index rows are dropped.
-   */
-  deferBackfill?: boolean
 }
 
 export type { Classified } from './harness/classified.ts'
@@ -281,7 +275,6 @@ export class SessionIndex extends EventEmitter implements SessionSource {
   /** Mutable: the Content search toggle attaches and detaches this at runtime. */
   private search: SearchIndexer | undefined
   private readonly listing: ListingCache | undefined
-  private readonly deferBackfill: boolean
   /** Startup-sweep counters for the launch log. */
   private sweepRead = 0
   private sweepCached = 0
@@ -295,7 +288,6 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     this.now = options.now ?? Date.now
     this.search = options.search
     this.listing = options.listing
-    this.deferBackfill = options.deferBackfill ?? false
   }
 
   /** The transcript paths this source feeds to the search index. */
@@ -367,13 +359,6 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     })
     await Promise.all(workers)
     if (this.stopped) return
-    // Everything on disk has been seen: commit the backfill and forget the
-    // files that are gone. Files the retention window skips are not live for
-    // the index either, so rows an earlier run stored for them are dropped
-    // here. Only now does search report itself as ready.
-    if (this.deferBackfill !== true) {
-      this.search?.finishBackfill(this.livePaths())
-    }
     // Rows for transcripts that disappeared between runs are dropped here;
     // unlike the search index the listing cache also covers retention-skipped
     // files, so its live set is every registered path.
@@ -391,7 +376,6 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     if (this.poll !== null) clearInterval(this.poll)
     for (const timer of this.pending.values()) clearTimeout(timer)
     this.pending.clear()
-    this.search?.stop()
   }
 
   /** Re-stat one path (tests and manual refresh). */
@@ -410,7 +394,7 @@ export class SessionIndex extends EventEmitter implements SessionSource {
    * in the background. Historical lines are re-read from disk — the consume
    * path only ever forwards appends — through the same per-file watermarks
    * the startup sweep uses, so re-enabling after a disable resumes instead
-   * of starting over. The caller owns `finishBackfill` (the composite closes
+   * of starting over. The caller owns `finishBackfill` (SearchLifecycle closes
    * it once every source has been enabled).
    */
   async enableSearch(search: SearchIndexer): Promise<void> {
@@ -560,9 +544,11 @@ export class SessionIndex extends EventEmitter implements SessionSource {
   async readAll(
     kind: HarnessKind,
     id: string,
-    emit: (event: SessionLiveEvent) => void,
+    emit: ReplaySink,
     fileId?: string,
+    signal?: AbortSignal,
   ): Promise<void> {
+    if (signal?.aborted) return
     const session = this.book.sessions.get(sessionKey(kind, id))
     if (session === undefined || session.main === null) return
     let entries: FileEntry[]
@@ -575,10 +561,9 @@ export class SessionIndex extends EventEmitter implements SessionSource {
       entries = [child]
       refOf = entry => standaloneRef(entry.ref)
     }
-    for (const entry of entries) emit({ type: 'file', file: refOf(entry) })
     const sources = await Promise.all(entries.map(async (entry) => {
       // Read up to the index's consumed offset; live events cover the rest.
-      const lines = await this.readEntryLines(entry)
+      const lines = await this.readEntryLines(entry, signal)
       // Grok's session facts, system prompt and tool schemas live beside the
       // transcript, so one synthetic line carries them into the fold
       // (GROK-DESIGN §3). Its `timestamp` is the session's creation instant, so
@@ -597,10 +582,11 @@ export class SessionIndex extends EventEmitter implements SessionSource {
         ...(sidecar === undefined ? {} : { synthetic: 1 }),
       }
     }))
-    for (const chunk of mergeChronologically(sources)) {
-      emit({ type: 'lines', file: chunk.ref, lines: chunk.lines, startLine: chunk.startLine })
-    }
-    emit({ type: 'meta', summary: this.book.summarize(session), children: this.book.childSummaries(session) })
+    await emitReplay(
+      entries.map(refOf), sources,
+      { type: 'meta', summary: this.book.summarize(session), children: this.book.childSummaries(session) },
+      emit, signal,
+    )
   }
 
   /**
@@ -608,16 +594,18 @@ export class SessionIndex extends EventEmitter implements SessionSource {
    * its lineage bases' decoded prefixes first (immutable, so read whole each
    * time), then its own bytes up to the cursor.
    */
-  private async readEntryLines(entry: FileEntry): Promise<string[]> {
-    if (entry.bases === undefined || entry.bases.length === 0) {
-      return readWholeFile(entry.path, entry.offset)
+  private async readEntryLines(entry: FileEntry, signal?: AbortSignal): Promise<string[]> {
+    const { path, offset, bases } = entry
+    if (bases === undefined || bases.length === 0) {
+      return readWholeFile(path, offset, signal)
     }
     const lines: string[] = []
-    for (const base of entry.bases) {
+    for (const base of bases) {
+      if (signal?.aborted) return lines
       const slice = await readDecodedPrefix(base.path, base.endByteOffset ?? undefined)
       lines.push(...slice.lines)
     }
-    lines.push(...await readWholeFile(entry.path, entry.offset))
+    lines.push(...await readWholeFile(path, offset, signal))
     return lines
   }
 
@@ -1707,11 +1695,12 @@ export {
   type GrokChildBinding, type GrokSidecarLine,
 } from './harness/grok.ts'
 
-async function readWholeFile(path: string, end: number): Promise<string[]> {
+async function readWholeFile(path: string, end: number, signal?: AbortSignal): Promise<string[]> {
   const lines: string[] = []
   let from = 0
   let rest = ''
   while (from < end) {
+    if (signal?.aborted) return lines
     const result = await readLines(path, from, rest, end)
     if (result.offset === from && result.lines.length === 0) break
     from = result.offset

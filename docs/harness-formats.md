@@ -704,6 +704,23 @@ chars resolves to nothing.
 
 Resume command: `dsh tui --resume <id>`.
 
+## Source lifecycle and replay (shared)
+
+`SearchLifecycle` owns the search service across discovery and runtime toggles.
+Sources borrow its indexer, attach before initial discovery, and never finish or
+close the shared index themselves. A runtime enable waits for discovery; backfill
+finishes with the union of all sources' live paths. Disabling detaches immediately,
+then waits for pending work before closing the store. A replacement backfill waits
+for the preceding service to retire.
+
+`SessionSource.readAll` captures replay content before awaiting its consumer and
+waits for each emission. An abort signal stops further replay emissions and file
+reads between read operations. Replay, queued appends, `ready`, and keepalives share
+one SSE writer. Queued live JSON is limited to an 8 MiB UTF-16 storage budget per
+connection; overflow disconnects that viewer so EventSource reconnects with a full
+replay. Synthetic records retain `startLine: -1`. Replay still materializes session
+content for chronological merging; transport backpressure does not bound that cost.
+
 ## Request-input statistics (shared)
 
 ### Incremental parser extension points
