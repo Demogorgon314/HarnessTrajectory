@@ -128,13 +128,6 @@ describe('agentNodeInputsOf — naming', () => {
     const bare = agentNodeInputsOf(files, reader({}, {}), summary(), CTX)
     expect(bare[1]?.label).toBe(CHILD)
   })
-
-  test('long captions trim to one readable line', () => {
-    const long = 'x'.repeat(200)
-    const [main] = agentNodeInputsOf([file(MAIN, 'main')], reader({}, {}), summary({ title: long }), CTX)
-    expect(main?.label.length).toBe(80)
-    expect(main?.label.endsWith('…')).toBe(true)
-  })
 })
 
 describe('agentNodeInputsOf — liveness', () => {

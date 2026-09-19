@@ -666,27 +666,4 @@ describe('StatsContext — the derived second row', () => {
     assert.equal(cells(m2.container).values[11], '0')
     await m2.unmount()
   })
-
-  test('the zh locale localizes the derived row’s bubbles too', async () => {
-    const m = await mount(h(StatsContextZh, {
-      counts: { turns: 0, steps: 0, injects: 0, compactions: 1, prunes: 2 },
-      usage: null,
-      requests: PROMPTS,
-      subagents: 1,
-      requestInput: addRequestInput({ calls: 0, reported: 0, estimated: 0, withWindow: 0 }, { source: 'estimated', tokens: 369_200 }, 1, 1),
-      images: 2,
-      locale: 'zh',
-    }))
-    await flush()
-    const values = cells(m.container).values
-    assert.deepEqual(values.slice(6), ['≈369.2k tokens', '15m0s', '1', '1', '—', '2'])
-    const tips = queryAll(m.container, '.lc-stat-tip').map(el => text(el))
-    assert.ok(tips[3]!.includes('可用窗口'))
-    assert.ok(tips[4]!.includes('耗时统计'))
-    assert.equal(tips[5], '本会话执行的上下文压缩次数。 另有 2 次裁剪。')
-    assert.ok(tips[6]!.includes('子 Agent'))
-    assert.ok(tips[7]!.includes('预估费用除以用户输入次数'))
-    assert.ok(tips[8]!.includes('图片块'))
-    await m.unmount()
-  })
 })

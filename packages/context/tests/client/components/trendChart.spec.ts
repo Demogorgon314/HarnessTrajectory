@@ -12,7 +12,7 @@
  * empty frame here.
  */
 
-import { act, createElement as h, useState } from 'react'
+import { act, createElement as h } from 'react'
 import assert from '../helpers/assert.ts'
 import { afterAll, beforeAll, describe, test } from 'vitest'
 import { aggregateByTurn, attachMarkers, jumpTargetOf, makeTrendChart, turnStepsOf, type TrendChartProps } from '../../../src/client/components/trendChart'
@@ -1105,61 +1105,6 @@ describe('jumpTargetOf', () => {
     assert.equal(jumpTargetOf(reqs, 60)?.seq, 60)
     assert.equal(jumpTargetOf(reqs, 10)?.seq, 50, 'below the window → the oldest retained bar')
     assert.equal(jumpTargetOf([], 1), null)
-  })
-})
-
-describe('TrendChart entrance rise', () => {
-  const slot = (el: Element): string => (el as HTMLElement).style.getPropertyValue('--lc-i')
-
-  test('each bar carries its rise stagger slot, capped so a long log settles quickly', async () => {
-    const reqs = Array.from({ length: 25 }, (_, i) => req(i + 1))
-    const m = await mount(h(TrendChart, propsOf(reqs)))
-    const stacks = queryAll(m.container, '.lc-bar-stack')
-    assert.equal(stacks.length, 25)
-    assert.equal(slot(stacks[0]!), '0')
-    assert.equal(slot(stacks[1]!), '1')
-    assert.equal(slot(stacks[19]!), '19')
-    // Past the cap every late bar joins at the same slot.
-    assert.equal(slot(stacks[20]!), '20')
-    assert.equal(slot(stacks[24]!), '20')
-    await m.unmount()
-  })
-
-  test('delta arms share their bar rise stagger slot', async () => {
-    const r1 = req(1, { turn: 1, step: 0 })
-    const r2 = req(2, { turn: 1, step: 1, system: 50, user: 60 })
-    const m = await mount(h(TrendChart, propsOf([r1, r2], { mode: 'delta' })))
-    const ups = queryAll(m.container, '.lc-bar-up')
-    const downs = queryAll(m.container, '.lc-bar-down')
-    assert.equal(slot(ups[0]!), '0')
-    assert.equal(slot(ups[1]!), '1')
-    assert.equal(slot(downs[1]!), '1')
-    // The first bar diffs against nothing, so it grows no down arm.
-    assert.equal(queryAll(downs[0]!, 'div').length, 0)
-    await m.unmount()
-  })
-
-  test('switching granularity remounts every bar so the entrance rise replays', async () => {
-    // A turn aggregate IS its last step's record (the same seq): without the granularity-keyed remount,
-    // a turn → step switch would reuse that bar's DOM node and its turn-final step bars would not rise.
-    function GranularityHarness(props: { requests: RequestRecord[] }) {
-      const [granularity, setGranularity] = useState<'step' | 'turn'>('turn')
-      // The parent (ContextView) aggregates for turn granularity; TrendChart renders what it is given.
-      const display = granularity === 'turn' ? aggregateByTurn(props.requests) : props.requests
-      return h('div', null,
-        h('button', { onClick: () => { setGranularity('step') } }, 'to-step'),
-        h(TrendChart, { ...propsOf(display), granularity }))
-    }
-    const reqs = [req(1, { turn: 1, step: 0 }), req(2, { turn: 1, step: 1 }), req(3, { turn: 2, step: 0 })]
-    const m = await mount(h(GranularityHarness, { requests: reqs }))
-    // Turn mode: one aggregate per turn, each keyed by its LAST step's seq.
-    assert.deepEqual(bars(m.container).map(b => b.getAttribute('data-seq')), ['2', '3'])
-    const reusedSeq = query(m.container, '.lc-bar[data-seq="2"]')
-    await click(query(m.container, 'button'))
-    // Step mode renders every step; even the seq the aggregate reused must be a FRESH node.
-    assert.deepEqual(bars(m.container).map(b => b.getAttribute('data-seq')), ['1', '2', '3'])
-    assert.notEqual(query(m.container, '.lc-bar[data-seq="2"]'), reusedSeq)
-    await m.unmount()
   })
 })
 

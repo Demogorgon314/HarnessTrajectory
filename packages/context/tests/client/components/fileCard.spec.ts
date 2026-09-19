@@ -150,13 +150,6 @@ describe('FileCard — header, rows, and filters', () => {
     const m = await mount(h(FileCard, { activity: richActivity(), scope: 'live' }))
     const paths = () => queryAll(m.container, '.lc-fa-row').map(r => r.title)
 
-    // Kind chips always carry their badge-color class; the neutral chips don't.
-    assert.ok(chipByLabel(m.container, 'Read').className.includes('lc-fa-chip-read'))
-    assert.ok(chipByLabel(m.container, 'Written').className.includes('lc-fa-chip-write'))
-    assert.ok(chipByLabel(m.container, 'Searched').className.includes('lc-fa-chip-search'))
-    assert.ok(!chipByLabel(m.container, 'All').className.includes('lc-fa-chip-'))
-    assert.ok(!chipByLabel(m.container, 'Images').className.includes('lc-fa-chip-'))
-
     await click(chipByLabel(m.container, 'Written'))
     assert.ok(chipByLabel(m.container, 'Written').className.includes('lc-gran-on'))
     assert.deepEqual(paths(), ['/src/a.ts', 'solo.md'])

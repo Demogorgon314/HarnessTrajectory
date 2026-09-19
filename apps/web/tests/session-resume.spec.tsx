@@ -72,24 +72,19 @@ afterEach(() => {
 })
 
 describe('SessionPane resume copy', () => {
-  test('a main session shows resume plus the icon copy, and an accepted write copies the command', async () => {
+  test('copies the resume command and ignores clicks during the success feedback', async () => {
     vi.useFakeTimers()
     const writes: string[] = []
     stubClipboard(async (text) => { writes.push(text) })
     open({ kind: 'claude', id: 'main-1' })
-    expect(screen.queryByText('copy resume command')).toBeNull()
-    expect(screen.getByText('resume')).toBeTruthy()
     const button = screen.getByRole('button', { name: /Copy the command that resumes this session/ })
-    expect(button.className).toContain('lc-rich-copy')
-    expect(button.className).not.toContain('lc-rich-copy-on')
-    expect(button.getAttribute('title')).toBe('claude --resume main-1')
     await act(async () => { button.click() })
     expect(writes).toEqual(['claude --resume main-1'])
-    expect(button.className).toContain('lc-rich-copy-on')
     await act(async () => { button.click() })
     expect(writes).toEqual(['claude --resume main-1'])
     await act(async () => { await vi.advanceTimersByTimeAsync(1200) })
-    expect(button.className).not.toContain('lc-rich-copy-on')
+    await act(async () => { button.click() })
+    expect(writes).toEqual(['claude --resume main-1', 'claude --resume main-1'])
   })
 
   test('a subagent view has no resume control', () => {

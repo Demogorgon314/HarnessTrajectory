@@ -1,16 +1,12 @@
 // @vitest-environment jsdom
 /**
- * Trajectory turn chrome and layout fold: expand blocks, usage on Message,
+ * Trajectory layout fold: expand blocks, usage on Message,
  * tool own-duration, group wall-span descriptions, in-flight rows.
  */
-import { afterEach, describe, expect, it } from 'vitest'
-import { cleanup, render, screen } from '@testing-library/react'
+import { describe, expect, it } from 'vitest'
 import type {
   ConversationLocation, ConversationNode, RequestView,
 } from '@harness-trajectory/core'
-import { TrajectoryGroupHeader } from '../src/trajectory/TrajectoryGroupHeader.tsx'
-import { TrajectoryTurn } from '../src/trajectory/TrajectoryTurn.tsx'
-import { TrajectoryTurnHeader } from '../src/trajectory/TrajectoryTurnHeader.tsx'
 import {
   appendTrajectoryPartialLayout as appendTrajectoryPartialLayoutWithLocale,
   deriveTrajectoryLayout as deriveTrajectoryLayoutWithLocale,
@@ -33,46 +29,6 @@ interface LegacyConversationSlice {
 
 const EMPTY_LOCATION_DATA_SOURCE = { getSnapshot: () => undefined, subscribe: () => () => {} }
 const EMPTY_LOCATION_DATA = { get: () => undefined, source: () => EMPTY_LOCATION_DATA_SOURCE }
-
-afterEach(cleanup)
-
-describe('TrajectoryTurnHeader', () => {
-  it('renders Turn N and the four metric column labels', () => {
-    render(<TrajectoryTurnHeader turn={1} t={t} />)
-    expect(screen.getByText('Turn 1')).toBeTruthy()
-    expect(screen.getByText('Input')).toBeTruthy()
-    expect(screen.getByText('Output')).toBeTruthy()
-    expect(screen.getByText('Think')).toBeTruthy()
-    expect(screen.getByText('Time')).toBeTruthy()
-  })
-})
-
-describe('TrajectoryGroupHeader', () => {
-  it('renders title and optional description', () => {
-    render(<TrajectoryGroupHeader title="Step 1" description="2.2s skill" />)
-    expect(screen.getByText('Step 1')).toBeTruthy()
-    expect(screen.getByText('2.2s skill')).toBeTruthy()
-  })
-
-  it('omits the description node when absent', () => {
-    const { container } = render(<TrajectoryGroupHeader title="Message" />)
-    expect(screen.getByText('Message')).toBeTruthy()
-    expect(container.querySelectorAll('span')).toHaveLength(1)
-  })
-})
-
-describe('TrajectoryTurn', () => {
-  it('wraps a sticky header and body children', () => {
-    render(
-      <TrajectoryTurn turn={3} t={t}>
-        <TrajectoryGroupHeader title="Message" description="49s" />
-      </TrajectoryTurn>,
-    )
-    expect(screen.getByText('Turn 3')).toBeTruthy()
-    expect(screen.getByText('Message')).toBeTruthy()
-    expect(screen.getByText('49s')).toBeTruthy()
-  })
-})
 
 describe('deriveTrajectoryLayout', () => {
   it('expands assistant blocks, hangs usage on Message, and folds call+result into Tool', () => {

@@ -36,6 +36,9 @@ pnpm pack:cli                     # build and pack the npm CLI tarball
 - Add regression coverage in each affected behavior layer. Use synthetic records with real
   field names and fake payloads; no fixture files. Server tests use real temporary directories.
   Do not add tests solely for documentation or mechanical edits.
+- Frontend tests should protect meaningful behavior and regressions. Do not add tests that
+  merely repeat display copy, CSS classes, animation presets, or direct prop-to-text mappings.
+  Prefer existing interaction/lifecycle coverage; review visual-only changes in a browser.
 - Run `pnpm typecheck` before finishing. Run `pnpm build` when changing build, packaging,
   or production-serving behavior. Report checks actually run and any failures or blockers.
 
