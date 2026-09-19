@@ -108,7 +108,9 @@ Logo credits live in the web registry and README license section.
   them out of the budget). `store.gcTexts()` reclaims them (with their FTS
   rows) at every `finishBackfill` — runtime resets and forgets orphan texts
   without a file vanishing — and in `applyMaxAgeDays`, never inline in a flush.
-  Startup compacts after reclaiming texts even when no file row was deleted.
+  Startup compacts only when free pages occupy at least 16 MiB and 10% of the
+  database, even if no file row was deleted this run. Smaller holes are reused;
+  an explicit retention purge still compacts immediately.
 - The search database is a cache: bump `SEARCH_SCHEMA_VERSION` instead of migrating.
 - `contentSearch` defaults off; `HARNESS_TRAJECTORY_SEARCH=1` forces it on for one launch.
   The toggle takes effect without a restart: enabling creates the service and runs a

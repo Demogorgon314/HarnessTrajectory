@@ -414,6 +414,28 @@ consumed node_ids (unconsumed rows must not replay or the next live emit doubles
 cost is one full replay per SSE open — ~250 ms on a 2.5k-node session, and reconnects re-derive
 again; caching replay output is a follow-up that first needs rewrite/epoch invalidation solved.
 
+### Restart catalog and search watermarks
+
+`listing.sqlite` also stores Devin's listing scanners, stream counters and child refs in a
+separate catalog table. Its fingerprint includes a catalog version, `META_SCANNER_VERSION`,
+database file identity, the session row, node count/max row id, subagent heads and tool states.
+Unchanged sessions restore these summaries without parsing message bodies or building chain
+maps. If search is enabled, every stream must also have matching search coverage. Missing or
+invalid snapshots and incomplete search coverage fall back to the existing full reconstruction.
+The first launch builds the catalog; existing filesystem cursor rows remain valid.
+
+Opening/subscribing to a restored session builds its chain state before replay/live consumption.
+A changed fingerprint on polling rebuilds it, including late claims and store rewrites. Access
+also rechecks the fingerprint because it can precede the next poll. Only startup snapshots are
+persisted: sessions changed during a run reconstruct and refresh their snapshot next launch.
+The cache follows Devin's append/rewrite contract: node payloads are immutable within a row-id
+generation; it does not hash message bodies to detect arbitrary edits in place.
+
+Search compares the session row's `last_activity_at` consistently at registration and progress,
+not the max message time used for display. Main and child progress records use the successfully
+consumed session row watermark; a newly discovered child's registration probes the current
+database watermark. This prevents initial timestamps/zero cursors from resetting a warm index.
+
 ### Polling and recovery
 
 The poll keys work off the `message_nodes` row_id watermark (growth → incremental materialize,
@@ -582,8 +604,8 @@ the next prompt — count regression → full rebuild with `file reset`. Childre
 ### Source tiers and polling
 
 Two tiers keep startup off the message/part blobs (~340 MB of JSON on the reference
-store): the catalog tier reads `session` rows plus grouped `COUNT`/`MAX`/`SUM(length)`
-queries — sizes once at startup and per changed session, never per tick — and feeds
+store): the catalog tier reads `session` rows plus grouped `COUNT`/`MAX`/`SUM(octet_length)`
+in one query per table — sizes once at startup and per changed session, never per tick — and feeds
 each scanner user header lines only; the transcript tier materializes a session's full
 stream lazily on first `subscribe`/`readAll`/search registration and rebuilds the
 scanner fresh (a catalog-fed scanner must never double count). The tick gate is
@@ -596,9 +618,13 @@ watermark otherwise; closed streams keep the cheap strict gate. File identity
 (`dev:ino`) detects atomic replacement; a missing db degrades to empty and recovers
 on its own.
 
+`octet_length(data)` reads SQLite record byte lengths without decoding the overflow text.
+Listing sizes are UTF-8 bytes, including non-ASCII content, rather than character counts.
+
 Search attached at startup backfills through the same tiers: a stream the index
 already covers (`coverage` — the index's registered row-count `size` EQUALS the
-current count, its `mtimeMs` is at least as new, AND `indexedBytes` ≥ `size` —
+current count, its `mtimeMs` equals the max of session/message/part row-update timestamps,
+AND `indexedBytes` ≥ `size` —
 a reverted, rewritten, or not-fully-consumed stream is not mistaken for
 covered) is never re-read, every other indexable stream materializes and
 queues as it emits, with an event-loop yield between streams. `size` and
@@ -607,6 +633,8 @@ queues as it emits, with an event-loop yield between streams. `size` and
 `indexedBytes` is `countOf − openRowCount` — the rows the emitted lines
 account for, so a stream stopped with an open tail (a prompt still behind
 the patience gate) reads as incomplete on the next boot and materializes.
+Search registration and progress both use those source-row timestamps, not wire-event
+activity times: reconstructing an incomplete stream must not reset its indexed prefix.
 A covered stream stays unmaterialized, but a later touch while search
 is live materializes it on the spot — `beginFile` anchors at the index's
 `indexedLines` watermark and only the appended lines queue. Toggling search on

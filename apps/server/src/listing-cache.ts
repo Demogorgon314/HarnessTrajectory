@@ -27,7 +27,7 @@ import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
-/** Bumped whenever the schema below changes; a mismatch drops and rebuilds. */
+/** Filesystem cursor schema; source catalogs version their own payload fingerprints. */
 export const LISTING_CACHE_VERSION = 2
 
 /** What the index persists for one consumed transcript. */
@@ -69,6 +69,16 @@ create table files (
 );
 `
 
+const CATALOG_SCHEMA = `
+create table if not exists catalogs (
+  source text not null,
+  session text not null,
+  fingerprint text not null,
+  state text not null,
+  primary key (source, session)
+);
+`
+
 function asInt(value: unknown, fallback = 0): number {
   if (typeof value === 'number') return value
   if (typeof value === 'bigint') return Number(value)
@@ -84,6 +94,8 @@ export class ListingCache {
     this.db.exec('pragma journal_mode = wal')
     this.db.exec('pragma synchronous = normal')
     this.ensureSchema()
+    // Adding an independent catalog must not invalidate every JSONL cursor.
+    this.db.exec(CATALOG_SCHEMA)
   }
 
   private ensureSchema(): void {
@@ -116,6 +128,40 @@ export class ListingCache {
       sidecarMtimeMs: typeof sidecar === 'number' || typeof sidecar === 'bigint' ? Number(sidecar) : null,
       state: typeof state === 'string' ? state : null,
       footprint: typeof footprint === 'string' ? footprint : null,
+    }
+  }
+
+  /** SQLite source snapshots are separate from filesystem consume cursors. */
+  loadCatalog(source: string, session: string, fingerprint: string): string | undefined {
+    try {
+      const row = this.db.prepare('select state from catalogs where source = ? and session = ? and fingerprint = ?')
+        .get(source, session, fingerprint)
+      return typeof row?.['state'] === 'string' ? row['state'] : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  saveCatalog(source: string, session: string, fingerprint: string, state: string): void {
+    try {
+      this.db.prepare(`insert into catalogs values (?, ?, ?, ?)
+        on conflict(source, session) do update set fingerprint = excluded.fingerprint, state = excluded.state`)
+        .run(source, session, fingerprint, state)
+    } catch {
+      // A failed cache write only costs reconstruction on the next start.
+    }
+  }
+
+  pruneCatalog(source: string, live: ReadonlySet<string>): void {
+    try {
+      const rows = this.db.prepare('select session from catalogs where source = ?').all(source)
+      const drop = this.db.prepare('delete from catalogs where source = ? and session = ?')
+      for (const row of rows) {
+        const id = String(row['session'])
+        if (!live.has(id)) drop.run(source, id)
+      }
+    } catch {
+      // Stale snapshots still need a matching fingerprint to be reused.
     }
   }
 

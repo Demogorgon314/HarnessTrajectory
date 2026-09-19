@@ -38,6 +38,23 @@ afterEach(async () => {
 })
 
 describe('SearchStore', () => {
+  it('reuses small holes at startup and compacts substantial free space', () => {
+    const store = open()
+    add(store, key(), [{ line: 0, role: 'human', text: 'preserved searchable text' }])
+    // Allocate overflow pages directly: this exercises SQLite space accounting
+    // without making the regression depend on text compression or FTS layout.
+    store.db.exec('create table scratch (data blob); insert into scratch values (zeroblob(1048576)); delete from scratch')
+    const pages = () => Number(store.db.prepare('pragma page_count').get()?.['page_count'])
+    const small = pages()
+    store.compactIfWasteful()
+    expect(pages()).toBe(small)
+    store.db.exec('insert into scratch values (zeroblob(20971520)); drop table scratch')
+    const large = pages()
+    store.compactIfWasteful()
+    expect(pages()).toBeLessThan(large / 2)
+    expect(search(store, { q: 'preserved searchable text' }).totalHits).toBe(1)
+  })
+
   it('drops and rebuilds an index written under another schema version', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'harness-trajectory-search-'))
     dirs.push(dir)

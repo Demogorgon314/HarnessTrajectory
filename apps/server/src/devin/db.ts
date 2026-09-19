@@ -154,6 +154,14 @@ export class DevinDb {
     return row.m
   }
 
+  /** Catalog validation also detects deletion below an unchanged maximum row id. */
+  nodeStats(sessionId: string): { count: number; maxRowId: number } {
+    return this.db.prepare(
+      `SELECT COUNT(*) AS count, COALESCE(MAX(row_id), 0) AS maxRowId
+       FROM message_nodes WHERE session_id = ?`,
+    ).get(sessionId) as { count: number; maxRowId: number }
+  }
+
   /** Rows appended after `rowId`, in insertion order. */
   nodesAfter(sessionId: string, rowId: number): DevinNodeRow[] {
     return this.db.prepare(

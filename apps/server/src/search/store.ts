@@ -213,6 +213,16 @@ export class SearchStore {
     }
   }
 
+  /** Avoid rewriting the entire startup cache for a handful of reclaimed pages. */
+  compactIfWasteful(): void {
+    const free = asInt(this.db.prepare('pragma freelist_count').get()?.['freelist_count'])
+    const pages = asInt(this.db.prepare('pragma page_count').get()?.['page_count'])
+    const pageSize = asInt(this.db.prepare('pragma page_size').get()?.['page_size'])
+    // Smaller holes are reused by subsequent indexing. Both limits matter:
+    // a large database should not be rewritten for a tiny fraction of its size.
+    if (free * pageSize >= 16 * 1024 * 1024 && free >= pages * 0.1) this.compact()
+  }
+
   close(): void {
     this.checkpoint()
     try {

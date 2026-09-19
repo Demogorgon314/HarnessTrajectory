@@ -494,7 +494,7 @@ describe('SearchIndexer', () => {
     indexer.stop()
   })
 
-  it('returns orphaned text pages to disk after a reset without a vanished file', async () => {
+  it('reclaims reset orphans but keeps small holes available for reuse', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'harness-search-gc-'))
     const path = join(dir, 'search.sqlite')
     const diskStore = new SearchStore({ path })
@@ -512,7 +512,7 @@ describe('SearchIndexer', () => {
       indexer.finishBackfill([key.path])
       expect(diskStore.fileCount()).toBe(1)
       expect(diskStore.textCount()).toBe(0)
-      expect((await stat(path)).size).toBeLessThan(before / 2)
+      expect((await stat(path)).size).toBe(before)
     } finally {
       indexer.stop()
       diskStore.close()

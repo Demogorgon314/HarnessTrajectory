@@ -26,9 +26,9 @@
  *   read and what old stores have.
  *
  * Scale traps (1.4 GB store, 381 sessions): `PRAGMA data_version` gates a
- * tick; `SUM(length(data))` reads every blob (~2 s cold) so it runs once at
- * startup grouped per session and per changed session afterwards — never
- * per tick for all sessions; message/part BODIES are fetched lazily per
+ * tick; `SUM(octet_length(data))` reads byte lengths from SQLite's record
+ * headers without loading overflow text. Sizes run grouped at startup and
+ * per changed session afterwards; message/part BODIES are fetched lazily per
  * session (the transcript tier), never all at startup.
  *
  * `json_extract` is used only for role row-selection — `userMessages`/
@@ -201,20 +201,19 @@ export class OpencodeDb {
     ).all() as unknown as OpencodeTouch[]
   }
 
-  /** `SUM(length(data))` per session for `message` or `part` — expensive; startup + per-session refresh only. */
-  sizes(table: 'message' | 'part'): Map<string, number> {
+  /** One startup scan per table; octet_length avoids decoding the text blobs. */
+  catalogStats(table: 'message' | 'part'): Map<string, OpencodeTouch & { bytes: number }> {
     const rows = this.db.prepare(
-      `SELECT session_id, SUM(length(data)) AS bytes FROM ${table} GROUP BY session_id`,
-    ).all() as unknown as Array<{ session_id: string; bytes: number | null }>
-    const map = new Map<string, number>()
-    for (const row of rows) map.set(row.session_id, row.bytes ?? 0)
-    return map
+      `SELECT session_id, COUNT(*) AS count, MAX(time_updated) AS max_updated,
+       SUM(octet_length(data)) AS bytes FROM ${table} GROUP BY session_id`,
+    ).all() as unknown as Array<OpencodeTouch & { bytes: number }>
+    return new Map(rows.map(row => [row.session_id, row]))
   }
 
-  /** Byte size of one session's rows in one table (the per-refresh variant of `sizes`). */
+  /** UTF-8 byte size of one session's rows in one table. */
   sizeOf(table: 'message' | 'part', sessionId: string): number {
     const row = this.db.prepare(
-      `SELECT SUM(length(data)) AS bytes FROM ${table} WHERE session_id = ?`,
+      `SELECT SUM(octet_length(data)) AS bytes FROM ${table} WHERE session_id = ?`,
     ).get(sessionId) as { bytes: number | null }
     return row.bytes ?? 0
   }

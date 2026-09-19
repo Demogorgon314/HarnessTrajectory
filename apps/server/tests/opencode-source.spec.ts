@@ -466,6 +466,21 @@ describe('OpencodeSource', () => {
     expect(replayed.length).toBeGreaterThan(0)
   })
 
+  it('reports UTF-8 byte sizes consistently in grouped and per-session catalog reads', async () => {
+    const db = fixture()
+    seedSimple(db)
+    insertSession(db, 'empty')
+    insertMessage(db, 'alpha', 'msg_z', userData(T + 100), T + 100)
+    insertPart(db, 'alpha', 'msg_z', 'prt_z', userText('中文 😀'), T + 100)
+    const expected = [...db.messages('alpha'), ...db.parts('alpha')]
+      .reduce((sum, row) => sum + Buffer.byteLength(row.data), 0)
+    expect(db.sizeOf('message', 'alpha') + db.sizeOf('part', 'alpha')).toBe(expected)
+    db.close()
+    const src = await start()
+    expect(src.list().find(row => row.id === 'alpha')?.bytes).toBe(expected)
+    expect(src.list().find(row => row.id === 'empty')?.bytes).toBe(0)
+  })
+
   it('indexes sessions at startup when a SearchIndexer is injected', async () => {
     const store = new SearchStore({ path: ':memory:' })
     const indexer = new SearchIndexer({ store, flushDelayMs: 1, extract: extractSearchDocs, maxAgeDays: 0 })
@@ -502,6 +517,34 @@ describe('OpencodeSource', () => {
     expect(store.docCount()).toBe(docs)
     expect(indexer.coverage('opencode://sessions/alpha')?.size).toBe(covered?.size)
     expect(queueSpy).not.toHaveBeenCalled()
+  })
+
+  it('reopening a partially consumed stream does not reset its indexed prefix', async () => {
+    const store = new SearchStore({ path: ':memory:' })
+    const indexer = new SearchIndexer({ store, maxAgeDays: 0 })
+    const db = fixture()
+    seedSimple(db)
+    insertMessage(db, 'alpha', 'msg_z', userData(T + 100), T + 100)
+    insertPart(db, 'alpha', 'msg_z', 'prt_z', userText('waiting prompt'), T + 100)
+    db.close()
+    source = new OpencodeSource({ dbPath, watch: false, search: indexer })
+    await source.start()
+    indexer.flush()
+    const before = store.docCount()
+    source.stop()
+    const queue = vi.spyOn(indexer, 'queue')
+    const reset = vi.spyOn(indexer, 'reset')
+    source = new OpencodeSource({ dbPath, watch: false, search: indexer })
+    await source.start()
+    indexer.flush()
+    expect(reset).not.toHaveBeenCalled()
+    expect(queue).not.toHaveBeenCalled()
+    expect(store.docCount()).toBe(before)
+    await source.refresh()
+    indexer.flush()
+    expect(search(store, { q: 'waiting prompt' }).totalHits).toBe(1)
+    indexer.stop()
+    store.close()
   })
 
   it('a covered stream indexes appended content on the next tick', async () => {

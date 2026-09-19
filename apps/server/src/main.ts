@@ -89,6 +89,7 @@ are editable in the UI.`)
   // or first-run while the viewer is up shows its sessions without a restart.
   const devin = new DevinSource({
     dbPath: devinDb,
+    ...(listing === undefined ? {} : { listing }),
   })
   // OpencodeSource is attached unconditionally too: a missing opencode.db
   // degrades to an empty source that retries on every poll.

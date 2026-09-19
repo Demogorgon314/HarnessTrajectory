@@ -6,7 +6,7 @@
  *
  * - **Catalog tier** (always, at `start()` and on ticks): `session` rows →
  *   `SessionBook` entries plus grouped `COUNT(*)`/`MAX(time_updated)`
- *   touches and a one-time grouped `SUM(length(data))` per session. Listing
+ *   touches and a one-time grouped `SUM(octet_length(data))` per session. Listing
  *   facts come from a meta scanner fed ONLY the user header lines
  *   (`json_extract(data,'$.role')='user'` — the one SQL-side filter), so
  *   `promptCount`/title share the core classifier without reading
@@ -267,17 +267,17 @@ export class OpencodeSource extends EventEmitter implements SessionSource {
         if (stream.materialized) {
           this.indexBacklog(search, stream)
         } else {
-          // Covered means exactly: same row count, an mtime at least as
-          // new, AND a fully consumed stream (`indexedBytes` = rows the
+          // Covered means exactly: same row count and source timestamp,
+          // AND a fully consumed stream (`indexedBytes` = rows the
           // emitted lines account for; an open tail at shutdown reads as
           // incomplete — materialize so its held rows can index). Anything
-          // else materializes — a larger or older prior makes `beginFile`
-          // reset and re-index from line 0 (the same append-shaped-rewrite
+          // else materializes — a shrinking count or regressed timestamp
+          // makes `beginFile` reset from line 0 (the same append-shaped-rewrite
           // blind spot JSONL accepts).
           const prior = search.coverage(entry.path)
           const covered = prior !== undefined
             && prior.size === this.countOf(stream)
-            && prior.mtimeMs >= entry.mtimeMs
+            && prior.mtimeMs === this.searchMtime(stream)
             && prior.indexedBytes >= prior.size
           if (!covered) {
             this.materialize(stream)
@@ -300,7 +300,7 @@ export class OpencodeSource extends EventEmitter implements SessionSource {
   private indexBacklog(search: SearchIndexer, stream: StreamState): void {
     const entry = stream.entry
     entry.searchFrom = search.beginFile(
-      searchKeyOf(entry), { size: this.countOf(stream), mtimeMs: entry.mtimeMs },
+      searchKeyOf(entry), { size: this.countOf(stream), mtimeMs: this.searchMtime(stream) },
     )
     const replay = this.replayStream(stream)
     // The replay must re-derive the emitted stream exactly; a mismatch
@@ -313,7 +313,7 @@ export class OpencodeSource extends EventEmitter implements SessionSource {
     }
     search.noteProgress(searchKeyOf(entry), {
       size: this.countOf(stream),
-      mtimeMs: entry.mtimeMs,
+      mtimeMs: this.searchMtime(stream),
       indexedBytes: this.countOf(stream) - openRowCount(stream.cursor),
       indexedLines: entry.lines,
     })
@@ -512,6 +512,11 @@ export class OpencodeSource extends EventEmitter implements SessionSource {
     return stream.messageCount + stream.partCount
   }
 
+  /** Source timestamps are available before parsing, unlike emitted activity times. */
+  private searchMtime(stream: StreamState): number {
+    return Math.max(stream.row.time_updated, stream.messageMax, stream.partMax)
+  }
+
   /**
    * The catalog-tier scanner: a FRESH scanner seeded from the row and fed
    * only the session's user header lines (small — assistant/tool bodies
@@ -585,7 +590,7 @@ export class OpencodeSource extends EventEmitter implements SessionSource {
       // anchors and replays itself afterwards).
       if (this.search !== undefined && !stream.entry.searchSkipped) {
         stream.entry.searchFrom = this.search.beginFile(
-          searchKeyOf(stream.entry), { size: this.countOf(stream), mtimeMs: stream.entry.mtimeMs },
+          searchKeyOf(stream.entry), { size: this.countOf(stream), mtimeMs: this.searchMtime(stream) },
         )
       }
       const out = planLines({ messages, parts, cursor: stream.cursor, mode: { kind: 'live' } })
@@ -665,7 +670,7 @@ export class OpencodeSource extends EventEmitter implements SessionSource {
     if (stream.entry.searchSkipped || this.search === undefined) return
     this.search.noteProgress(searchKeyOf(stream.entry), {
       size: this.countOf(stream),
-      mtimeMs: stream.entry.mtimeMs,
+      mtimeMs: this.searchMtime(stream),
       // Same shape JSONL uses: `size` is the total (rows), `indexedBytes`
       // the consumed prefix (rows the emitted lines account for). An open
       // tail at shutdown reads as incomplete to `coverage`.
@@ -815,21 +820,15 @@ export class OpencodeSource extends EventEmitter implements SessionSource {
     const rows = this.sessionRows()
     if (rows === null) return
     const byId = new Map(rows.map(row => [row.id, row]))
-    // Two grouped SUM(length(data)) queries for the whole store — the only
-    // time blob sizes are read in bulk (per-session `sizeOf` covers a single
-    // changed row later; never 2×N queries at startup).
-    const messageSizes = db.sizes('message')
-    const partSizes = db.sizes('part')
-    // Grouped counts/maxes too: the lazy streams' watermarks start honest so
-    // search coverage can compare without materializing and an unchanged
-    // stream costs nothing on the first tick.
-    const messageTouch = new Map(db.touches('message').map(touch => [touch.session_id, touch]))
-    const partTouch = new Map(db.touches('part').map(touch => [touch.session_id, touch]))
+    // Counts, timestamps and byte sizes share one scan per table. The byte
+    // length comes from record headers, leaving overflow bodies unread.
+    const messageStats = db.catalogStats('message')
+    const partStats = db.catalogStats('part')
     for (const row of rows) {
       try {
-        const size = (messageSizes.get(row.id) ?? 0) + (partSizes.get(row.id) ?? 0)
-        const msg = messageTouch.get(row.id)
-        const prt = partTouch.get(row.id)
+        const msg = messageStats.get(row.id)
+        const prt = partStats.get(row.id)
+        const size = (msg?.bytes ?? 0) + (prt?.bytes ?? 0)
         this.registerStream(row, rootOf(row, byId), size, {
           messages: msg?.count ?? 0,
           parts: prt?.count ?? 0,
@@ -1058,16 +1057,21 @@ export class OpencodeSource extends EventEmitter implements SessionSource {
     const rows = this.sessionRows()
     if (rows === null) return false
     const byId = new Map(rows.map(row => [row.id, row]))
-    const messageSizes = db.sizes('message')
-    const partSizes = db.sizes('part')
+    const messageStats = db.catalogStats('message')
+    const partStats = db.catalogStats('part')
     const seen = new Set<string>()
     for (const row of rows) {
       seen.add(row.id)
       const stream = this.streams.get(row.id)
       try {
         if (stream === undefined) {
-          const size = (messageSizes.get(row.id) ?? 0) + (partSizes.get(row.id) ?? 0)
-          this.registerStream(row, rootOf(row, byId), size)
+          const msg = messageStats.get(row.id)
+          const prt = partStats.get(row.id)
+          const size = (msg?.bytes ?? 0) + (prt?.bytes ?? 0)
+          this.registerStream(row, rootOf(row, byId), size, {
+            messages: msg?.count ?? 0, parts: prt?.count ?? 0,
+            messageMax: msg?.max_updated ?? 0, partMax: prt?.max_updated ?? 0,
+          })
           this.emit('change', KIND, row.id)
           continue
         }

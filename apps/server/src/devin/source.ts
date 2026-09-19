@@ -80,12 +80,14 @@ import {
   type AgentFileMeta, type HarnessKind, type SessionFileRef, type SessionLiveEvent,
 } from '@harness-trajectory/core'
 import { createMetaScanner } from '../meta.ts'
+import type { ListingCache } from '../listing-cache.ts'
 import type { SearchIndexer } from '../search/indexer.ts'
 import {
   CHUNK_LINES, emitReplay, lineTimes, SessionBook, searchKeyOf, standaloneRef,
   type LineSource, type SessionSource, type ReplaySink, type SourceEntry, type SourceSession, type Subscriber,
 } from '../source.ts'
 import { DevinDb, type DevinNodeRow, type DevinSessionRow } from './db.ts'
+import { catalogFingerprint, parseCatalog, serializeCatalog } from './catalog.ts'
 
 const KIND: HarnessKind = 'devin'
 const POLL_INTERVAL_MS = 1_500
@@ -94,6 +96,7 @@ export interface DevinSourceOptions {
   /** Absolute path of `sessions.db`. */
   dbPath: string
   search?: SearchIndexer | undefined
+  listing?: ListingCache | undefined
   /** Disable polling and file watching (tests). */
   watch?: boolean | undefined
   now?: (() => number) | undefined
@@ -223,6 +226,8 @@ interface StoredNode {
 }
 
 interface DevinSessionState {
+  /** Validated listing-only restart snapshot; no chain state has been built yet. */
+  catalogFingerprint: string | null
   session: SourceSession<DevinEntry>
   row: DevinSessionRow
   /**
@@ -304,6 +309,7 @@ function jsonString(value: string | null): unknown {
 
 export class DevinSource extends EventEmitter implements SessionSource {
   private readonly dbPath: string
+  private readonly listing: ListingCache | undefined
   /** Mutable: the Content search toggle attaches and detaches this at runtime. */
   private search: SearchIndexer | undefined
   private readonly watchEnabled: boolean
@@ -336,6 +342,7 @@ export class DevinSource extends EventEmitter implements SessionSource {
   constructor(options: DevinSourceOptions) {
     super()
     this.dbPath = options.dbPath
+    this.listing = options.listing
     this.search = options.search
     this.watchEnabled = options.watch !== false
     this.now = options.now ?? Date.now
@@ -461,9 +468,12 @@ export class DevinSource extends EventEmitter implements SessionSource {
    * not: callers catch per session.
    */
   private freshSession(db: DevinDb, row: DevinSessionRow): void {
+    const fresh = !this.states.has(row.id)
+    const fingerprint = this.listing === undefined ? undefined : catalogFingerprint(db, this.dbSig, row)
     const state = this.register(row)
     state.row = row
     state.heads = new Map(db.subagentHeads(row.id).map(head => [head.chain_node_id, head.agent_id]))
+    if (fresh && fingerprint !== undefined && this.restoreCatalog(state, fingerprint)) return
     this.materialize(state)
     // History tools arrive in replay; only track their fingerprints live.
     for (const tool of db.toolStates(row.id)) {
@@ -474,6 +484,35 @@ export class DevinSource extends EventEmitter implements SessionSource {
     }
     this.syncSeedFacts(state)
     this.syncSidecar(state)
+    if (fingerprint !== undefined && fingerprint === catalogFingerprint(db, this.dbSig, row)) {
+      const entries = [state.session.main, ...state.session.children.values()].filter(entry => entry !== null)
+      this.listing?.saveCatalog(this.dbPath, row.id, fingerprint, serializeCatalog(entries, state.maxRowId))
+    }
+  }
+
+  private restoreCatalog(state: DevinSessionState, fingerprint: string): boolean {
+    const saved = this.listing?.loadCatalog(this.dbPath, state.row.id, fingerprint)
+    if (saved === undefined) return false
+    const catalog = parseCatalog(saved, state.row.id)
+    if (catalog === undefined) return false
+    const search = this.search
+    const skipped = search !== undefined && !search.shouldIndex({ mtimeMs: state.row.last_activity_at * 1000 })
+    if (search !== undefined && !skipped) {
+      for (const entry of catalog.entries) {
+        const prior = search.coverage(entry.path)
+        if (prior === undefined || prior.size !== catalog.maxRowId || prior.indexedLines !== entry.lines
+          || prior.indexedBytes !== entry.size || prior.mtimeMs !== state.row.last_activity_at * 1000) return false
+      }
+    }
+    for (const entry of catalog.entries) {
+      const restored: DevinEntry = { ...entry, searchFrom: entry.lines, searchSkipped: skipped }
+      if (entry.ref.role === 'main') state.session.main = restored
+      else state.session.children.set(entry.ref.id, restored)
+      this.book.files.set(entry.path, restored)
+    }
+    state.maxRowId = catalog.maxRowId
+    state.catalogFingerprint = fingerprint
+    return true
   }
 
   /**
@@ -566,6 +605,12 @@ export class DevinSource extends EventEmitter implements SessionSource {
    */
   enableSearch(search: SearchIndexer): void {
     if (this.search !== undefined) return
+    // The backlog pass below is the sole producer for this toggle. Restore
+    // deferred chains before attaching, otherwise materialization queues the
+    // same lines that the following replay is about to enqueue.
+    for (const state of this.states.values()) {
+      if (state.catalogFingerprint !== null) this.materialize(state)
+    }
     this.search = search
     for (const state of this.states.values()) {
       if (!state.live) continue
@@ -574,7 +619,7 @@ export class DevinSource extends EventEmitter implements SessionSource {
         entry.searchSkipped = !search.shouldIndex({ mtimeMs: state.row.last_activity_at * 1000 })
         entry.searchFrom = entry.searchSkipped
           ? 0
-          : search.beginFile(searchKeyOf(entry), { size: state.maxRowId, mtimeMs: entry.mtimeMs })
+          : search.beginFile(searchKeyOf(entry), { size: state.maxRowId, mtimeMs: state.row.last_activity_at * 1000 })
       }
       const replay = this.replaySession(state)
       for (const [path, lines] of replay) {
@@ -590,7 +635,7 @@ export class DevinSource extends EventEmitter implements SessionSource {
         }
         search.noteProgress(searchKeyOf(entry), {
           size: state.maxRowId,
-          mtimeMs: entry.mtimeMs,
+          mtimeMs: state.row.last_activity_at * 1000,
           indexedBytes: entry.size,
           indexedLines: entry.lines,
         })
@@ -613,6 +658,8 @@ export class DevinSource extends EventEmitter implements SessionSource {
     return kind === KIND && this.book.hasChild(kind, id, fileId)
   }
   subscribe(kind: HarnessKind, id: string, subscriber: Subscriber) {
+    const state = kind === KIND ? this.states.get(id) : undefined
+    if (state !== undefined && state.catalogFingerprint !== null) this.materialize(state)
     return this.book.subscribe(kind, id, subscriber)
   }
   facts(kind: HarnessKind, id: string) {
@@ -634,6 +681,7 @@ export class DevinSource extends EventEmitter implements SessionSource {
     if (signal?.aborted) return
     if (kind !== KIND) return
     const state = this.states.get(id)
+    if (state !== undefined && state.catalogFingerprint !== null) this.materialize(state)
     const main = state?.session.main
     if (state === undefined || main === null || main === undefined) return
     const session = state.session
@@ -702,6 +750,7 @@ export class DevinSource extends EventEmitter implements SessionSource {
     session.main = entry
     book.files.set(entry.path, entry)
     return {
+      catalogFingerprint: null,
       session,
       row,
       live,
@@ -738,7 +787,7 @@ export class DevinSource extends EventEmitter implements SessionSource {
       // appends, lower after a rebuild — exactly what `beginFile` checks.
       const maxRow = this.db?.maxRowId(row.id) ?? 0
       entry.searchFrom = this.search.beginFile(
-        searchKeyOf(entry), { size: maxRow, mtimeMs: entry.mtimeMs },
+        searchKeyOf(entry), { size: maxRow, mtimeMs: state.row.last_activity_at * 1000 },
       )
     }
     return state
@@ -987,7 +1036,10 @@ export class DevinSource extends EventEmitter implements SessionSource {
     state.book.files.set(path, entry)
     if (state.live && this.search !== undefined && !entry.searchSkipped) {
       entry.searchFrom = this.search.beginFile(
-        searchKeyOf(entry), { size: state.maxRowId, mtimeMs: entry.mtimeMs },
+        searchKeyOf(entry), {
+          size: this.db?.maxRowId(state.row.id) ?? state.maxRowId,
+          mtimeMs: state.row.last_activity_at * 1000,
+        },
       )
     }
     state.book.emitTo(session, { type: 'file', file: entry.ref })
@@ -1022,7 +1074,7 @@ export class DevinSource extends EventEmitter implements SessionSource {
 
   /**
    * Fan a materialization batch out to subscribers as chunked `lines` events
-   * (one event per contiguous run per stream) and record search progress. A
+   * (one event per contiguous run per stream). A
    * replay state just collects them for `readAll` instead.
    */
   private flushBatch(state: DevinSessionState, emitted: Map<DevinEntry, string[]>): void {
@@ -1042,14 +1094,22 @@ export class DevinSource extends EventEmitter implements SessionSource {
           startLine: startLine + offset,
         })
       }
-      if (!entry.searchSkipped) {
-        this.search?.noteProgress(searchKeyOf(entry), {
-          size: state.maxRowId,
-          mtimeMs: entry.mtimeMs,
-          indexedBytes: entry.size,
-          indexedLines: entry.lines,
-        })
-      }
+    }
+  }
+
+  private noteSearchProgress(state: DevinSessionState): void {
+    if (!state.live || this.search === undefined) return
+    const entries = [state.session.main, ...state.session.children.values()]
+    for (const entry of entries) {
+      if (entry === null || entry.searchSkipped) continue
+      this.search.noteProgress(searchKeyOf(entry), {
+        size: state.maxRowId,
+        // Listing activity includes message timestamps; restart validation
+        // must use the same source timestamp before and after reconstruction.
+        mtimeMs: state.row.last_activity_at * 1000,
+        indexedBytes: entry.size,
+        indexedLines: entry.lines,
+      })
     }
   }
 
@@ -1065,8 +1125,18 @@ export class DevinSource extends EventEmitter implements SessionSource {
     // retry would see `fresh` empty and skip them forever), so flag it and
     // let the next materialize rebuild rather than resume.
     if (state.needsRebuild) full = true
+    const fromCatalog = state.catalogFingerprint !== null
+    if (fromCatalog) {
+      // Access may beat the next poll. Validate again before trusting the
+      // cached line numbers, and pick up claims that landed in the meantime.
+      state.row = this.db.sessions().find(row => row.id === state.row.id) ?? state.row
+      full ||= catalogFingerprint(this.db, this.dbSig, state.row) !== state.catalogFingerprint
+      state.heads = new Map(this.db.subagentHeads(state.row.id).map(head => [head.chain_node_id, head.agent_id]))
+    }
+    state.catalogFingerprint = null
     try {
-      this.materializeRows(state, full)
+      this.materializeRows(state, full || fromCatalog, fromCatalog && !full)
+      this.noteSearchProgress(state)
       state.needsRebuild = false
     } catch (error) {
       state.needsRebuild = true
@@ -1074,7 +1144,7 @@ export class DevinSource extends EventEmitter implements SessionSource {
     }
   }
 
-  private materializeRows(state: DevinSessionState, full: boolean): void {
+  private materializeRows(state: DevinSessionState, full: boolean, preserveSearch = false): void {
     const db = this.db
     if (db === null) return
     if (full) {
@@ -1099,7 +1169,13 @@ export class DevinSource extends EventEmitter implements SessionSource {
         entry.size = 0
         entry.searchFrom = 0
         if (state.live) {
-          this.search?.reset(entry.path)
+          if (preserveSearch) {
+            entry.searchFrom = this.search?.beginFile(searchKeyOf(entry), {
+              size: db.maxRowId(state.row.id), mtimeMs: state.row.last_activity_at * 1000,
+            }) ?? 0
+          } else {
+            this.search?.reset(entry.path)
+          }
           entry.meta = createMetaScanner(
             KIND, entry === state.session.main ? sessionSeed(state.row) : null,
           )
@@ -1321,6 +1397,7 @@ export class DevinSource extends EventEmitter implements SessionSource {
     }
     if (emitted.size > 0) {
       this.flushBatch(state, emitted)
+      this.noteSearchProgress(state)
       if (state.live) this.emit('change', KIND, state.row.id)
     }
   }
@@ -1515,6 +1592,7 @@ export class DevinSource extends EventEmitter implements SessionSource {
         this.emit('error', new Error(`devin session ${row.id} materialization failed`, { cause: error }))
       }
     }
+    this.listing?.pruneCatalog(this.dbPath, new Set(rows.filter(row => row.hidden === 0).map(row => row.id)))
   }
 
   /** Flag the session for a full rebuild on its next materialize. */
@@ -1568,6 +1646,17 @@ export class DevinSource extends EventEmitter implements SessionSource {
         // alone would never materialize it — it would list but stay empty.
         const fresh = !this.states.has(row.id)
         const state = this.register(row)
+        if (state.catalogFingerprint !== null) {
+          if (!state.needsRebuild && state.catalogFingerprint === catalogFingerprint(db, this.dbSig, row)) continue
+          state.row = row
+          state.heads = new Map(db.subagentHeads(row.id).map(head => [head.chain_node_id, head.agent_id]))
+          this.materialize(state, true)
+          this.syncToolState(state)
+          this.syncSeedFacts(state)
+          this.syncSidecar(state)
+          this.emit('change', KIND, row.id)
+          continue
+        }
         const metaMoved = row.title !== state.row.title
           || row.main_chain_id !== state.row.main_chain_id
         const moved = metaMoved || row.last_activity_at !== state.row.last_activity_at
