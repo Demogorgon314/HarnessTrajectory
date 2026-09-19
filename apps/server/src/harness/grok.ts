@@ -1,11 +1,11 @@
 /**
  * Grok Build's filesystem layout: `updates.jsonl` transcripts, `summary.json`
  * and sibling sidecars, `subagents/<id>/meta.json` child bindings, and the
- * child → parent binding cache (`GrokBindings`).
+ * child → parent bindings and per-transcript lifecycle (`GrokSessions`).
  */
 
 import { Buffer } from 'node:buffer'
-import { readFile } from 'node:fs/promises'
+import { readFile, stat } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import {
   asArray, asString, GROK_SIDECAR_METHOD, type AgentFileMeta,
@@ -212,18 +212,122 @@ export function grokChildDir(mainPath: string): string {
   return join(dirname(mainPath), 'subagents')
 }
 
+/** The listing cache validates the current summary independently of live polling. */
+export async function readGrokSummaryMtime(path: string): Promise<number | null> {
+  try {
+    return (await stat(join(dirname(path), 'summary.json'))).mtimeMs
+  } catch {
+    return null
+  }
+}
+
+interface GrokSessionState {
+  unresolved: boolean
+  summaryMtimeMs: number | null
+  summaryRevision: number
+  title: string | null
+  sidecarKey: string | undefined
+}
+
+interface GrokSummaryChange {
+  title: string | null
+  titleChanged: boolean
+  sidecar?: string
+}
+
 /**
- * Grok child → parent bindings read from `<parent>/subagents/<childId>/meta.json`.
+ * Owns summary observation, sidecar delivery baselines, provisional identity and
+ * child → parent bindings read from `<parent>/subagents/<childId>/meta.json`.
  * A grok child is a top-level session directory that names no parent of its
  * own, so this map is the only way a child registered before (or far away
  * from) its parent finds it (GROK-FORMAT §D.2, §D.3).
+ * The index applies returned changes to scanners, membership and subscribers;
+ * it does not mutate these format-specific states. Restart probes them afresh.
  */
-export class GrokBindings {
+export class GrokSessions<E extends { path: string; ref: { id: string } }> {
+  private readonly sessions = new WeakMap<E, GrokSessionState>()
   private readonly children = new Map<string, GrokChildBinding>()
   /** Bumped whenever a new grok binding is learned; see `parentOf`. */
   private generation = 0
   /** Grok root → the generation its whole-root sweep ran at (negative cache). */
   private readonly swept = new Map<string, number>()
+
+  register(entry: E, probe: GrokProbe): void {
+    this.sessions.set(entry, {
+      unresolved: probe.summary === null || (probe.child && probe.parentId === undefined),
+      summaryMtimeMs: null,
+      summaryRevision: 0,
+      title: grokSummaryTitle(probe.summary),
+      sidecarKey: undefined,
+    })
+  }
+
+  needsBinding(entry: E): boolean {
+    return this.sessions.get(entry)?.unresolved === true
+  }
+
+  /** A parent meta can claim a provisional session before its own summary lands. */
+  claim(entry: E): boolean {
+    const state = this.sessions.get(entry)
+    if (state === undefined || !state.unresolved) return false
+    state.unresolved = false
+    return true
+  }
+
+  async refreshBinding(rootDir: string, entry: E): Promise<{ parentId: string; agent: AgentFileMeta } | undefined> {
+    if (!this.needsBinding(entry)) return undefined
+    const probe = await this.probe(rootDir, entry.path, entry.ref.id)
+    if (probe.parentId !== undefined && probe.agent !== undefined) {
+      if (this.claim(entry)) return { parentId: probe.parentId, agent: probe.agent }
+    } else if (probe.summary !== null && !probe.child) {
+      // A readable main-session summary settles identity permanently.
+      this.claim(entry)
+    }
+    return undefined
+  }
+
+  /** The observed mtime belongs with the scanner snapshot, not a fresh stat. */
+  summaryMtime(entry: E): number | null {
+    return this.sessions.get(entry)?.summaryMtimeMs ?? null
+  }
+
+  async replaySidecar(entry: E): Promise<GrokSidecarLine | undefined> {
+    const sidecar = await readGrokSidecar(entry.path, entry.ref.id)
+    const state = this.sessions.get(entry)
+    // The first replay seeds the delivery baseline. Later clients must not
+    // acknowledge changed facts on behalf of subscribers still awaiting them.
+    if (state !== undefined && sidecar !== undefined) state.sidecarKey ??= sidecar.key
+    return sidecar
+  }
+
+  /**
+   * Gate summary reads by mtime, title updates by title, and live sidecars by
+   * stable facts. Volatile counters change on virtually every transcript append.
+   * Without subscribers, avoid reading the large system prompt and tool schemas.
+   * Registration already seeded the scanner; its initial pass only records mtime.
+   */
+  async refreshSummary(entry: E, initial: boolean, subscribed: boolean): Promise<GrokSummaryChange | undefined> {
+    const state = this.sessions.get(entry)
+    if (state === undefined) return undefined
+    const mtime = await readGrokSummaryMtime(entry.path)
+    if (mtime === null || mtime === state.summaryMtimeMs) return undefined
+    state.summaryMtimeMs = mtime
+    const revision = ++state.summaryRevision
+    if (initial) return undefined
+    const dir = dirname(entry.path)
+    const summary = await readJsonRecord(join(dir, 'summary.json'))
+    const sidecar = subscribed ? await buildGrokSidecar(dir, entry.ref.id, summary) : undefined
+    // Polling and watcher refreshes can overlap after the consume lock ends.
+    // An older sidecar read must not overwrite a newer observation's title or
+    // delivery baseline. Compare titles only after this observation wins.
+    if (revision !== state.summaryRevision) return undefined
+    const title = grokSummaryTitle(summary)
+    const titleChanged = title !== state.title
+    state.title = title
+    if (sidecar === undefined || sidecar.key === state.sidecarKey) return { title, titleChanged }
+    state.sidecarKey = sidecar.key
+    return { title, titleChanged, sidecar: sidecar.line }
+  }
 
   /**
    * Decide whether a grok session directory is a subagent child and bind it to

@@ -267,6 +267,24 @@ are top-level session dirs bound through the parent's `subagents/<id>/meta.json`
 call id. Title, cwd, system prompt, and tool schemas live outside the JSONL and reach the
 parsers through the server's sidecar line.
 
+`GrokSessions` owns provisional parent binding, observed summary mtime, title
+comparison and sidecar delivery baselines. `SessionIndex` applies its changes to
+session membership, listing scanners, search addresses and subscriber events.
+Missing summaries and unbound children remain provisional; a readable main
+summary settles identity, while a parent's `subagents/<id>/meta.json` can claim
+a provisional child before the child's summary is written.
+
+Live summary refresh checks mtime first and reads the system prompt/tool schemas
+only with subscribers. An observation revision discards older asynchronous reads
+that finish after a newer summary was observed, before they can change the title
+or sidecar baseline. Volatile counters (`updated_at`, `num_messages`,
+`num_chat_messages`, `next_trace_turn`) do not trigger another synthetic line.
+Replay always reads current sidecar facts: the first replay can seed the delivery
+baseline, but a later client's replay cannot acknowledge a change for existing
+subscribers. Sidecars remain `startLine: -1` and never move search/JSONL cursors.
+Restart rebuilds these transient states from sidecars; listing-cache validation
+independently checks summary mtime before restoring the scanner and byte cursor.
+
 One prompt can persist multiple consecutive content chunks with the same
 `_meta.promptIndex`. Core, Context and metadata share `GrokPromptChunks`; chunks
 retain all content but count once. A non-chunk boundary ends the run, so rewinding

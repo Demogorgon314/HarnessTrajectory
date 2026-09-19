@@ -36,8 +36,8 @@ import { mergeReplay, type StreamingLineSource } from './replay.ts'
 import type { Classified } from './harness/classified.ts'
 import { classifyClaudePath, claudeChildDir, readAgentMeta } from './harness/claude.ts'
 import {
-  buildGrokSidecar, classifyGrokPath, GrokBindings, grokChildDir, grokChildPaths,
-  grokSummaryTitle, readGrokSidecar, readGrokSubagentMetas,
+  classifyGrokPath, GrokSessions, grokChildDir, grokChildPaths,
+  readGrokSubagentMetas, readGrokSummaryMtime,
 } from './harness/grok.ts'
 import { classifyKimiPath, kimiChildDir, readKimiTitle } from './harness/kimi.ts'
 import { classifyPiPath } from './harness/pi.ts'
@@ -114,24 +114,6 @@ interface FileEntry extends SourceEntry {
   consuming: boolean
   /** The newest stat a skipped consume arrived with, drained by the lock holder. */
   consumePending: { size: number; mtimeMs: number } | undefined
-  /** Grok only: mtime of the `summary.json` last read for this file. */
-  summaryMtimeMs?: number
-  /**
-   * Grok only: the facts of the sidecar last sent to subscribers
-   * (`grokSidecarKey`). `summary.json` is rewritten on essentially every
-   * appended line — `num_messages`, `updated_at` and the trace cursor are
-   * patched per write — so neither the mtime nor the rendered line is a usable
-   * gate: only what the sidecar actually tells the fold is.
-   */
-  sidecarKey?: string
-  /** Grok only: `summary.session_summary` as last read, so the title syncs only on a change. */
-  summaryTitle?: string | null
-  /**
-   * Grok only: this file registered as a main session although it may be a
-   * subagent child — its `summary.json` was unreadable, or it said "subagent"
-   * and no parent binding existed yet. Re-probed until it settles.
-   */
-  grokUnresolved?: boolean
 
   // -- Codex lineage / compression ------------------------------------------
   /** Codex only: the rollout id from the filename (last UUID), which `history_base` references. */
@@ -234,7 +216,7 @@ export class SessionIndex extends EventEmitter implements SessionSource {
    * from) its parent finds it (GROK-FORMAT §D.2, §D.3). The mechanics live in
    * `harness/grok.ts`.
    */
-  private readonly grok = new GrokBindings()
+  private readonly grok = new GrokSessions<FileEntry>()
 
   // -- Codex rollout lineage -------------------------------------------------
   /**
@@ -574,8 +556,7 @@ export class SessionIndex extends EventEmitter implements SessionSource {
         })
       }
       parts.push({ path, end })
-      const sidecar = entry.kind === 'grok' ? await readGrokSidecar(path, ref.id) : undefined
-      if (sidecar !== undefined) entry.sidecarKey = sidecar.key
+      const sidecar = entry.kind === 'grok' ? await this.grok.replaySidecar(entry) : undefined
       sources.push({
         ref,
         ...(sidecar === undefined ? {} : { synthetic: 1 }),
@@ -718,19 +699,10 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     // Grok's role is not path-derived: a child session is a top-level directory
     // like any other and only `summary.json` says otherwise (GROK-DESIGN §2).
     let agent: AgentFileMeta | undefined
-    let grokSummary: Record<string, unknown> | null = null
-    let grokUnresolved = false
-    if (root.kind === 'grok') {
-      const probe = await this.grok.probe(root.dir, path, id)
-      grokSummary = probe.summary
-      if (probe.parentId !== undefined) {
-        parentId = probe.parentId
-        agent = probe.agent
-      }
-      // Grok writes the child's directory and `updates.jsonl` before its
-      // `summary.json` and before the parent's `subagents/<id>/meta.json`, so
-      // an early probe has to be repeatable (see `refreshGrokBinding`).
-      grokUnresolved = probe.summary === null || (probe.child && probe.parentId === undefined)
+    const grokProbe = root.kind === 'grok' ? await this.grok.probe(root.dir, path, id) : undefined
+    if (grokProbe?.parentId !== undefined) {
+      parentId = grokProbe.parentId
+      agent = grokProbe.agent
     }
     const role: 'main' | 'child' = parentId !== undefined ? 'child' : classified.role
     const sessionId = parentId ?? id
@@ -758,12 +730,10 @@ export class SessionIndex extends EventEmitter implements SessionSource {
       consumePending: undefined,
       searchFrom: 0,
       searchSkipped: false,
-      meta: listingScannerFor(root.kind, role, agent, grokSummary),
+      meta: listingScannerFor(root.kind, role, agent, grokProbe?.summary ?? null),
       baseBytes: 0,
       baseLines: 0,
       basesConsumed: false,
-      ...(root.kind === 'grok' ? { summaryTitle: grokSummaryTitle(grokSummary) } : {}),
-      ...(grokUnresolved && role === 'main' ? { grokUnresolved: true } : {}),
       ...(root.kind === 'codex' ? {
         rootDir: root.dir,
         ...(rolloutId === undefined ? {} : { rolloutId }),
@@ -777,6 +747,7 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     }
     if (this.book.files.has(path)) return this.book.files.get(path)
     this.book.files.set(path, entry)
+    if (grokProbe !== undefined) this.grok.register(entry, grokProbe)
     if (dshIdentity !== undefined) this.dsh.register(path, entry, dshIdentity)
     if (root.kind === 'codex') {
       this.codex.registered(entry)
@@ -961,14 +932,9 @@ export class SessionIndex extends EventEmitter implements SessionSource {
    * has settled, either as a genuine main or under its parent.
    */
   private async refreshGrokBinding(root: HarnessRoot, entry: FileEntry): Promise<void> {
-    if (entry.kind !== 'grok' || entry.grokUnresolved !== true || entry.ref.role !== 'main') return
-    const probe = await this.grok.probe(root.dir, entry.path, entry.ref.id)
-    if (probe.parentId !== undefined && probe.agent !== undefined) {
-      this.rehomeGrokChild(entry, probe.parentId, probe.agent)
-      return
-    }
-    // A readable summary that claims no subagent kind settles the question.
-    if (probe.summary !== null && !probe.child) entry.grokUnresolved = false
+    if (entry.kind !== 'grok' || entry.ref.role !== 'main') return
+    const binding = await this.grok.refreshBinding(root.dir, entry)
+    if (binding !== undefined) this.rehomeGrokChild(entry, binding.parentId, binding.agent)
   }
 
   /**
@@ -990,7 +956,6 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     // Listing metadata belongs to main files only; the child is served through
     // its parent (and standalone from its lines) from here on.
     entry.meta = null
-    entry.grokUnresolved = false
     // Its lines were indexed under its own id; move them to the parent so a hit
     // opens the parent session with this transcript selected.
     this.search?.rebind(searchKeyOf(entry))
@@ -1048,54 +1013,21 @@ export class SessionIndex extends EventEmitter implements SessionSource {
     this.emit('change', entry.kind, entry.sessionId)
   }
 
-  /**
-   * Grok keeps the session's title, cwd, model, system prompt and tool schemas
-   * beside `updates.jsonl` and rewrites `summary.json` as the session runs
-   * (GROK-FORMAT §B.1). Re-read the title the way Claude's `ai-title` record is
-   * surfaced, and — whenever the facts actually changed — re-send the sidecar
-   * line (GROK-DESIGN §3) as a one-line append, so an open view refolds them
-   * without a reconnect. The initial pass only records the baseline: the replay
-   * in `readAll` already carries a sidecar of its own.
-   *
-   * Three gates, cheapest first, because grok patches `num_messages` and
-   * `updated_at` into `summary.json` on essentially every appended line, so
-   * "changed" is the steady state of a live session:
-   *   1. the mtime, which costs one `stat`;
-   *   2. `session_summary`, which gates the title sync;
-   *   3. the facts the sidecar carries (`grokSidecarKey`), which gate the
-   *      ~60 KB line — and which are only assembled at all when somebody is
-   *      subscribed to the session.
-   */
+  /** Apply Grok's observed changes to shared listing state and live subscribers. */
   private async syncGrokSummary(entry: FileEntry, initial = false): Promise<void> {
     if (entry.kind !== 'grok') return
-    const dir = dirname(entry.path)
-    let mtimeMs: number
-    try {
-      mtimeMs = (await stat(join(dir, 'summary.json'))).mtimeMs
-    } catch {
-      // Written last (GROK-DESIGN §1): a session without it yet keeps its facts null.
-      return
-    }
-    if (entry.summaryMtimeMs === mtimeMs) return
-    entry.summaryMtimeMs = mtimeMs
-    // `register` already fed this very object to the meta scanner.
-    if (initial) return
-    const key = sessionKey(entry.kind, entry.sessionId)
-    const session = this.book.sessions.get(key)
+    const session = this.book.sessions.get(sessionKey(entry.kind, entry.sessionId))
     if (session === undefined) return
-    const summary = await readJsonRecord(join(dir, 'summary.json'))
-    const title = grokSummaryTitle(summary)
-    const titleChanged = title !== entry.summaryTitle
-    entry.summaryTitle = title
-    if (titleChanged && title !== null && entry.meta !== null) entry.meta.state.aiTitle = title
-    if (titleChanged) this.emit('change', entry.kind, entry.sessionId)
-    if (!this.book.hasSubscribers(entry.kind, entry.sessionId)) return
-    const sidecar = await buildGrokSidecar(dir, entry.ref.id, summary)
-    if (sidecar !== undefined && sidecar.key !== entry.sidecarKey) {
-      entry.sidecarKey = sidecar.key
+    const subscribed = this.book.hasSubscribers(entry.kind, entry.sessionId)
+    const change = await this.grok.refreshSummary(entry, initial, subscribed)
+    if (change === undefined) return
+    if (change.titleChanged && change.title !== null && entry.meta !== null) entry.meta.state.aiTitle = change.title
+    if (change.titleChanged) this.emit('change', entry.kind, entry.sessionId)
+    if (!subscribed) return
+    if (change.sidecar !== undefined) {
       // Synthetic: it belongs to no line of `updates.jsonl` (see `startLine`).
-      this.book.emitTo(session, { type: 'lines', file: entry.ref, lines: [sidecar.line], startLine: -1 })
-    } else if (!titleChanged) {
+      this.book.emitTo(session, { type: 'lines', file: entry.ref, lines: [change.sidecar], startLine: -1 })
+    } else if (!change.titleChanged) {
       return
     }
     this.book.emitTo(session, { type: 'meta', summary: this.book.summarize(session), children: this.book.childSummaries(session) })
@@ -1169,11 +1101,7 @@ export class SessionIndex extends EventEmitter implements SessionSource {
   /** Grok: `summary.json`'s mtime — the one scanner input outside the transcript. */
   private async sidecarMtime(entry: FileEntry): Promise<number | null> {
     if (entry.kind !== 'grok') return null
-    try {
-      return (await stat(join(dirname(entry.path), 'summary.json'))).mtimeMs
-    } catch {
-      return null
-    }
+    return readGrokSummaryMtime(entry.path)
   }
 
   /** Persist the consume cursor and scanner state at a settle point. */
@@ -1188,7 +1116,7 @@ export class SessionIndex extends EventEmitter implements SessionSource {
       rest: entry.rest,
       lines: entry.lines,
       scannerVersion: META_SCANNER_VERSION,
-      sidecarMtimeMs: entry.kind === 'grok' ? entry.summaryMtimeMs ?? null : null,
+      sidecarMtimeMs: this.grok.summaryMtime(entry),
       state: serializeMeta(entry.meta),
       footprint,
     })
@@ -1590,7 +1518,7 @@ export class SessionIndex extends EventEmitter implements SessionSource {
           await this.refreshAgentMeta(session, entry)
           await this.syncKimiTitle(entry)
           await this.syncGrokSummary(entry)
-          const entryRoot = entry.grokUnresolved === true ? this.rootFor(entry.path) : undefined
+          const entryRoot = this.grok.needsBinding(entry) ? this.rootFor(entry.path) : undefined
           if (entryRoot !== undefined) await this.refreshGrokBinding(entryRoot, entry)
           this.saveListing(entry)
         } catch {
@@ -1633,7 +1561,7 @@ export class SessionIndex extends EventEmitter implements SessionSource {
         if (existing !== undefined) {
           // Registered before this meta.json existed, so it landed as a session
           // of its own: the parent has claimed it now.
-          if (existing.grokUnresolved === true) this.rehomeGrokChild(existing, binding.parentId, binding.agent)
+          if (this.grok.claim(existing)) this.rehomeGrokChild(existing, binding.parentId, binding.agent)
           break
         }
         if (await this.register(root, candidate) !== undefined) break

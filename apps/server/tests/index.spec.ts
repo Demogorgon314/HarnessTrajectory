@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto'
 import { mkdtemp, mkdir, rm, utimes, writeFile, appendFile } from 'node:fs/promises'
+import * as fs from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as zlib from 'node:zlib'
@@ -15,6 +16,12 @@ import { SearchIndexer } from '../src/search/indexer.ts'
 import { SearchStore, unpackText } from '../src/search/store.ts'
 import { extractSearchDocs } from '../src/search/extract.ts'
 import { search as querySearch } from '../src/search/query.ts'
+
+// Keep real filesystem I/O while allowing deterministic ordering of sidecar reads.
+vi.mock('node:fs/promises', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>()
+  return { ...actual }
+})
 
 function jsonl(records: readonly unknown[]): string {
   return records.map(record => JSON.stringify(record)).join('\n') + '\n'
@@ -1192,6 +1199,136 @@ describe('SessionIndex — Grok Build', () => {
     await index.refreshPath(join(mainDir, 'updates.jsonl'))
     expect(events).toEqual([])
     unsubscribe()
+  })
+
+  it('delivers changed sidecar facts to an existing client even when another client replays first', async () => {
+    const events: SessionLiveEvent[] = []
+    const unsubscribe = index.subscribe('grok', GROK_MAIN, event => events.push(event))
+    await index.readAll('grok', GROK_MAIN, () => {})
+    const summaryPath = join(mainDir, 'summary.json')
+    try {
+      // The title is unchanged: only the synthetic line can deliver this fact.
+      await writeFile(summaryPath, grokSummary(GROK_MAIN, '/work/grok', { current_model_id: 'grok-new' }))
+      await utimes(summaryPath, new Date(T0 + 3_600_000), new Date(T0 + 3_600_000))
+      const newcomer: SessionLiveEvent[] = []
+      await index.readAll('grok', GROK_MAIN, event => { newcomer.push(event) })
+      const replay = newcomer.find(event => event.type === 'lines' && event.file.id === GROK_MAIN && event.startLine === -1)
+      expect(replay?.type === 'lines' && JSON.parse(replay.lines[0] ?? '{}'))
+        .toMatchObject({ params: { summary: { current_model_id: 'grok-new' } } })
+      await index.refreshPath(join(mainDir, 'updates.jsonl'))
+      const live = events.filter(event => event.type === 'lines')
+      expect(live).toHaveLength(1)
+      expect(live[0]).toMatchObject({ startLine: -1 })
+      expect(live[0]?.type === 'lines' && JSON.parse(live[0].lines[0] ?? '{}'))
+        .toMatchObject({ params: { summary: { current_model_id: 'grok-new' } } })
+      events.length = 0
+      await writeFile(summaryPath, grokSummary(GROK_MAIN, '/work/grok', {
+        current_model_id: 'grok-new', num_messages: 20, updated_at: iso(9000),
+      }))
+      await utimes(summaryPath, new Date(T0 + 7_200_000), new Date(T0 + 7_200_000))
+      await index.refreshPath(join(mainDir, 'updates.jsonl'))
+      expect(events).toEqual([])
+    } finally {
+      unsubscribe()
+    }
+  })
+
+  it('refreshes titles without subscribers and replays the latest sidecar on a later connection', async () => {
+    const summaryPath = join(mainDir, 'summary.json')
+    await writeFile(summaryPath, grokSummary(GROK_MAIN, '/work/grok', { session_summary: 'Changed while closed' }))
+    await utimes(summaryPath, new Date(T0 + 3_600_000), new Date(T0 + 3_600_000))
+    await index.refreshPath(join(mainDir, 'updates.jsonl'))
+    expect(index.get('grok', GROK_MAIN)?.title).toBe('Changed while closed')
+    const replay: SessionLiveEvent[] = []
+    await index.readAll('grok', GROK_MAIN, event => { replay.push(event) })
+    const sidecar = replay.find(event => event.type === 'lines' && event.file.id === GROK_MAIN && event.startLine === -1)
+    expect(sidecar?.type === 'lines' && JSON.parse(sidecar.lines[0] ?? '{}'))
+      .toMatchObject({ params: { summary: { session_summary: 'Changed while closed' }, systemPrompt, toolDefinitions } })
+    const live: SessionLiveEvent[] = []
+    const unsubscribe = index.subscribe('grok', GROK_MAIN, event => live.push(event))
+    try {
+      await writeFile(summaryPath, grokSummary(GROK_MAIN, '/work/grok', {
+        session_summary: 'Changed while closed', num_messages: 10,
+      }))
+      await utimes(summaryPath, new Date(T0 + 7_200_000), new Date(T0 + 7_200_000))
+      await index.refreshPath(join(mainDir, 'updates.jsonl'))
+      expect(live).toEqual([])
+    } finally {
+      unsubscribe()
+    }
+  })
+
+  it.each(['Newest observation', 'Older observation'])('ignores an older summary refresh after the latest title becomes %s', async latestTitle => {
+    const summaryPath = join(mainDir, 'summary.json')
+    const transcriptPath = join(mainDir, 'updates.jsonl')
+    const events: SessionLiveEvent[] = []
+    const unsubscribe = index.subscribe('grok', GROK_MAIN, event => events.push(event))
+    await index.readAll('grok', GROK_MAIN, () => {})
+    await writeFile(summaryPath, grokSummary(GROK_MAIN, '/work/grok', { session_summary: 'Older observation' }))
+    await utimes(summaryPath, new Date(T0 + 3_600_000), new Date(T0 + 3_600_000))
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    const readFile = fs.readFile
+    let paused = false
+    const spy = vi.spyOn(fs, 'readFile').mockImplementation(async (...args) => {
+      if (!paused && args[0] === join(mainDir, 'system_prompt.txt')) {
+        paused = true
+        entered.resolve()
+        await release.promise
+      }
+      return readFile(...args)
+    })
+    const older = index.refreshPath(transcriptPath)
+    try {
+      await entered.promise
+      await writeFile(summaryPath, grokSummary(GROK_MAIN, '/work/grok', { session_summary: latestTitle }))
+      await utimes(summaryPath, new Date(T0 + 7_200_000), new Date(T0 + 7_200_000))
+      await index.refreshPath(transcriptPath)
+      expect(index.get('grok', GROK_MAIN)?.title).toBe(latestTitle)
+      events.length = 0
+      release.resolve()
+      await older
+      expect(index.get('grok', GROK_MAIN)?.title).toBe(latestTitle)
+      expect(events).toEqual([])
+      // A volatile-only follow-up also proves the stale sidecar did not win.
+      await writeFile(summaryPath, grokSummary(GROK_MAIN, '/work/grok', {
+        session_summary: latestTitle, num_messages: 99,
+      }))
+      await utimes(summaryPath, new Date(T0 + 10_800_000), new Date(T0 + 10_800_000))
+      await index.refreshPath(transcriptPath)
+      expect(events).toEqual([])
+    } finally {
+      release.resolve()
+      await older
+      spy.mockRestore()
+      unsubscribe()
+    }
+  })
+
+  it('rebinds indexed orphan records when a late parent claims the transcript', async () => {
+    const store = new SearchStore({ path: ':memory:' })
+    const search = new SearchIndexer({ store, extract: extractSearchDocs, maxAgeDays: 0 })
+    try {
+      await index.enableSearch(search)
+      search.flush()
+      expect(querySearch(store, { q: 'Orphaned work' }).groups[0]).toMatchObject({ sessionId: GROK_ORPHAN })
+      await mkdir(join(mainDir, 'subagents', GROK_ORPHAN), { recursive: true })
+      await writeFile(join(mainDir, 'subagents', GROK_ORPHAN, 'meta.json'), JSON.stringify({
+        child_session_id: GROK_ORPHAN, parent_session_id: GROK_MAIN, description: 'Claimed helper',
+      }))
+      await index.refreshPath(join(root, '%2Fwork%2Fgrok', GROK_ORPHAN, 'updates.jsonl'))
+      search.flush()
+      const group = querySearch(store, { q: 'Orphaned work' }).groups[0]
+      expect(group).toMatchObject({ sessionId: GROK_MAIN })
+      expect(group?.hits).toEqual([expect.objectContaining({ fileId: GROK_ORPHAN, line: 0 })])
+      const replay: SessionLiveEvent[] = []
+      await index.readAll('grok', GROK_MAIN, event => { replay.push(event) }, GROK_ORPHAN)
+      expect(replay.filter(event => event.type === 'lines').map(event => event.startLine)).toEqual([-1, 0])
+    } finally {
+      index.disableSearch()
+      search.stop()
+      store.close()
+    }
   })
 })
 
