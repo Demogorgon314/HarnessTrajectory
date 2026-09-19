@@ -391,6 +391,10 @@ describe('snippetSegments', () => {
 // -- navigation -----------------------------------------------------------------
 
 describe('hitRoute', () => {
+  test('Chat hits preserve the view and child transcript address', () => {
+    expect(hitRoute(hit({ fileId: 'child', line: 40 }), 'chat'))
+      .toStrictEqual({ kind: 'claude', id: 'sess-1', tab: 'chat', file: 'child', line: 40 })
+  })
   test('a hit in the main transcript addresses the session itself', () => {
     expect(hitRoute(hit({ fileId: 'sess-1', line: 4 })))
       .toStrictEqual({ kind: 'claude', id: 'sess-1', line: 4 })

@@ -1,0 +1,41 @@
+/* Viewer integration only. The other modules are unmodified upstream styles. */
+.root {
+  /* Same adaptive axis as ConversationRoot; the viewer has no width handle. */
+  --dsh-chat-content-width: clamp(680px, calc(var(--dsh-conversation-column-width, 0px) * 0.64), 920px);
+  --dsh-composer-side-clearance: 16px;
+  min-width: 0;
+  color: var(--dsw-alias-label-primary);
+  /* Upstream ConversationRoot owns this surface; sticky disclosure headers
+     and running sweeps use the same token and must not inherit the shell layer. */
+  background: var(--dsw-alias-bg-base);
+}
+.scroll { overflow-anchor: none; }
+.message { min-width: 0; scroll-margin: 24px; border-radius: 10px; }
+.message[data-selected] { outline: 2px solid var(--dsw-alias-button-info-fill); outline-offset: 8px; }
+.plain { white-space: pre-wrap; overflow-wrap: anywhere; }
+.disclosure { min-width: 0; color: var(--dsw-alias-label-secondary); }
+.disclosure > summary { list-style: none; }
+.disclosure > summary::-webkit-details-marker { display: none; }
+/* Native details opens synchronously, whereas React receives `toggle` later.
+   Geometry must follow the native state so search never measures a collapsed
+   reasoning wrapper around an already expanded body. Keep upstream CSS intact. */
+.root .nativeThinking:has(> details[open]) { contain: none; height: auto; }
+.root .nativeThinking:not(:has(> details[open])) {
+  contain: size layout;
+  height: calc(24px + var(--dsh-content-font-delta, 0px));
+}
+.disclosure[open]:not([data-keep-preview]) > summary .preview { display: none; }
+.disclosure[open] > summary .idleIcon { display: none; }
+.disclosure[open] > summary .openIcon { opacity: 1; }
+.process > summary { list-style: none; }
+.process > summary::-webkit-details-marker { display: none; }
+.process[open] > summary { margin-bottom: 16px; }
+.process[open] > summary svg { transform: rotate(0deg); }
+.process:not([open]) + .message { margin-top: 8px; }
+.processBody { display: flex; flex-direction: column; gap: 16px; }
+.assistantTail { margin-top: 16px; }
+.toolBody { display: flex; flex-direction: column; gap: 8px; }
+.raw { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 20px; }
+.caption { color: var(--dsw-alias-label-tertiary); font-size: 12px; }
+.error, .disclosure[data-error] > summary { color: var(--dsw-alias-state-error-primary); }
+.root button:focus-visible, .disclosure > summary:focus-visible { outline: 2px solid var(--dsw-alias-button-info-fill); outline-offset: 3px; }

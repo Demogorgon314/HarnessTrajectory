@@ -15,6 +15,8 @@ describe('parseHash / routeHash', () => {
       { kind: K, id: ID, file: FILE },
       { kind: K, id: ID, tab: 'context' },
       { kind: K, id: ID, tab: 'context', agent: FILE },
+      { kind: K, id: ID, tab: 'chat' },
+      { kind: K, id: ID, tab: 'chat', file: FILE, line: 12 },
     ]
     for (const route of routes) expect(parseHash(routeHash(route))).toStrictEqual(route)
   })
@@ -81,6 +83,9 @@ describe('parseHash / routeHash', () => {
 
 describe('runtimeKey', () => {
   test('both tabs of one session share a stream', () => {
+    expect(runtimeKey({ kind: K, id: ID, tab: 'chat' })).toBe(runtimeKey({ kind: K, id: ID }))
+    expect(runtimeKey({ kind: K, id: ID, tab: 'chat', file: FILE }))
+      .toBe(runtimeKey({ kind: K, id: ID, file: FILE }))
     expect(runtimeKey({ kind: K, id: ID })).toBe(runtimeKey({ kind: K, id: ID, tab: 'context' }))
     // Picking a child inside the Context tab keeps the whole-session stream.
     expect(runtimeKey({ kind: K, id: ID, tab: 'context', agent: FILE }))

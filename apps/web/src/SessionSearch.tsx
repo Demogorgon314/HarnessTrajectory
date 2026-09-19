@@ -196,7 +196,7 @@ function projectBasename(cwd: string | undefined): string | null {
 }
 
 /** The address a hit opens: the session, its child transcript, and the record. */
-export function hitRoute(hit: SearchHit): Route {
+export function hitRoute(hit: SearchHit, tab: 'trajectory' | 'chat' = 'trajectory'): Route {
   return {
     kind: hit.kind,
     id: hit.sessionId,
@@ -204,6 +204,7 @@ export function hitRoute(hit: SearchHit): Route {
     // transcript becomes a `file` of its own.
     ...(hit.fileId === hit.sessionId ? {} : { file: hit.fileId }),
     line: hit.line,
+    ...(tab === 'chat' ? { tab } : {}),
   }
 }
 
@@ -234,7 +235,9 @@ function MatchGroup({ group, selected, onSelect }: {
         className={css.matchSessionRow}
         data-active={active || undefined}
         title={[group.title, meta.label, group.cwd ?? '', group.sessionId].filter(part => part !== '').join('\n')}
-        onClick={() => { onSelect({ kind: group.kind, id: group.sessionId }) }}
+        onClick={() => {
+          onSelect({ kind: group.kind, id: group.sessionId, ...(selected?.tab === 'chat' ? { tab: 'chat' } : {}) })
+        }}
       >
         <span className={css.slot} data-role="mark" aria-label={meta.label}>
           <HarnessMark kind={group.kind} size={14} />
@@ -249,7 +252,7 @@ function MatchGroup({ group, selected, onSelect }: {
           type="button"
           className={css.matchHitRow}
           title={hit.snippet}
-          onClick={() => { onSelect(hitRoute(hit)) }}
+          onClick={() => { onSelect(hitRoute(hit, selected?.tab === 'chat' ? 'chat' : 'trajectory')) }}
         >
           <span className={css.matchRole} data-role={hit.role}>{hit.role}</span>
           <Snippet hit={hit} />

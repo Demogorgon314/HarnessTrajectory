@@ -4,7 +4,7 @@ import type {
 } from '@harness-trajectory/core'
 import { makeCostPeriod } from '@harness-trajectory/context'
 import {
-  Menu, TrajectoryView, Tooltip, icons, useSnapshotSelector, writeClipboard,
+  ChatView, Menu, TrajectoryView, Tooltip, icons, useSnapshotSelector, writeClipboard,
   type MenuEntry, type SnapshotStore, type TrajectoryInspectLine, type TrajectoryTranslate,
 } from '@harness-trajectory/ui'
 import type { Route, SessionTab } from './App.tsx'
@@ -30,8 +30,8 @@ export interface SessionPaneProps {
 
 /** The tab strip's labels, in both UI locales. */
 const TAB_LABELS: Record<'en' | 'zh', Record<SessionTab, string>> = {
-  en: { trajectory: 'Trajectory', context: 'Context' },
-  zh: { trajectory: '轨迹', context: '上下文' },
+  en: { trajectory: 'Trajectory', chat: 'Chat', context: 'Context' },
+  zh: { trajectory: '轨迹', chat: '对话', context: '上下文' },
 }
 
 const { IconCheckOutline16, IconCopyOutline16 } = icons
@@ -291,7 +291,8 @@ export function SessionPane({ route, summary: listSummary, onNavigate, t, locale
    */
   const [inspectLine, setInspectLine] = useState<TrajectoryInspectLine | null>(null)
   useEffect(() => {
-    if (route.line === undefined || state.loading) return
+    if (route.line === undefined) { setInspectLine(null); return }
+    if (state.loading) return
     setInspectLine({ line: route.line, fileId: route.file ?? route.id })
   }, [route, state.loading])
   const summary = state.summary ?? listSummary
@@ -325,9 +326,9 @@ export function SessionPane({ route, summary: listSummary, onNavigate, t, locale
   const agentTitle = agentFile === null ? null : (agent?.description ?? state.meta.title ?? shortAgentId(agentFile))
   // Opening a child keeps the reader in the tab they are reading.
   const openChild = (fileId: string) => {
-    onNavigate(tab === 'context' ? { kind, id, tab: 'context', agent: fileId } : { kind, id, file: fileId })
+    onNavigate(tab === 'context' ? { kind, id, tab: 'context', agent: fileId } : { kind, id, file: fileId, tab })
   }
-  const tabs: readonly SessionTab[] = ['trajectory', 'context']
+  const tabs: readonly SessionTab[] = ['chat', 'trajectory', 'context']
   // Switching tabs carries the agent across: the Context tab addresses it as a
   // fold of the session, the trajectory as a stream of its own.
   const selectTab = (next: SessionTab) => {
@@ -335,7 +336,9 @@ export function SessionPane({ route, summary: listSummary, onNavigate, t, locale
       onNavigate(agentFile === null ? { kind, id, tab: 'context' } : { kind, id, tab: 'context', agent: agentFile })
       return
     }
-    onNavigate(agentFile === null ? { kind, id } : { kind, id, file: agentFile })
+    const anchor = route.line === undefined ? {} : { line: route.line }
+    onNavigate({ kind, id, ...(next === 'chat' ? { tab: next } : {}),
+      ...(agentFile === null ? {} : { file: agentFile }), ...anchor })
   }
   return (
     <div className={css.pane}>
@@ -345,7 +348,7 @@ export function SessionPane({ route, summary: listSummary, onNavigate, t, locale
             <button
               type="button"
               className={css.crumbLink}
-              onClick={() => { onNavigate(tab === 'context' ? { kind, id, tab: 'context' } : { kind, id }) }}
+              onClick={() => { onNavigate(tab === 'context' ? { kind, id, tab: 'context' } : { kind, id, tab }) }}
             >
               {summary?.title ?? id}
             </button>
@@ -438,7 +441,10 @@ export function SessionPane({ route, summary: listSummary, onNavigate, t, locale
               }}
             />
           )
-          : (
+          : tab === 'chat' ? (
+            <ChatView snapshot={state.snapshot} loading={state.loading} loadImage={runtime.loadImage}
+              locale={locale} inspectLine={inspectLine} onInspectApplied={() => { setInspectLine(null) }} />
+          ) : (
             <TrajectoryView
               snapshot={state.snapshot}
               loading={state.loading && state.snapshot.eventNodes.length === 0}
