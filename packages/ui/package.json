@@ -16,6 +16,7 @@
     "@harness-trajectory/core": "workspace:*",
     "@shikijs/langs": "^4.3.1",
     "@tanstack/react-virtual": "^3.14.9",
+    "anser": "^2.3.5",
     "clsx": "^2.1.1",
     "diff": "^9.0.0",
     "katex": "^0.16.47",

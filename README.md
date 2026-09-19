@@ -29,6 +29,11 @@ both ported to run on top of plain transcript files instead of a runtime.
   in-flight assistant output and running tool calls render as they happen.
 - **Subagents** nest under the call that spawned them. Open one to view it as its own
   session, with a breadcrumb back to the parent.
+- **Chat tab**: a read-only conversation inspired by deepseek-harness, with user bubbles,
+  Markdown replies, images, and expandable reasoning, context, and tool results. It shares
+  the Trajectory fold across all harnesses. While Chat is open, global content-search hits
+  open the matching conversation (including subagents), reveal the record, and scroll to it.
+  Older messages load in pages; live updates follow the bottom until you scroll away.
 - **Context tab**: stats, token and timing donuts, context-window occupancy, per-step
   trend, a browser for every request's assembled context (system prompt, tool schemas,
   messages, results), context events (compactions, injections, model switches), file
@@ -109,7 +114,7 @@ Transcript roots are only ever read. The search index is a cache: delete
 
 ```
 packages/core     Contract types + one incremental adapter per harness. Pure TS; runs in browser and server.
-packages/ui       Trajectory view: ledger, timeline, inspector. Vendored dsh primitives and theme.
+packages/ui       Trajectory and Chat views. Vendored dsh primitives and theme.
 packages/context  dsh-context port: fold engine (src/fold), transcript → fold-event synthesizers (src/synth), dashboard (src/client).
 apps/server       Hono API: scans harness roots, classifies files, replays and tails JSONL over SSE.
                   src/search = SQLite FTS5 full-text index over the same lines.
@@ -117,8 +122,8 @@ apps/web          Vite + React shell: sidebar, routes, harness registry, live se
 ```
 
 Data flow: the server finds transcript files and streams raw JSONL lines to the browser.
-The browser feeds each line to two incremental parsers, the core adapter for the Trajectory
-view and the context synthesizer for the Context tab. Replays merge a session with its
+The browser feeds each line to two incremental parsers, the core adapter shared by the
+Trajectory and Chat views and the context synthesizer for the Context tab. Replays merge a session with its
 subagent transcripts by timestamp. Parsers never throw on malformed or unknown records, so a
 newer harness version degrades to "unknown record" rather than a blank page.
 

@@ -7,7 +7,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
-import { act, cleanup, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { createTrajectoryDurationStore, createTrajectoryTranslate } from '@harness-trajectory/ui'
 import type { SessionFileRef, SessionLiveEvent } from '@harness-trajectory/core'
 import type { Route } from '../src/App.tsx'
@@ -114,6 +114,21 @@ afterEach(() => {
 })
 
 describe('SessionPane record anchor', () => {
+  test('Chat resolves streamed search hits and switching views keeps the same stream', () => {
+    const route: Route = { kind: 'claude', id: 'main-1', tab: 'chat', line: 2 }
+    const navigate = vi.fn()
+    const props = { summary: null, onNavigate: navigate, t, locale: 'en' as const, durationStore }
+    const view = render(<SessionPane {...props} route={route} />)
+    replay()
+    expect(view.container.querySelector('[data-selected]')?.textContent).toContain('Bash')
+    expect(view.container.querySelector<HTMLDetailsElement>('[data-call-id="call-1"]')?.open).toBe(true)
+    fireEvent.click(screen.getByRole('tab', { name: 'Trajectory' }))
+    expect(navigate).toHaveBeenLastCalledWith({ kind: 'claude', id: 'main-1', line: 2 })
+    view.rerender(<SessionPane {...props} route={{ kind: 'claude', id: 'main-1', line: 2 }} />)
+    expect(selectedRows().join()).toMatch(/Bash/)
+    expect(FakeEventSource.instances).toHaveLength(1)
+    expect(FakeEventSource.instances[0]?.closed).toBe(false)
+  })
   test('an address without an anchor selects nothing', () => {
     open({ kind: 'claude', id: 'main-1' })
     replay()

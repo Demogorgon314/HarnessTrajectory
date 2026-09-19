@@ -279,6 +279,11 @@ export function SessionList({
           )
         }
         const session = item.session
+        // Carry only the view preference: child and record anchors belong to
+        // the previous session and must not leak into the newly selected one.
+        const selectSession = () => { onSelect({ kind: session.kind, id: session.id,
+          ...(selected?.tab === undefined ? {} : { tab: selected.tab }),
+        }) }
         const active = selectedKey === sessionKeyOf(session)
         const meta = harnessMeta(session.kind)
         return (
@@ -292,11 +297,11 @@ export function SessionList({
               data-animate={item.delayMs !== null || undefined}
               title={rowTooltip(session)}
               style={item.delayMs === null ? undefined : { animationDelay: `${item.delayMs}ms` }}
-              onClick={() => { onSelect({ kind: session.kind, id: session.id }) }}
+              onClick={selectSession}
               onKeyDown={(event) => {
                 if (event.key === 'Enter' || event.key === ' ') {
                   event.preventDefault()
-                  onSelect({ kind: session.kind, id: session.id })
+                  selectSession()
                 }
               }}
             >

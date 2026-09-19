@@ -164,12 +164,14 @@ class StreamingRenderer {
  * relative links, and unsafe protocols are disabled, while absolute HTTP(S)
  * images render directly.
  */
-export const MarkdownText = memo(function MarkdownText({ text, streaming = false, labels, fileMentions, pathImages }: {
+export const MarkdownText = memo(function MarkdownText({ text, streaming = false, labels, fileMentions, pathImages, variant = 'body' }: {
   text: string
   streaming?: boolean
   labels: MarkdownLabels
   fileMentions?: MarkdownFileMentions | undefined
   pathImages?: MarkdownPathImages | undefined
+  /** Secondary typography for reasoning and injected context. */
+  variant?: 'body' | 'compact'
 }) {
   const streamRef = useRef<StreamingRenderer | null>(null)
   const streamLabelsRef = useRef<MarkdownLabels>(labels)
@@ -184,5 +186,6 @@ export const MarkdownText = memo(function MarkdownText({ text, streaming = false
     }
     return streamRef.current.render(text)
   }, [text, streaming, labels, fileMentions, pathImages])
-  return <div className={css.markdown}>{children}</div>
+  return <div className={variant === 'compact' ? `${css.markdown} ${css.compact}` : css.markdown}
+    data-markdown-variant={variant === 'compact' ? variant : undefined}>{children}</div>
 })

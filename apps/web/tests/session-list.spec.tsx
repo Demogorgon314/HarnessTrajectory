@@ -128,6 +128,19 @@ describe('SessionList', () => {
     projectCounts: {} as Record<string, number>,
   }
 
+  test.each(['chat', 'trajectory', 'context'] as const)('session selection preserves %s without stale anchors', tab => {
+    const onSelect = vi.fn()
+    const { getByText } = render(<SessionList {...base} sessions={[summary()]}
+      selected={{ kind: 'codex', id: 'previous', tab, file: 'child', agent: 'agent', line: 42 }} onSelect={onSelect} />)
+    const row = getByText('a session').closest('[role="treeitem"]')
+    if (row === null) throw new Error('Missing session row')
+    fireEvent.click(row)
+    fireEvent.keyDown(row, { key: 'Enter' })
+    fireEvent.keyDown(row, { key: ' ' })
+    expect(onSelect).toHaveBeenCalledTimes(3)
+    for (const [route] of onSelect.mock.calls) expect(route).toEqual({ kind: 'claude', id: 'sess-0', tab })
+  })
+
   test('mounts only the viewport rows of a long listing', () => {
     const { container } = render(
       <SessionList {...base} sessions={listing(400)} hasMore={false} />,

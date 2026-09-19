@@ -30,13 +30,13 @@ const THEME_CYCLE: readonly ThemePreference[] = ['system', 'light', 'dark']
 const EMPTY_KINDS: ReadonlySet<HarnessKind> = new Set()
 
 /** The pane's tabs; `trajectory` is the address without a tab segment. */
-export type SessionTab = 'trajectory' | 'context'
+export type SessionTab = 'trajectory' | 'chat' | 'context'
 
 export interface Route {
   kind: HarnessKind
   id: string
   /**
-   * Child (subagent) transcript id when the TRAJECTORY view folds one subagent
+   * Child (subagent) transcript id when the Trajectory or Chat view folds one subagent
    * on its own (`/agent/<id>`); the stream then serves that file alone.
    */
   file?: string
@@ -51,7 +51,7 @@ export interface Route {
   /**
    * Record anchor a content-search hit aimed at: the 0-based JSONL line index
    * inside the addressed transcript, carried as `?line=N` so the address stays
-   * shareable. `SessionPane` hands it to the trajectory, which resolves it
+   * shareable. `SessionPane` hands it to the transcript view, which resolves it
    * through the fold's line index and scrolls to the record it produced.
    * It is deliberately NOT part of `runtimeKey`: moving the anchor inside an
    * open session must not reopen its stream.
@@ -61,7 +61,7 @@ export interface Route {
 
 // Kinds are lowercase words, so no escaping is needed to join them into an alternation.
 // Ids are percent-encoded, so `?` only ever starts the query tail.
-const ROUTE_KIND_PATTERN = new RegExp(`^#/(${HARNESS_KINDS.join('|')})/([^/?]+)(?:/(agent|context)(?:/([^/?]+))?)?$`)
+const ROUTE_KIND_PATTERN = new RegExp(`^#/(${HARNESS_KINDS.join('|')})/([^/?]+)(?:/(agent|context|chat)(?:/([^/?]+))?)?$`)
 
 /** `?line=N`: a 0-based record anchor. Anything else is no anchor at all. */
 function parseLine(search: string): number | undefined {
@@ -93,6 +93,9 @@ export function parseHash(hash: string): Route | null {
   if (section === 'context') {
     return { ...base, tab: 'context', ...(tail === undefined ? {} : { agent: decodeURIComponent(tail) }) }
   }
+  if (section === 'chat') {
+    return { ...base, tab: 'chat', ...(tail === undefined ? {} : { file: decodeURIComponent(tail) }) }
+  }
   return base
 }
 
@@ -101,12 +104,14 @@ export function routeHash(route: Route): string {
   const base = `#/${route.kind}/${encodeURIComponent(route.id)}`
   const path = route.tab === 'context'
     ? (route.agent === undefined ? `${base}/context` : `${base}/context/${encodeURIComponent(route.agent)}`)
-    : (route.file === undefined ? base : `${base}/agent/${encodeURIComponent(route.file)}`)
+    : route.tab === 'chat'
+      ? (route.file === undefined ? `${base}/chat` : `${base}/chat/${encodeURIComponent(route.file)}`)
+      : (route.file === undefined ? base : `${base}/agent/${encodeURIComponent(route.file)}`)
   return route.line === undefined ? path : `${path}?line=${route.line}`
 }
 
 /**
- * The runtime identity of a route: the stream a pane opens. Both tabs of one
+ * The runtime identity of a route: the stream a pane opens. All tabs of one
  * session share it, so switching tabs (or agents inside the Context tab)
  * never reopens the stream.
  */
