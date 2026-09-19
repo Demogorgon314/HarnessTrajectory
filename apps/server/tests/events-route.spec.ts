@@ -98,7 +98,7 @@ describe('GET /api/sessions/:kind/:id/events', () => {
       .toMatchObject({ uuid: 'u-0' })
   })
 
-  it('pauses replay at the consumer and keeps appends outside its captured boundary', async () => {
+  it.each(['file', 'lines'] as const)('keeps appends outside the replay boundary while paused on %s', async pauseAt => {
     const entered = Promise.withResolvers<void>()
     const release = Promise.withResolvers<void>()
     const events: SessionLiveEvent[] = []
@@ -106,17 +106,18 @@ describe('GET /api/sessions/:kind/:id/events', () => {
     const unsubscribe = index.subscribe('claude', 'main-1', event => { live.push(event) })
     const pending = index.readAll('claude', 'main-1', async event => {
       events.push(event)
-      if (event.type === 'lines' && event.startLine === 0) {
+      if (event.type === pauseAt && (event.type !== 'lines' || event.startLine === 0)) {
         entered.resolve()
         await release.promise
       }
     })
     await entered.promise
-    expect(numbering(events, 'main-1')).toEqual([[0, 400]])
+    const pausedLines = pauseAt === 'lines' ? [[0, 400]] : []
+    expect(numbering(events, 'main-1')).toEqual(pausedLines)
     const path = join(dir, 'claude', '-slug', 'main-1.jsonl')
     await appendFile(path, jsonl([claudeUser('while replay is paused', 'main-1', 99_000)]))
     await index.refreshPath(path)
-    expect(numbering(events, 'main-1')).toEqual([[0, 400]])
+    expect(numbering(events, 'main-1')).toEqual(pausedLines)
     expect(numbering(live, 'main-1')).toEqual([[900, 1]])
     release.resolve()
     await pending

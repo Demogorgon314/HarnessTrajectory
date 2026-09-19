@@ -57,7 +57,8 @@ the second UUID appears on reverts and forks, and the rollout id is always the L
 the basename. Cold files are zstd-compressed in place to `.jsonl.zst` (one zstd frame over the
 whole file) and materialize back to `.jsonl` on the next append, so discovery, replay, tailing,
 and search must accept both spellings and never double-count the pair. Offsets in
-`history_base` are DECODED bytes — `readLines` slices compressed files after decompressing.
+`history_base` are DECODED bytes — `readLines` slices compressed files after decompressing;
+replay's `streamLines` incrementally decodes up to the same byte cut.
 
 ### Logical history
 
@@ -625,7 +626,10 @@ a flush in flight or a crash — consumes nothing and is retried once its bytes
 complete; structurally corrupt data stops the scan rather than misreading.
 `readFirstLine` decodes just enough of the first frame to probe the header.
 Lines may span frames; the decoded text feeds the same splitter a plain read
-uses, so search line numbers stay the non-blank record index.
+uses, so search line numbers stay the non-blank record index. Replay finds each
+complete frame with positional header reads and streams its decompression through
+a shared UTF-8 decoder. Neither the full compressed frame nor its decoded body is
+retained; a physical replay cut still excludes an incomplete final frame.
 
 ### Events and classification
 
@@ -713,13 +717,23 @@ finishes with the union of all sources' live paths. Disabling detaches immediate
 then waits for pending work before closing the store. A replacement backfill waits
 for the preceding service to retire.
 
-`SessionSource.readAll` captures replay content before awaiting its consumer and
+`SessionSource.readAll` captures replay boundaries before awaiting its consumer and
 waits for each emission. An abort signal stops further replay emissions and file
 reads between read operations. Replay, queued appends, `ready`, and keepalives share
 one SSE writer. Queued live JSON is limited to an 8 MiB UTF-16 storage budget per
 connection; overflow disconnects that viewer so EventSource reconnects with a full
-replay. Synthetic records retain `startLine: -1`. Replay still materializes session
-content for chronological merging; transport backpressure does not bound that cost.
+replay. Synthetic records retain `startLine: -1`.
+
+Filesystem replay opens bounded 64 KiB readers over the captured logical stream
+(Codex lineage prefixes followed by the head). `mergeReplay` retains one lookahead
+record per file and emits at most 400 records or roughly 1 MiB of UTF-16 payload
+per batch; a single oversized record remains indivisible. Memory depends on active
+readers, codec windows, and individual record size rather than transcript length.
+Untimestamped leading records still inherit the first timestamp: a bounded-memory
+probe finds that timestamp, then reopens the stream. An entirely untimestamped file
+therefore needs two passes, and starts at negative infinity as before. Every iterator
+closes on completion, cancellation, consumer failure, or a reader error. SQLite
+sources retain their existing scratch reconstruction and materialized replay arrays.
 
 ## Request-input statistics (shared)
 

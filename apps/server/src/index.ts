@@ -20,18 +20,19 @@ import type { ListingCache } from './listing-cache.ts'
 import type { HarnessRoot } from './roots.ts'
 import type { SearchIndexer } from './search/indexer.ts'
 import {
-  emitReplay, lineTimes, scopeToFile, searchKeyOf,
+  scopeToFile, searchKeyOf,
   SessionBook, sessionKey, standaloneRef, type ReplaySink, type SourceEntry, type SourceSession,
   type SessionSource, type Subscriber,
 } from './source.ts'
 import {
   isCompressedTranscript, plainTranscriptPath, readDecodedPrefix, readFirstLine, readLines,
-  resolveTranscriptFile, zstdSupported,
+  resolveTranscriptFile, streamLines, zstdSupported,
 } from './tail.ts'
 import {
   classifyCodexPath, CodexRollouts, codexFootprintMatches, parseCodexFootprint,
   serializeCodexFootprint, type CodexBase,
 } from './codex-rollouts.ts'
+import { mergeReplay, type StreamingLineSource } from './replay.ts'
 import type { Classified } from './harness/classified.ts'
 import { classifyClaudePath, claudeChildDir, readAgentMeta } from './harness/claude.ts'
 import {
@@ -561,52 +562,49 @@ export class SessionIndex extends EventEmitter implements SessionSource {
       entries = [child]
       refOf = entry => standaloneRef(entry.ref)
     }
-    const sources = await Promise.all(entries.map(async (entry) => {
-      // Read up to the index's consumed offset; live events cover the rest.
-      const lines = await this.readEntryLines(entry, signal)
-      // Grok's session facts, system prompt and tool schemas live beside the
-      // transcript, so one synthetic line carries them into the fold
-      // (GROK-DESIGN §3). Its `timestamp` is the session's creation instant, so
-      // the chronological merge keeps it first.
-      const sidecar = entry.kind === 'grok' ? await readGrokSidecar(entry.path, entry.ref.id) : undefined
-      // The replay carries these facts, so a live tick only re-sends them when
-      // they actually differ from what this view already folded.
-      if (sidecar !== undefined) entry.sidecarKey = sidecar.key
-      const all = sidecar === undefined ? lines : [sidecar.line, ...lines]
-      // The sidecar is in no file, so it takes no line index: the merge keeps it
-      // in its own chunk and the first real line of the file is still line 0.
-      return {
-        ref: refOf(entry),
-        lines: all,
-        times: lineTimes(all),
-        ...(sidecar === undefined ? {} : { synthetic: 1 }),
-      }
+    // Capture every stream's boundary before the first await. In particular,
+    // a slow client must not replay records also arriving through live events.
+    const captured = entries.map(entry => ({
+      entry, ref: refOf(entry), path: entry.path, end: entry.offset,
+      bases: (entry.bases ?? []).map(base => ({ ...base })),
     }))
-    await emitReplay(
-      entries.map(refOf), sources,
-      { type: 'meta', summary: this.book.summarize(session), children: this.book.childSummaries(session) },
-      emit, signal,
-    )
-  }
-
-  /**
-   * The entry's consumed records as one logical stream: a Codex head replays
-   * its lineage bases' decoded prefixes first (immutable, so read whole each
-   * time), then its own bytes up to the cursor.
-   */
-  private async readEntryLines(entry: FileEntry, signal?: AbortSignal): Promise<string[]> {
-    const { path, offset, bases } = entry
-    if (bases === undefined || bases.length === 0) {
-      return readWholeFile(path, offset, signal)
+    const sources: StreamingLineSource[] = []
+    for (const capturedFile of captured) {
+      if (signal?.aborted) return
+      const { entry, ref, path, end, bases } = capturedFile
+      const parts: { path: string; end?: number }[] = []
+      for (const base of bases) {
+        const resolved = await resolveTranscriptFile(base.path)
+        if (resolved !== null) parts.push({
+          path: resolved.path,
+          ...(base.endByteOffset !== null ? { end: base.endByteOffset }
+            : resolved.compressed ? {} : { end: resolved.size }),
+        })
+      }
+      parts.push({ path, end })
+      const sidecar = entry.kind === 'grok' ? await readGrokSidecar(path, ref.id) : undefined
+      if (sidecar !== undefined) entry.sidecarKey = sidecar.key
+      sources.push({
+        ref,
+        ...(sidecar === undefined ? {} : { synthetic: 1 }),
+        async *open() {
+          if (sidecar !== undefined) yield sidecar.line
+          // Each lineage prefix discards its own incomplete final record,
+          // exactly as consume does; partial lines cannot cross files.
+          for (const part of parts) yield* streamLines(part.path, part.end, signal)
+        },
+      })
     }
-    const lines: string[] = []
-    for (const base of bases) {
-      if (signal?.aborted) return lines
-      const slice = await readDecodedPrefix(base.path, base.endByteOffset ?? undefined)
-      lines.push(...slice.lines)
+    const meta = { type: 'meta' as const, summary: this.book.summarize(session), children: this.book.childSummaries(session) }
+    for (const { ref } of captured) {
+      if (signal?.aborted) return
+      await emit({ type: 'file', file: ref })
     }
-    lines.push(...await readWholeFile(path, offset, signal))
-    return lines
+    for await (const chunk of mergeReplay(sources, signal)) {
+      if (signal?.aborted) return
+      await emit({ type: 'lines', file: chunk.ref, lines: chunk.lines, startLine: chunk.startLine })
+    }
+    if (!signal?.aborted) await emit(meta)
   }
 
   subscribe(kind: HarnessKind, id: string, subscriber: Subscriber): () => void {
@@ -1694,21 +1692,6 @@ export {
   encodeGrokCwd, grokChildPaths, grokSummaryTitle, readGrokSidecar, readGrokSubagentMetas,
   type GrokChildBinding, type GrokSidecarLine,
 } from './harness/grok.ts'
-
-async function readWholeFile(path: string, end: number, signal?: AbortSignal): Promise<string[]> {
-  const lines: string[] = []
-  let from = 0
-  let rest = ''
-  while (from < end) {
-    if (signal?.aborted) return lines
-    const result = await readLines(path, from, rest, end)
-    if (result.offset === from && result.lines.length === 0) break
-    from = result.offset
-    rest = result.rest
-    lines.push(...result.lines)
-  }
-  return lines
-}
 
 /** Missing-path fs errors: the harness simply has no root on this machine. */
 function isEnoent(error: unknown): boolean {

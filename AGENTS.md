@@ -51,6 +51,7 @@ pnpm pack:cli                     # build and pack the npm CLI tarball
 | `packages/context/src/client/` | Context dashboard |
 | `apps/server/src/source.ts` | `SessionSource`, shared `SessionBook`, `CompositeSource` |
 | `apps/server/src/index.ts` | Filesystem `SessionIndex`: scan, classify, replay, tail JSONL |
+| `apps/server/src/replay.ts`, `tail.ts` | Bounded filesystem replay, chronological merge, byte/frame readers |
 | `apps/server/src/devin/` | SQLite-backed source for virtual `devin://sessions/<id>` streams |
 | `apps/server/src/opencode/` | SQLite-backed source for virtual `opencode://sessions/<id>` streams |
 | `apps/server/src/meta.ts` | Listing scanners, serializable metadata, child-agent facts |

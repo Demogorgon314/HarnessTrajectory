@@ -1,7 +1,10 @@
 /** Byte-offset file reading with line reassembly, for initial loads and live tails. */
 
 import { createReadStream } from 'node:fs'
-import { open, readFile, stat } from 'node:fs/promises'
+import { open, readFile, stat, type FileHandle } from 'node:fs/promises'
+import { pipeline } from 'node:stream/promises'
+import { Readable } from 'node:stream'
+import { StringDecoder } from 'node:string_decoder'
 import * as zlib from 'node:zlib'
 import { splitLines } from '@harness-trajectory/core'
 
@@ -18,7 +21,8 @@ export interface ReadResult {
  * `rollout-*.jsonl.zst`, a plain zstd stream of the whole file
  * (rollout/src/compression.rs). Compressed files are immutable — Codex
  * materializes them back to `.jsonl` before appending again — so a `.zst`
- * transcript is read whole and its cursor lives in DECODED bytes.
+ * consume reader decodes the whole file and its cursor lives in DECODED
+ * bytes. Replay uses streamLines to decode incrementally to the same cut.
  */
 export const COMPRESSED_SUFFIX = '.zst'
 
@@ -43,6 +47,22 @@ export function isDshFrameTranscript(path: string): boolean {
 }
 
 const ZSTD_MAGIC = 0xFD2FB528
+
+function zstdHeaderBytes(descriptor: number): number {
+  if ((descriptor & 0x18) !== 0) throw new Error('corrupt Zstandard session log: reserved frame-header bit')
+  const sizeFlag = descriptor >>> 6
+  const singleSegment = (descriptor & 0x20) !== 0
+  const dictionaryFlag = descriptor & 0x03
+  const dictionaryBytes = dictionaryFlag === 3 ? 4 : dictionaryFlag
+  const sizeBytes = sizeFlag === 0 ? (singleSegment ? 1 : 0) : 1 << sizeFlag
+  return (singleSegment ? 0 : 1) + dictionaryBytes + sizeBytes
+}
+
+function zstdBlockBytes(header: number): number {
+  const type = (header >>> 1) & 0x03
+  if (type === 0x03) throw new Error('corrupt Zstandard session log: reserved block type')
+  return type === 0x01 ? 1 : header >>> 3
+}
 
 /** Byte range occupied by one structurally complete Zstandard frame. */
 export interface ZstdFrameRange {
@@ -71,18 +91,8 @@ export function scanZstdFrames(buffer: Buffer): ZstdFrameRange[] {
     if (offset === buffer.length) break
     const descriptor = buffer.readUInt8(offset)
     offset += 1
-    if ((descriptor & 0x18) !== 0) {
-      throw new Error(`corrupt Zstandard session log: reserved frame-header bit at byte ${offset - 1}`)
-    }
-    const contentSizeFlag = descriptor >>> 6
-    const singleSegment = (descriptor & 0x20) !== 0
     const checksum = (descriptor & 0x04) !== 0
-    const dictionaryFlag = descriptor & 0x03
-    const dictionaryBytes = dictionaryFlag === 3 ? 4 : dictionaryFlag
-    const contentSizeBytes = contentSizeFlag === 0
-      ? (singleSegment ? 1 : 0)
-      : 1 << contentSizeFlag
-    const remainingHeaderBytes = (singleSegment ? 0 : 1) + dictionaryBytes + contentSizeBytes
+    const remainingHeaderBytes = zstdHeaderBytes(descriptor)
     if (buffer.length - offset < remainingHeaderBytes) break
     offset += remainingHeaderBytes
     for (;;) {
@@ -90,12 +100,7 @@ export function scanZstdFrames(buffer: Buffer): ZstdFrameRange[] {
       const blockHeader = buffer.readUIntLE(offset, 3)
       offset += 3
       const lastBlock = (blockHeader & 1) !== 0
-      const blockType = (blockHeader >>> 1) & 0x03
-      const blockSize = blockHeader >>> 3
-      if (blockType === 0x03) {
-        throw new Error(`corrupt Zstandard session log: reserved block type at byte ${offset - 3}`)
-      }
-      const payloadBytes = blockType === 0x01 ? 1 : blockSize
+      const payloadBytes = zstdBlockBytes(blockHeader)
       if (buffer.length - offset < payloadBytes) return frames
       offset += payloadBytes
       if (lastBlock) break
@@ -309,6 +314,125 @@ export async function readDecodedPrefix(path: string, endByteOffset: number | un
   const resolved = await resolveTranscriptFile(path)
   if (resolved === null) return { lines: [], offset: 0, rest: '' }
   return readLines(resolved.path, 0, '', endByteOffset)
+}
+
+/**
+ * Find complete frames using only headers and positional reads. A frame may
+ * span the whole file; skipping block payloads keeps compressed input bounded.
+ */
+async function* frameRanges(handle: FileHandle, end: number, signal?: AbortSignal): AsyncGenerator<ZstdFrameRange> {
+  const header = Buffer.allocUnsafe(5)
+  const read = async (at: number, length: number): Promise<boolean> => {
+    if (at + length > end || signal?.aborted) return false
+    let filled = 0
+    while (filled < length) {
+      const { bytesRead } = await handle.read(header, filled, length - filled, at + filled)
+      if (bytesRead === 0 || signal?.aborted) return false
+      filled += bytesRead
+    }
+    return true
+  }
+  let at = 0
+  while (await read(at, 4)) {
+    const start = at
+    if (header.readUInt32LE(0) !== ZSTD_MAGIC) throw new Error('corrupt Zstandard session log: invalid frame magic')
+    if (!await read(at + 4, 1)) return
+    const descriptor = header.readUInt8(0)
+    at += 5 + zstdHeaderBytes(descriptor)
+    for (;;) {
+      if (!await read(at, 3)) return
+      const block = header.readUIntLE(0, 3)
+      at += 3 + zstdBlockBytes(block)
+      if (at > end) return
+      if ((block & 1) !== 0) break
+    }
+    if ((descriptor & 0x04) !== 0) at += 4
+    if (at > end) return
+    yield { start, end: at }
+  }
+}
+
+const REPLAY_READ_BYTES = 64 * 1024
+
+async function* physicalChunks(
+  handle: FileHandle, start: number, end: number, signal?: AbortSignal,
+): AsyncGenerator<Buffer> {
+  let at = start
+  while (at < end && !signal?.aborted) {
+    const bytes = Buffer.allocUnsafe(Math.min(REPLAY_READ_BYTES, end - at))
+    const { bytesRead } = await handle.read(bytes, 0, bytes.length, at)
+    if (bytesRead === 0 || signal?.aborted) return
+    at += bytesRead
+    yield bytes.subarray(0, bytesRead)
+  }
+}
+
+/** A bounded physical window, optionally decoded through one zstd frame. */
+async function* byteChunks(
+  handle: FileHandle, start: number, end: number, compressed: boolean, signal?: AbortSignal,
+): AsyncGenerator<Buffer> {
+  if (start >= end || signal?.aborted) return
+  // Frame decoders borrow the descriptor. Destroying a FileHandle read stream
+  // closes its handle even with autoClose:false, breaking the next frame.
+  const input = Readable.from(physicalChunks(handle, start, end, signal), {
+    objectMode: false, highWaterMark: REPLAY_READ_BYTES,
+  })
+  const decoder = compressed ? zlib.createZstdDecompress({ chunkSize: REPLAY_READ_BYTES }) : undefined
+  const pumping = decoder === undefined ? undefined : pipeline(input, decoder, signal === undefined ? {} : { signal })
+  // The iterator observes pipeline errors; attach immediately to avoid an
+  // unhandled rejection while the downstream consumer is paused on a line.
+  void pumping?.catch(() => {})
+  try {
+    for await (const chunk of decoder ?? input) {
+      if (signal?.aborted) return
+      yield chunk as Buffer
+    }
+    await pumping
+  } finally {
+    input.destroy()
+    decoder?.destroy()
+    await pumping?.catch(() => {})
+  }
+}
+
+/**
+ * Replay complete non-blank records on demand. `end` is decoded bytes for
+ * Codex `.zst`, physical bytes otherwise. DSH emits only complete frames.
+ * Memory is bounded by stream buffers, the codec window, and the longest
+ * record; an unterminated last record is never emitted.
+ */
+export async function* streamLines(path: string, end?: number, signal?: AbortSignal): AsyncGenerator<string> {
+  if (end === 0 || signal?.aborted) return
+  const handle = await open(path, 'r')
+  try {
+    const size = (await handle.stat()).size
+    const compressed = isCompressedTranscript(path)
+    const physicalEnd = compressed ? size : Math.min(end ?? size, size)
+    const frames = isDshFrameTranscript(path)
+      ? frameRanges(handle, physicalEnd, signal)
+      : [{ start: 0, end: physicalEnd }]
+    const decoder = new StringDecoder('utf8')
+    let rest = ''
+    let decoded = 0
+    for await (const frame of frames) {
+      for await (const bytes of byteChunks(handle, frame.start, frame.end, compressed || isDshFrameTranscript(path), signal)) {
+        const remaining = compressed && end !== undefined ? Math.max(0, end - decoded) : bytes.length
+        const slice = bytes.subarray(0, remaining)
+        decoded += slice.length
+        const split = splitLines(rest + decoder.write(slice))
+        rest = split.rest
+        for (const line of split.lines) {
+          if (signal?.aborted) return
+          if (line.trim() !== '') yield line
+        }
+        if (compressed && end !== undefined && decoded >= end) return
+      }
+    }
+  } catch (error) {
+    if (!signal?.aborted) throw error
+  } finally {
+    await handle.close()
+  }
 }
 
 /** Read only the first line of a file (bounded), for identity probing. */
