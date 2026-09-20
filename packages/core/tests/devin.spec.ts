@@ -365,6 +365,54 @@ describe('devin adapter', () => {
     expect(parser.snapshot().eventNodes.every(node => node.kind !== 'user' || true)).toBe(true)
   })
 
+  it('folds a devin-rs/summary system node as a compaction, not a prompt update', () => {
+    const parser = createDevinParser()
+    parser.push(sidecar(), MAIN, -1)
+    parser.push(system('You are Devin.'), MAIN, -1)
+    parser.push(human('Fix it', 2, 1, 1000), MAIN, 0)
+    parser.push(assistant(3, 2, 2000, { text: 'Working.' }), MAIN, 1)
+    const summaryText = 'You are continuing work from a previous conversation thread.\n' +
+      'Summary:\n## 1. Request\nFix it.\n' +
+      '<conversation_history>\n<user>Fix it</user>\n</conversation_history>'
+    parser.push(msgRecord(4, 3, {
+      message_id: 'm-sum-4',
+      role: 'system',
+      content: [{ type: 'text', text: summaryText }],
+      metadata: {
+        created_at: new Date(at(3000)).toISOString(),
+        extensions: {
+          'devin-rs/summary': { source: 'async_file_compactor' },
+          'chisel/conversation_history': { messages: [] },
+        },
+      },
+    }, 3000), MAIN, 2)
+    // A re-rendered prefix is still a plain system-prompt update.
+    parser.push(system('You are Devin. v2', 5), MAIN, 3)
+    parser.push(human('Continue', 6, 5, 4000), MAIN, 4)
+
+    const snapshot = parser.snapshot()
+    const compactions = snapshot.eventNodes.filter(node => node.kind === 'compaction')
+    expect(compactions).toHaveLength(1)
+    expect(compactions[0]).toMatchObject({ summary: summaryText, time: at(3000) })
+    const seq = compactions[0]?.seq
+    const requests = snapshot.requests.filter(request => request.purpose === 'compaction')
+    expect(requests).toHaveLength(1)
+    expect(requests[0]).toMatchObject({
+      status: 'complete', turn: 1, startSeq: seq, resultSeq: seq,
+    })
+    expect(requests[0]?.summary?.[0]).toEqual({ type: 'text', text: summaryText })
+    const prompts = snapshot.systemPrompts ?? []
+    expect(prompts).toHaveLength(2)
+    expect(prompts[0]).toMatchObject({ text: 'You are Devin.', update: false })
+    expect(prompts[1]).toMatchObject({ text: 'You are Devin. v2', update: true })
+    const continued = users(parser).find(node => {
+      const first = node.content[0]
+      return first?.type === 'text' && first.text === 'Continue'
+    })
+    expect(continued).toBeDefined()
+    expect(parser.meta().promptCount).toBe(2)
+  })
+
   it('never throws on malformed input and keeps snapshot identity stable', () => {
     const parser = createDevinParser()
     parser.push(human('hi', 2, 1, 10), MAIN, 0)

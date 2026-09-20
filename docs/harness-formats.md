@@ -391,7 +391,8 @@ under `<conversation_history>`, and `extensions['chisel/conversation_history'].m
 carries the same tail in structured form (with `compact/todo_list`/`compact/edited_files`
 alongside). The fold prices it as ONE compaction block — after a compaction `user` can read
 zero even though kept prompts sit inside the bundle; that is the wire truth, not a dropped
-message.
+message. Trajectory folds the summary node as a compaction node/request (the full bundle
+text as the summary), while the plain rendered prefix stays a system-prompt update.
 
 ### Replay bookkeeping
 

@@ -34,11 +34,14 @@
  *   the agent id is never a usable stream id on its own.
  * - `tool_calls` entries are flat `{id, name, arguments}` (not the OpenAI
  *   `{function:{…}}` nesting); both spellings are accepted.
+ * - A `system` node carrying `extensions['devin-rs/summary']` is a compaction:
+ *   `content` is the summary text plus the kept `<conversation_history>` tail,
+ *   and it folds as a compaction node + request, not a system-prompt update.
  */
 
 import type {
-  AssistantBlock, AssistantMessageNode, ContentBlock, ContextMessageNode,
-  ImageAttachmentRef, KnownContextForm, TokenUsage, TrajectorySnapshot,
+  AssistantBlock, AssistantMessageNode, CompactionRequestView, ContentBlock,
+  ContextMessageNode, ImageAttachmentRef, KnownContextForm, TokenUsage, TrajectorySnapshot,
 } from '../contract.ts'
 import { asArray, asNumber, asString, isRecord, parseJsonLine } from '../jsonl.ts'
 import type {
@@ -414,6 +417,10 @@ class DevinParser implements SessionParser {
       run.model = asString(ext?.['subagent/model']) ?? run.model
       this.assembler.touch()
     }
+    if (ext?.['devin-rs/summary'] !== undefined) {
+      this.handleCompaction(msg, time)
+      return
+    }
     const text = msgText(msg)
     if (text.trim() === '') return
     this.assembler.systemPrompts.push({
@@ -426,6 +433,38 @@ class DevinParser implements SessionParser {
     })
     this.systemPromptSeen = true
     this.assembler.touch()
+  }
+
+  /**
+   * A `devin-rs/summary` system node: Devin's file compactor replaced the
+   * context with this bundle (summary plus kept conversation tail). The node
+   * records no compactor model or token counts, so no provenance/usage.
+   */
+  private handleCompaction(msg: Record<string, unknown>, time: number): void {
+    const text = msgText(msg)
+    const summary = text.trim() === '' ? null : text
+    const seq = this.assembler.seq.next()
+    this.assembler.pushNode({
+      kind: 'compaction',
+      seq,
+      time,
+      summary,
+      summaryEventSeq: summary === null ? null : seq,
+      shadowedItemCount: null,
+      shadowedTokenCount: null,
+    })
+    const request: CompactionRequestView = {
+      purpose: 'compaction',
+      turn: this.turn > 0 ? this.turn : null,
+      step: 0,
+      startSeq: seq,
+      startedAt: time,
+      completedAt: time,
+      status: 'complete',
+      resultSeq: seq,
+      ...(summary === null ? {} : { summary: [{ type: 'text', text: summary }] }),
+    }
+    this.assembler.upsertRequest(request)
   }
 
   private handleUser(msg: Record<string, unknown>, time: number): void {
