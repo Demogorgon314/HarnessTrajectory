@@ -5,7 +5,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import type {
   ImageAttachmentRef, SourceLineIndex, SourceLineTarget, TrajectorySnapshot,
 } from '@harness-trajectory/core'
@@ -93,6 +93,38 @@ function View({ inspectLine, snapshot, onInspectApplied }: {
 }
 
 describe('TrajectoryView line anchor', () => {
+  it('opens diagnostic evidence and permits inspecting the same call again', () => {
+    render(<View snapshot={snapshotOf(undefined)} inspectLine={null} />)
+    const opener = screen.getByRole('button', { name: 'Open execution diagnostics' })
+    opener.focus()
+    fireEvent.click(opener)
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Close execution diagnostics' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Close execution diagnostics' }))
+    expect(document.activeElement).toBe(opener)
+    fireEvent.click(opener)
+    fireEvent.click(screen.getByRole('button', { name: 'View call 1' }))
+    expect(screen.getByRole('row', { name: /TOOL/ }).getAttribute('aria-selected')).toBe('true')
+    fireEvent.click(screen.getByRole('row', { name: /USER/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Open execution diagnostics' }))
+    fireEvent.click(screen.getByRole('button', { name: 'View call 1' }))
+    expect(screen.getByRole('row', { name: /TOOL/ }).getAttribute('aria-selected')).toBe('true')
+  })
+  it('loads evidence outside the resident history page before opening its details', () => {
+    const base = snapshotOf(undefined)
+    const snapshot: TrajectorySnapshot = { ...base, eventNodes: [
+      ...base.eventNodes,
+      ...Array.from({ length: 60 }, (_, index) => ({
+        kind: 'user' as const, seq: index + 4, time: 4000 + index,
+        content: [{ type: 'text' as const, text: `Later prompt ${index}` }], source: {},
+      })),
+    ] }
+    render(<View snapshot={snapshot} inspectLine={null} />)
+    expect(screen.queryByRole('row', { name: /TOOL/ })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Open execution diagnostics' }))
+    fireEvent.click(screen.getByRole('button', { name: 'View call 1' }))
+    const details = screen.getByRole('complementary', { name: 'Event details' })
+    expect(within(details).getByText('built')).toBeTruthy()
+  })
   it('labels whole-turn usage in the ledger and request details', () => {
     const base = snapshotOf(undefined)
     const usage = { inputTokens: 30, outputTokens: 12, scope: 'turn' as const }

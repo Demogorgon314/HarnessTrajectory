@@ -21,6 +21,8 @@ export interface TrajectoryToolbarProps {
   allAssistantsCollapsed: boolean
   /** Fold or expand tool calls under every collapsible assistant. */
   onToggleAllAssistants: () => void
+  /** Open the on-demand execution diagnostics dialog. */
+  onOpenDiagnostics: () => void
   /** Current live ledger search query. */
   searchQuery: string
   /** Update the live ledger search query. */
@@ -43,6 +45,7 @@ export function TrajectoryToolbar({
   onToggleAllTurns,
   allAssistantsCollapsed,
   onToggleAllAssistants,
+  onOpenDiagnostics,
   searchQuery,
   onSearchQueryChange,
   t,
@@ -108,6 +111,16 @@ export function TrajectoryToolbar({
               {allAssistantsCollapsed ? '⊞' : '⊟'}
             </span>
             {t('toolbar.calls')}
+          </button>
+          <button
+            type="button"
+            className={css.action}
+            aria-label={t('diagnostics.open')}
+            title={t('diagnostics.open')}
+            onClick={onOpenDiagnostics}
+          >
+            <span className={css.actionIcon} aria-hidden="true">⌁</span>
+            {t('diagnostics.short')}
           </button>
         </div>
         <div className={css.search}>

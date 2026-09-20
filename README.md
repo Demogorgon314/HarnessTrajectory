@@ -25,6 +25,10 @@ both ported to run on top of plain transcript files instead of a runtime.
 - **Trajectory ledger**: turns, steps, user / assistant / tool records, token usage, durations,
   a record inspector (payload, result, schema, timing), fold controls, and live search.
 - **Timing overview**: drag to focus an interval, wheel to zoom, recorded or equal widths.
+- **Execution diagnostics** from the Trajectory toolbar: tool-call loops (the same tool and
+  arguments failing three or more times within one turn, even with other calls in between),
+  model request trouble (repeated retries, request errors, output limits), and the slowest tool
+  call compared against its own tool's median. Every card links to the evidence rows.
 - **Live follow**: the server tails transcript files and streams new lines over SSE, so
   in-flight assistant output and running tool calls render as they happen.
 - **Subagents** nest under the call that spawned them. Open one to view it as its own

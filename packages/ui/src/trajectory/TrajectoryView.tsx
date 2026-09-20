@@ -14,6 +14,7 @@ import {
 } from './TrajectoryTable.tsx'
 import { TrajectoryToolbar } from './TrajectoryToolbar.tsx'
 import { TrajectoryTimeline } from './TrajectoryTimeline.tsx'
+import { ExecutionDiagnostics } from './ExecutionDiagnostics.tsx'
 import {
   appendTrajectoryPartialLayout, deriveTrajectoryLayout,
   type TrajectoryTurnModel,
@@ -176,6 +177,9 @@ export function TrajectoryView({
   inspectCallId = null, inspectLine = null, onInspectApplied, t,
 }: TrajectoryViewProps) {
   const [collapsedTurns, setCollapsedTurns] = useState<ReadonlySet<number>>(EMPTY_TURN_IDS)
+  const [diagnosticCallId, setDiagnosticCallId] = useState<string | null>(null)
+  const [diagnosticSeq, setDiagnosticSeq] = useState<number | null>(null)
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false)
   const renderImages = useCallback<RenderMessageImages>(
     owner => renderImagesProp === undefined
       ? <TrajectoryImages {...owner} loadImage={loadImage} />
@@ -260,8 +264,11 @@ export function TrajectoryView({
   }, [completeInspection, lineAttempt, pendingLine])
   const inspectLineCallId = lineTarget?.kind === 'call' ? lineTarget.callId : null
   const inspectLineSeq = lineTarget?.kind === 'seq' ? lineTarget.seq : null
-  const inspectTargetCallId = inspectCallId ?? inspectLineCallId
+  const inspectTargetCallId = diagnosticCallId ?? inspectCallId ?? inspectLineCallId
+  const inspectTargetSeq = diagnosticSeq ?? inspectLineSeq
   const handleInspectApplied = useCallback(() => {
+    setDiagnosticCallId(null)
+    setDiagnosticSeq(null)
     setPendingLine(null)
     onInspectApplied?.()
   }, [onInspectApplied])
@@ -282,15 +289,15 @@ export function TrajectoryView({
     return () => { clearTimeout(timer) }
   }, [handleInspectApplied, lineAttempt, lineTarget, pendingLine])
   const inspectNodeIndex = useMemo(() => {
-    if (inspectLineSeq !== null) {
-      return completeInspection.eventNodes.findIndex(node => node.seq === inspectLineSeq)
+    if (inspectTargetSeq !== null) {
+      return completeInspection.eventNodes.findIndex(node => node.seq === inspectTargetSeq)
     }
     return inspectTargetCallId === null
       ? -1
       : completeInspection.eventNodes.findIndex(node => node.kind === 'assistant'
         ? node.blocks.some(block => block.kind === 'tool-call' && block.callId === inspectTargetCallId)
         : node.kind === 'tool-result' && containsCall([node], inspectTargetCallId))
-  }, [completeInspection.eventNodes, inspectLineSeq, inspectTargetCallId])
+  }, [completeInspection.eventNodes, inspectTargetSeq, inspectTargetCallId])
   useEffect(() => {
     if (inspectNodeIndex < 0 || inspectNodeIndex >= historyStartIndex) return
     setHistoryNodeLimit(limit => limit + historyStartIndex - inspectNodeIndex)
@@ -609,6 +616,7 @@ export function TrajectoryView({
         onToggleAllTurns={toggleAllTurns}
         allAssistantsCollapsed={allAssistantsCollapsed}
         onToggleAllAssistants={toggleAllAssistants}
+        onOpenDiagnostics={() => { setDiagnosticsOpen(true) }}
         searchQuery={searchQuery}
         onSearchQueryChange={setSearchQuery}
         t={t}
@@ -626,6 +634,20 @@ export function TrajectoryView({
         onRecordSelect={handleTimelineRecordSelect}
         onRecordFocus={handleTimelineRecordFocus}
       />
+      <ExecutionDiagnostics nodes={completeInspection.eventNodes} t={t} open={diagnosticsOpen}
+        onClose={() => { setDiagnosticsOpen(false) }} onInspect={(callId) => {
+          setDiagnosticsOpen(false)
+          setSearchQuery('')
+          setTimelineSelection(null)
+          setDiagnosticSeq(null)
+          setDiagnosticCallId(callId)
+        }} onInspectSeq={(seq) => {
+          setDiagnosticsOpen(false)
+          setSearchQuery('')
+          setTimelineSelection(null)
+          setDiagnosticCallId(null)
+          setDiagnosticSeq(seq)
+        }} />
       <div className={css.ledger}>
         <TrajectoryTable
           t={t}
@@ -650,7 +672,7 @@ export function TrajectoryView({
           collapsedAssistants={collapsedAssistants}
           onToggleAssistant={toggleAssistant}
           inspectCallId={inspectTargetCallId}
-          inspectSeq={inspectLineSeq}
+          inspectSeq={inspectTargetSeq}
           onInspectApplied={handleInspectApplied}
         />
       </div>
