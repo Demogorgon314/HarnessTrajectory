@@ -8,6 +8,7 @@ dist/
 coverage/
 .idea/
 .playwright-cli/
+.playwright-mcp/
 src-tauri/target/
 src-tauri/gen/
 src-tauri/icons/generated/
