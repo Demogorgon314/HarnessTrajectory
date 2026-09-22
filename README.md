@@ -225,7 +225,6 @@ MIT, except where noted:
 - `packages/context` derives from [dsh-context](https://github.com/bowenliang123/dsh-context)
   and is Apache-2.0, see `packages/context/LICENSE` and `NOTICE`.
 - Harness marks use path data from [Simple Icons](https://simpleicons.org) (CC0) and
-  [lobe-icons](https://github.com/lobehub/lobe-icons) (MIT); the Devin and pi marks are drawn
-  in-house, and the OpenCode and Cursor marks are in-house monograms (the Cursor
-  mark is a pointer, not the product's cube). Claude, Codex, Kimi, Grok, Devin, OpenCode, and Cursor are
+  [lobe-icons](https://github.com/lobehub/lobe-icons) (MIT); the Devin, pi, and OpenCode
+  marks are drawn in-house. Claude, Codex, Kimi, Grok, Devin, OpenCode, and Cursor are
   trademarks of their respective owners. This project is not affiliated with any of them.
