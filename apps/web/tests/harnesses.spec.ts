@@ -30,4 +30,11 @@ describe('harness registry', () => {
       .toBe(`cd /work/project && opencode --session ses_abc123`)
     expect(meta.resumeCommand({ id: 'ses_abc123', cwd: null })).toBe('opencode --session ses_abc123')
   })
+
+  test('cursor resumes through `agent --resume` in the session directory', () => {
+    const meta = harnessMeta('cursor')
+    expect(meta.resumeCommand({ id: '11111111-1111-1111-1111-111111111111', cwd: '/work/project' }))
+      .toBe('cd /work/project && agent --resume 11111111-1111-1111-1111-111111111111')
+    expect(meta.resumeCommand({ id: 'agent id', cwd: null })).toBe(`agent --resume 'agent id'`)
+  })
 })

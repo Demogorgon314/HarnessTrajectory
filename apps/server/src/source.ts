@@ -13,6 +13,9 @@
  *   OpenCode keeps V1 sessions in `opencode.db`, so its "files" are virtual
  *   per-session streams emitted from the `message`/`part` tables (catalog
  *   eagerly, transcript lazily).
+ * - {@link CursorSource} (`cursor/source.ts`) — one SQLite store per Cursor
+ *   Agent session under `~/.cursor/chats`. The catalog reads `meta.json`;
+ *   the transcript is decoded from the protobuf root on demand.
  *
  * A source is a collection of line streams ("files", one main per session plus
  * child transcripts), session-list metadata, and a per-session pub/sub channel

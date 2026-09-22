@@ -1,7 +1,7 @@
 # Harness Trajectory
 
 A local viewer for coding-agent sessions. It reads the transcripts that **Claude Code**,
-**Codex**, **Kimi Code**, **Grok Build**, **Devin CLI**, **pi**, **OpenCode**, and **DeepSeek Harness** write on your machine and renders each session
+**Codex**, **Kimi Code**, **Grok Build**, **Devin CLI**, **pi**, **OpenCode**, **Cursor Agent**, and **DeepSeek Harness** write on your machine and renders each session
 as a turn-by-turn trajectory with timing, token usage, subagents, and a context dashboard.
 Live sessions update as they run. Nothing leaves your machine.
 
@@ -126,6 +126,8 @@ card opens the rule editor directly.
 | `HARNESS_TRAJECTORY_{CLAUDE,CODEX,KIMI,GROK,PI,DSH}_ROOT` | derived | Point one harness at an arbitrary directory |
 | `HARNESS_TRAJECTORY_DEVIN_DB` | `$XDG_DATA_HOME/devin/cli/sessions.db`, else `~/.local/share/devin/cli/sessions.db` | Devin CLI session store — read directly (read-only); no transcript files exist |
 | `HARNESS_TRAJECTORY_OPENCODE_DB` | `$XDG_DATA_HOME/opencode/opencode.db`, else `~/.local/share/opencode/opencode.db` | OpenCode V1 session store — read directly (read-only); no transcript files exist |
+| `CURSOR_CONFIG_DIR` | `~/.cursor` | Cursor config home (`<home>/chats` is scanned) |
+| `HARNESS_TRAJECTORY_CURSOR_CHATS` | `$CURSOR_CONFIG_DIR/chats`, else `~/.cursor/chats` | Cursor Agent per-session stores — read directly (read-only); no transcript files exist |
 | `HARNESS_TRAJECTORY_CACHE_DIR` | `$XDG_CACHE_HOME/harness-trajectory`, else `~/.cache/harness-trajectory` | Holds `search.sqlite` and `settings.json`, the only files the server writes |
 | `HARNESS_TRAJECTORY_SEARCH` | off | `1`, `true`, or `on` forces indexing on for the launch; otherwise the Content search toggle in `settings.json` decides. While off, `/api/search` answers `{ "enabled": false }` |
 | `HARNESS_TRAJECTORY_NO_OPEN` | off | `1`, `true`, or `on` skips opening the default browser (same as `--no-open`). SSH sessions never open one. |
@@ -150,16 +152,19 @@ Trajectory and Chat views and the context synthesizer for the Context tab. Repla
 subagent transcripts by timestamp. Parsers never throw on malformed or unknown records, so a
 newer harness version degrades to "unknown record" rather than a blank page.
 
-Devin CLI and OpenCode are the exceptions: both keep sessions in a SQLite store
-(`sessions.db` and `opencode.db`), so the server reads them read-only and materializes
-virtual line streams (`devin://sessions/<id>` and `opencode://sessions/<id>` URIs —
-nothing is written to disk). Devin's store is a message forest: chains duplicate
+Devin CLI, OpenCode, and Cursor Agent keep sessions in SQLite, so the server reads
+them read-only and materializes virtual line streams (`devin://sessions/<id>`,
+`opencode://sessions/<id>`, and `cursor://sessions/<id>` — nothing is written to
+disk). Devin's store is a message forest: chains duplicate
 context under shared `message_id`s, so the logical transcript dedupes them, and
 subagent chains are the forest components disjoint from the main chain, named by the
 `subagent/agent_id` metadata on the spawning `run_subagent` result. OpenCode's store is
 flat `message`/`part` rows per session; transcripts are emitted lazily (the catalog of
 sessions is read eagerly, message/part bodies only when a session is opened), and child
 sessions are bound to the parent's `task` tool call by `state.metadata.sessionId`.
+Cursor keeps one `store.db` per agent under `~/.cursor/chats/<md5>/<agentId>/`;
+the catalog reads `meta.json`, and the transcript is the protobuf root's ordered
+model-message blobs.
 
 Adding a harness means one adapter, one synthesizer, a server root and classifier, and a
 web registry entry. See [AGENTS.md](AGENTS.md) for the checklist and per-harness format
@@ -186,6 +191,11 @@ Tests use hand-written synthetic records only. Never commit real transcript cont
   carries (per-call `input_tokens`, `ttft_ms`, tool durations from `tool_call_state`).
   OpenCode records no window either; usage buckets are disjoint (output excludes
   reasoning, input excludes cache), so request input is input + cache read + cache write.
+  Cursor Agent records a context-usage snapshot (`used` / `window` and named
+  buckets) on the session root. Per-message times come from the turn chain when
+  it has timestamps, and otherwise from `meta.json`. Subagent discovery is
+  unverified (no observed `Task` tool call), and IDE (non-`cli`) sessions are
+  not yet verified.
 - **System prompt and tool schemas.** Only newer Claude Code transcripts record them. Codex
   records instructions but no schemas. Grok Build keeps both outside the JSONL and newest
   builds only write the schemas.
@@ -216,5 +226,6 @@ MIT, except where noted:
   and is Apache-2.0, see `packages/context/LICENSE` and `NOTICE`.
 - Harness marks use path data from [Simple Icons](https://simpleicons.org) (CC0) and
   [lobe-icons](https://github.com/lobehub/lobe-icons) (MIT); the Devin and pi marks are drawn
-  in-house, and the OpenCode mark is an in-house monogram. Claude, Codex, Kimi, Grok, Devin, and OpenCode are
+  in-house, and the OpenCode and Cursor marks are in-house monograms (the Cursor
+  mark is a pointer, not the product's cube). Claude, Codex, Kimi, Grok, Devin, OpenCode, and Cursor are
   trademarks of their respective owners. This project is not affiliated with any of them.

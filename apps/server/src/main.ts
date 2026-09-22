@@ -11,6 +11,8 @@ import { listingDbPath, searchDbPath, searchEnabled } from './cache.ts'
 import { DevinSource } from './devin/source.ts'
 import { SessionIndex } from './index.ts'
 import { ListingCache } from './listing-cache.ts'
+import { cursorChatsDir } from './cursor/roots.ts'
+import { CursorSource } from './cursor/source.ts'
 import { OpencodeSource } from './opencode/source.ts'
 import { defaultRoots, devinDbPath, opencodeDbPath } from './roots.ts'
 import { CompositeSource, type SessionSource } from './source.ts'
@@ -42,15 +44,17 @@ async function main(): Promise<void> {
 
 Scans Claude Code (~/.claude/projects), Codex (~/.codex/sessions), Kimi Code
 (~/.kimi-code/sessions), Grok Build (~/.grok/sessions), Devin CLI
-(~/.local/share/devin/cli/sessions.db), pi (~/.pi/agent/sessions) and
-OpenCode (~/.local/share/opencode/opencode.db) transcripts on this machine
+(~/.local/share/devin/cli/sessions.db), pi (~/.pi/agent/sessions),
+OpenCode (~/.local/share/opencode/opencode.db) and Cursor Agent
+(~/.cursor/chats) transcripts on this machine
 and serves the trajectory viewer. Harness home overrides (CLAUDE_CONFIG_DIR /
-CODEX_HOME / KIMI_CODE_HOME / GROK_HOME / PI_CODING_AGENT_DIR) are honoured;
+CODEX_HOME / KIMI_CODE_HOME / GROK_HOME / PI_CODING_AGENT_DIR /
+CURSOR_CONFIG_DIR) are honoured;
 override a root directly with
 HARNESS_TRAJECTORY_CLAUDE_ROOT / HARNESS_TRAJECTORY_CODEX_ROOT /
 HARNESS_TRAJECTORY_KIMI_ROOT / HARNESS_TRAJECTORY_GROK_ROOT /
 HARNESS_TRAJECTORY_PI_ROOT / HARNESS_TRAJECTORY_DEVIN_DB /
-HARNESS_TRAJECTORY_OPENCODE_DB.
+HARNESS_TRAJECTORY_OPENCODE_DB / HARNESS_TRAJECTORY_CURSOR_CHATS.
 
 A local launch opens the UI in the default browser. Pass --no-open (or set
 HARNESS_TRAJECTORY_NO_OPEN=1) to skip. An SSH session never opens a browser.
@@ -102,7 +106,11 @@ are editable in the UI.`)
   const opencode = new OpencodeSource({
     dbPath: opencodeDb,
   })
-  const sources = [index, devin, opencode]
+  // CursorSource is attached unconditionally: a missing chats directory
+  // degrades to empty and later polls recover it without a restart.
+  const cursorChats = cursorChatsDir()
+  const cursor = new CursorSource({ chatsDir: cursorChats })
+  const sources = [index, devin, opencode, cursor]
   const source: SessionSource = new CompositeSource(sources)
   const search = new SearchLifecycle(sources, {
     path: dbPath,
@@ -126,6 +134,7 @@ are editable in the UI.`)
   )
   console.log(`  devin: ${devinDb}${existsSync(devinDb) ? '' : ' (waiting for sessions.db)'}`)
   console.log(`  opencode: ${opencodeDb}${existsSync(opencodeDb) ? '' : ' (waiting for opencode.db)'}`)
+  console.log(`  cursor: ${cursorChats}${existsSync(cursorChats) ? '' : ' (waiting for chats)'}`)
   source.on('error', (error: unknown) => {
     console.error('[harness-trajectory] watcher error:', error)
   })
