@@ -6,6 +6,8 @@ import type { SessionFileRef } from '@harness-trajectory/core'
 import { describe, expect, it } from 'vitest'
 import { DEFAULT_BOUNDS } from '../../src/fold/config.ts'
 import { applyTimeline, createTimelineState } from '../../src/fold/fold.ts'
+import { ContextSession } from '../../src/fold/session.ts'
+import { headlineOf } from '../../src/client/headline.ts'
 import { createCursorSynthesizer } from '../../src/synth/cursor.ts'
 import type { InputEvent } from '../../src/synth/requestInput.ts'
 
@@ -87,14 +89,11 @@ describe('cursor synthesizer', () => {
     const synth = createCursorSynthesizer(FILE)
     const events = transcript().flatMap(item => [...synth.push(item)])
     const types = events.map(event => event.type)
-    expect(types).toContain('request/context')
     expect(types).toContain('system/message')
     expect(types).toContain('user/message')
     expect(types).toContain('assistant/message')
     expect(types).toContain('tool/call')
     expect(types).toContain('tool/result')
-    const context = events.find(event => event.type === 'request/context')
-    expect(context?.data?.['contextWindow']).toBe(256_000)
     const humans = events.filter(event => event.type === 'user/message' && event.data?.['source'] &&
       (event.data['source'] as { kind?: string }).kind === 'user')
     expect(humans).toHaveLength(1)
@@ -110,23 +109,31 @@ describe('cursor synthesizer', () => {
     expect(synth.meta().running).toBe(false)
   })
 
-  it('projects the usage snapshot as the latest checkpoint', () => {
-    const synth = createCursorSynthesizer(FILE)
-    const committed = transcript().flatMap(item => [...synth.push(item)])
-    const preview = synth.preview?.() ?? []
-    expect(preview.map(event => event.type)).toEqual(['assistant/message'])
-    expect(preview[0]?.data?.['usage']).toEqual({ inputTokens: 22_201 })
-    expect(synth.preview?.()).toEqual(preview)
-    let state = createTimelineState()
-    for (const event of [...committed, ...preview]) state = applyTimeline(state, event, DEFAULT_BOUNDS)
-    expect(state.contextWindow).toBe(256_000)
-    const last = state.requests[state.requests.length - 1]
-    expect(last?.prompt).toBe(22_201)
+  it('shows recorded occupancy without manufacturing requests, calls or billed tokens', () => {
+    const session = new ContextSession('cursor')
+    const lines = transcript()
+    session.push(lines[0] ?? '', FILE)
+    const initial = session.timelineOf(FILE.id)
+    expect(initial?.requests).toEqual([])
+    expect(initial?.requestInput?.calls).toBe(0)
+    expect(initial?.cost).toBeUndefined()
+    expect(initial?.timing?.calls ?? 0).toBe(0)
+    for (const item of lines.slice(1)) session.push(item, FILE)
+    const current = session.timelineOf(FILE.id)
+    expect(current).not.toBeNull()
+    if (current === null) return
+    expect(headlineOf(current)).toMatchObject({ tokens: 22_201, window: 256_000 })
+    expect(current.requests).toHaveLength(1)
+    expect(current.requests[0]?.prompt).toBeUndefined()
+    expect(current.requestInput).toMatchObject({ calls: 1, reported: 0, estimated: 0 })
+    expect(current.cost).toBeUndefined()
+    expect(current.timing?.calls).toBe(1)
+    expect(session.timelineOf(FILE.id)).toBe(current)
   })
 
-  it('prices official buckets onto system, tools, skill, and inject', () => {
-    const synth = createCursorSynthesizer(FILE)
-    const committed = [
+  it('retains real system content and recorded bucket sizes without fabricating schemas or messages', () => {
+    const session = new ContextSession('cursor')
+    const lines = [
       line({
         type: 'cursor.session', time: T0, agentId: 'agent-1', model: 'grok-4.7-high',
         usage: {
@@ -147,21 +154,71 @@ describe('cursor synthesizer', () => {
         type: 'cursor.message', index: 0, blobId: 'sys', time: T0,
         message: { role: 'system', content: 'You are a coding assistant.' },
       }),
-    ].flatMap(item => [...synth.push(item)])
-    const preview = synth.preview?.() ?? []
-    let state = createTimelineState()
-    for (const event of [...committed, ...preview]) state = applyTimeline(state, event, DEFAULT_BOUNDS)
-    expect(state.systemTokens).toBe(505)
-    expect(state.toolsTokens).toBe(800)
-    expect(state.toolsKnown).toBe(true)
-    expect(state.sums.skill).toBe(200)
-    expect(state.sums.inject).toBe(300 + 120 + 80)
-    const last = state.requests[state.requests.length - 1]
-    expect(last?.prompt).toBe(20_000)
-    expect(committed.some(event => {
-      const text = JSON.stringify(event.data ?? {})
-      return text.includes('summarized_conversation') || text.includes('"conversation"')
-    })).toBe(false)
+    ]
+    for (const item of lines) session.push(item, FILE)
+    const state = session.timelineOf(FILE.id)
+    expect(state?.current).toMatchObject({ system: 505, tools: 800, skill: 200, inject: 500 })
+    expect(state?.toolsKnown).not.toBe(true)
+    expect(state?.requests).toEqual([])
+    expect(state?.nodes).toEqual([])
+    expect(state?.systems).toHaveLength(1)
+    const system = state?.systems?.at(-1)
+    expect(system).toBeDefined()
+    if (system === undefined) return
+    expect(session.contentOf(FILE.id, system.seq)).toEqual([{ type: 'text', text: 'You are a coding assistant.' }])
+    expect(session.headerContentOf(FILE.id, system.seq)?.system).toBe('You are a coding assistant.')
+    expect(session.headersOf(FILE.id)?.headers.flatMap(header => header.tools)).toEqual([])
+  })
+
+  it('replaces current buckets on same-model updates, zeroes and removals without changing history', () => {
+    const session = new ContextSession('cursor')
+    for (const item of transcript()) session.push(item, FILE)
+    const before = session.timelineOf(FILE.id)
+    const baselineInject = before?.current.inject ?? 0
+    const baselineNodes = before?.nodes
+    const snapshot = (tokens: number) => line({
+      type: 'cursor.session', model: 'grok-4.7-high', time: T0 + 5_000,
+      usage: { used: tokens, window: 100_000, buckets: [
+        { key: 'system_prompt', tokens }, { key: 'tools', tokens },
+        { key: 'rules', tokens }, { key: 'skills', tokens },
+      ] },
+    })
+    for (const tokens of [100, 200, 0]) {
+      session.push(snapshot(tokens), FILE)
+      const current = session.timelineOf(FILE.id)
+      expect(current?.current).toMatchObject({ system: tokens, tools: tokens, inject: baselineInject + tokens, skill: tokens })
+      expect(current?.requests).toEqual(before?.requests)
+      expect(current?.requestInput).toEqual(before?.requestInput)
+      expect(current?.timing).toEqual(before?.timing)
+      expect(current?.cost).toBeUndefined()
+      expect(current?.nodes).toEqual(baselineNodes)
+      if (current !== null) expect(headlineOf(current).tokens).toBe(tokens)
+      // Re-reading and repeating an unchanged snapshot must preserve identity.
+      expect(session.timelineOf(FILE.id)).toBe(current)
+      session.push(snapshot(tokens), FILE)
+      expect(session.timelineOf(FILE.id)).toBe(current)
+    }
+    expect(before?.current.tools).toBe(8_000)
+    session.push(snapshot(300), FILE)
+    session.push(line({ type: 'cursor.session', model: 'grok-4.7-high', usage: { used: 400, window: 100_000, buckets: [] } }), FILE)
+    const removed = session.timelineOf(FILE.id)
+    expect(removed?.current).toMatchObject({ tools: 0, skill: 0, inject: baselineInject })
+    expect(removed?.current.system).toBeGreaterThan(0)
+    session.push(line({ type: 'cursor.session', model: 'grok-4.7-high' }), FILE)
+    expect(session.timelineOf(FILE.id)?.contextUsage).toBeUndefined()
+    expect(session.timelineOf(FILE.id)?.contextWindow).toBeUndefined()
+  })
+
+  it('counts a tool-only assistant response as one request with unknown input', () => {
+    const session = new ContextSession('cursor')
+    session.push(line({ type: 'cursor.message', message: { role: 'assistant', content: [
+      { type: 'tool-call', toolCallId: callId, toolName: 'Read', args: { path: 'a.ts' } },
+    ] } }), FILE)
+    const current = session.timelineOf(FILE.id)
+    expect(current?.requests).toHaveLength(1)
+    expect(current?.requestInput).toMatchObject({ calls: 1, reported: 0 })
+    expect(current?.requests[0]?.prompt).toBeUndefined()
+    expect(current?.cost).toBeUndefined()
   })
 
   it('books step and tool windows from the turn span', () => {

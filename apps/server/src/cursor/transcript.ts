@@ -9,16 +9,11 @@
  * takes `updatedAt`, and a time never moves backwards.
  */
 
-import { asArray, asString, cursorUserClass, isRecord } from '@harness-trajectory/core'
+import {
+  asArray, asString, cursorUserClass, cursorProviderOptions, isRecord,
+  type CursorSessionFacts, type CursorStepSpan, type CursorCallSpan, type CursorBlockSpan,
+} from '@harness-trajectory/core'
 import type { CursorTurnItem } from './proto.ts'
-
-function requestIdOf(message: Record<string, unknown>): string | undefined {
-  const provider = message['providerOptions']
-  if (!isRecord(provider)) return undefined
-  const cursor = provider['cursor']
-  if (!isRecord(cursor)) return undefined
-  return asString(cursor['requestId'])
-}
 
 /** Structural clock facts for one model message. Tool ids stay opaque. */
 export function clockMessageOf(message: Record<string, unknown>): CursorClockMessage {
@@ -46,42 +41,13 @@ export function clockMessageOf(message: Record<string, unknown>): CursorClockMes
     const id = asString(message['id'])
     if (id !== undefined && !toolResultIds.includes(id)) toolResultIds.push(id)
   }
-  const requestId = kind === 'human' ? requestIdOf(message) : undefined
+  const requestId = kind === 'human' ? asString(cursorProviderOptions(message)?.['requestId']) : undefined
   return {
     kind,
     toolCallIds,
     toolResultIds,
     ...(requestId === undefined || requestId === '' ? {} : { requestId }),
   }
-}
-
-export interface CursorWireBucket {
-  key: string
-  label: string
-  tokens: number
-  chars: number
-}
-
-export interface CursorWireUsage {
-  used: number
-  window: number
-  buckets: readonly CursorWireBucket[]
-}
-
-export interface CursorSessionFacts {
-  agentId: string
-  title?: string
-  cwd?: string
-  workspaceUri?: string
-  repoPath?: string
-  branch?: string
-  client?: string
-  mode?: string
-  approvalMode?: string
-  model?: string
-  createdAt?: number
-  updatedAt?: number
-  usage?: CursorWireUsage
 }
 
 export type TranscriptPlan =
@@ -127,26 +93,6 @@ export interface CursorClockTurn {
   /** User-prompt field 25. */
   promptTime?: number
   items: readonly CursorTurnItem[]
-}
-
-export interface CursorCallSpan {
-  id: string
-  start: number
-  end: number
-}
-
-export interface CursorBlockSpan {
-  kind: 'reasoning' | 'text' | 'tool-call'
-  start: number
-  end: number
-}
-
-/** Step window for one assistant message, plus each tool call's own window. */
-export interface CursorStepSpan {
-  start: number
-  end: number
-  calls: readonly CursorCallSpan[]
-  blocks: readonly CursorBlockSpan[]
 }
 
 export interface CursorLineClock {

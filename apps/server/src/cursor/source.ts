@@ -16,8 +16,9 @@
 import { EventEmitter } from 'node:events'
 import { readdirSync, readFileSync, statSync, watch, type FSWatcher } from 'node:fs'
 import { join } from 'node:path'
+import { setImmediate as yieldToLoop } from 'node:timers/promises'
 import {
-  asNumber, asString, cursorModelOf, isRecord, type HarnessKind,
+  asNumber, asString, isRecord, type HarnessKind, type CursorSessionFacts,
 } from '@harness-trajectory/core'
 import { createMetaScanner } from '../meta.ts'
 import type { SearchIndexer } from '../search/indexer.ts'
@@ -25,20 +26,15 @@ import {
   emitReplay, searchKeyOf, SessionBook, type LineSource, type ReplaySink, type SessionSource,
   type SourceEntry, type SourceSession, type Subscriber,
 } from '../source.ts'
-import { CursorDb } from './db.ts'
-import { decodeItem, decodeRoot, decodeTurn, decodeUserPrompt, type CursorRoot, type CursorTurnItem } from './proto.ts'
-import {
-  assignCursorTimes, assignTimes, clockMessageOf, cursorSessionModel, messageLine, planTranscript, sessionLine,
-  type CursorClockTurn, type CursorLineClock, type CursorSessionFacts, type CursorStepSpan,
-} from './transcript.ts'
+import { decodeRoot, type CursorRoot } from './proto.ts'
+import { CursorReaderPool, cursorPrefixVersion, type CursorPublishedRecord } from './reader.ts'
+import { cursorSessionModel, messageLine, sessionLine } from './transcript.ts'
 
 const KIND: HarnessKind = 'cursor'
 const POLL_MS = 1_500
-const POOL_LIMIT = 16
 const FAIL_LIMIT = 3
 
 interface CursorFile extends SourceEntry {
-  searchFrom: number
   searchSkipped: boolean
 }
 
@@ -70,10 +66,8 @@ interface CursorState {
   dataVersion: number | null
   materialized: boolean
   rootId: string | null
-  emittedIds: string[]
-  times: number[]
-  spans: (CursorStepSpan | undefined)[]
-  lastTime: number | null
+  records: CursorPublishedRecord[]
+  searchCursor: { indexer: SearchIndexer; nextLine: number } | undefined
   sidecar: string | null
   seenModel: string | undefined
   storeMeta: Record<string, unknown> | undefined
@@ -95,49 +89,6 @@ export interface CursorSourceOptions {
   watch?: boolean
   now?: () => number
   search?: SearchIndexer
-}
-
-interface OpenStore {
-  db: CursorDb
-  fresh: boolean
-}
-
-class StorePool {
-  private readonly open = new Map<string, CursorDb>()
-
-  acquire(path: string): OpenStore | undefined {
-    const existing = this.open.get(path)
-    if (existing !== undefined) {
-      this.open.delete(path)
-      this.open.set(path, existing)
-      return { db: existing, fresh: false }
-    }
-    try {
-      const db = new CursorDb(path)
-      this.open.set(path, db)
-      while (this.open.size > POOL_LIMIT) {
-        const oldest = this.open.keys().next().value
-        if (oldest === undefined) break
-        this.open.get(oldest)?.close()
-        this.open.delete(oldest)
-      }
-      return { db, fresh: true }
-    } catch {
-      return undefined
-    }
-  }
-
-  drop(path: string): void {
-    const db = this.open.get(path)
-    if (db === undefined) return
-    db.close()
-    this.open.delete(path)
-  }
-
-  close(): void {
-    for (const db of this.open.values()) db.close()
-    this.open.clear()
-  }
 }
 
 function fileStat(path: string): { mtimeMs: number; size: number } | undefined {
@@ -168,28 +119,19 @@ function readCatalog(metaPath: string): CatalogFacts | undefined {
   }
 }
 
-/** Model messages are JSON objects. Anything else (protobuf, ciphertext) is not a line. */
-function parseMessage(data: Uint8Array): Record<string, unknown> | undefined {
-  if (data.length === 0 || data[0] !== 0x7b) return undefined
-  try {
-    const parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(data)) as unknown
-    return isRecord(parsed) ? parsed : undefined
-  } catch {
-    return undefined
-  }
-}
-
 export class CursorSource extends EventEmitter implements SessionSource {
   private readonly chatsDir: string
   private readonly watchEnabled: boolean
   private readonly book: SessionBook<CursorFile>
   private readonly states = new Map<string, CursorState>()
-  private readonly pool = new StorePool()
+  private readonly pool = new CursorReaderPool()
   private search: SearchIndexer | undefined
   private poll: ReturnType<typeof setInterval> | null = null
   private watcher: FSWatcher | null = null
   private stopped = false
-  private scanning = false
+  private scanning: Promise<void> | undefined
+  private watchTimer: ReturnType<typeof setTimeout> | undefined
+  private readonly pendingPaths = new Set<string>()
 
   constructor(options: CursorSourceOptions) {
     super()
@@ -201,10 +143,10 @@ export class CursorSource extends EventEmitter implements SessionSource {
 
   async start(): Promise<void> {
     this.stopped = false
-    this.scan()
-    if (!this.watchEnabled) return
+    await this.scan()
+    if (!this.watchEnabled || this.stopped) return
     if (this.poll === null) {
-      this.poll = setInterval(() => { this.scan() }, POLL_MS)
+      this.poll = setInterval(() => { void this.scan() }, POLL_MS)
       this.poll.unref()
     }
     this.attachWatch()
@@ -218,12 +160,15 @@ export class CursorSource extends EventEmitter implements SessionSource {
     }
     this.watcher?.close()
     this.watcher = null
+    clearTimeout(this.watchTimer)
+    this.watchTimer = undefined
+    this.pendingPaths.clear()
     this.pool.close()
   }
 
   /** One catalog/transcript pass. Tests call this instead of waiting for the poll. */
-  refresh(): void {
-    this.scan()
+  refresh(): Promise<void> {
+    return this.scan()
   }
 
   livePaths(): string[] {
@@ -231,24 +176,25 @@ export class CursorSource extends EventEmitter implements SessionSource {
   }
 
   /**
-   * Attach search and backfill. Already-materialized streams re-derive lines
-   * from the store and queue from `beginFile`'s watermark. The rest materialize
-   * now. Called before `start` on a cold boot (the catalog is still empty)
-   * and again, after `disableSearch`, once sessions exist.
+   * Verify the persisted content prefix before resuming search. Yield between
+   * sessions so disabling search can detach an in-flight backfill promptly.
    */
   async enableSearch(search: SearchIndexer): Promise<void> {
     if (this.search !== undefined) return
     this.search = search
     for (const state of this.states.values()) {
+      if (this.stopped || this.search !== search) return
       state.entry.searchSkipped = !search.shouldIndex({ mtimeMs: state.entry.mtimeMs })
       if (state.entry.searchSkipped) continue
-      if (state.materialized) this.indexMaterialized(state, search)
-      else this.load(state)
+      this.sync(state, true)
+      this.indexMaterialized(state, search)
+      await yieldToLoop()
     }
   }
 
   disableSearch(): void {
     this.search = undefined
+    for (const state of this.states.values()) state.searchCursor = undefined
   }
 
   kinds(): readonly HarnessKind[] {
@@ -301,7 +247,7 @@ export class CursorSource extends EventEmitter implements SessionSource {
         synthetic: 1,
       })
     }
-    const times = state.times.slice(0, lines.length)
+    const times = state.records.slice(0, lines.length).map(record => record.time)
     sources.push({ ref: state.entry.ref, lines, times })
     await emitReplay(
       [state.entry.ref],
@@ -312,13 +258,20 @@ export class CursorSource extends EventEmitter implements SessionSource {
     )
   }
 
-  private scan(): void {
-    if (this.stopped || this.scanning) return
-    this.scanning = true
+  private scan(): Promise<void> {
+    if (this.stopped) return Promise.resolve()
+    if (this.scanning !== undefined) return this.scanning
+    const pass = this.scanCatalog().finally(() => { this.scanning = undefined })
+    this.scanning = pass
+    return pass
+  }
+
+  private async scanCatalog(): Promise<void> {
     try {
       const hits = this.listHits()
       const seen = new Set<string>()
       for (const hit of hits) {
+        if (this.stopped) return
         seen.add(hit.id)
         let state = this.states.get(hit.id)
         if (state === undefined) {
@@ -331,26 +284,25 @@ export class CursorSource extends EventEmitter implements SessionSource {
           state.catalog = hit.catalog
         }
         this.sync(state, false)
+        await yieldToLoop()
       }
+      if (this.stopped) return
       for (const state of [...this.states.values()]) {
         if (!seen.has(state.id)) this.drop(state)
       }
       if (this.watchEnabled) this.attachWatch()
     } catch (error) {
       this.emit('error', error)
-    } finally {
-      this.scanning = false
     }
   }
 
-  private listHits(): Hit[] {
+  private *listHits(): Generator<Hit> {
     let parents: string[]
     try {
       parents = readdirSync(this.chatsDir)
     } catch {
-      return []
+      return
     }
-    const hits: Hit[] = []
     for (const parent of parents) {
       const parentDir = join(this.chatsDir, parent)
       let agents: string[]
@@ -374,10 +326,9 @@ export class CursorSource extends EventEmitter implements SessionSource {
         if (!directory) continue
         const catalog = readCatalog(metaPath)
         if (catalog === undefined || fileStat(storePath) === undefined) continue
-        hits.push({ id, dir, storePath, metaPath, catalog })
+        yield { id, dir, storePath, metaPath, catalog }
       }
     }
-    return hits
   }
 
   private create(hit: Hit): CursorState {
@@ -392,7 +343,6 @@ export class CursorSource extends EventEmitter implements SessionSource {
       mtimeMs: 0,
       lines: 0,
       meta: createMetaScanner(KIND, seedOf(hit.catalog)),
-      searchFrom: 0,
       searchSkipped: false,
     }
     session.main = entry
@@ -410,10 +360,8 @@ export class CursorSource extends EventEmitter implements SessionSource {
       dataVersion: null,
       materialized: false,
       rootId: null,
-      emittedIds: [],
-      times: [],
-      spans: [],
-      lastTime: null,
+      records: [],
+      searchCursor: undefined,
       sidecar: null,
       seenModel: undefined,
       storeMeta: undefined,
@@ -457,7 +405,8 @@ export class CursorSource extends EventEmitter implements SessionSource {
       this.noteSidecar(state, this.factsFrom(state))
       return
     }
-    const { db, fresh } = opened
+    const { reader, fresh } = opened
+    const { db } = reader
     const version = db.dataVersion()
     if (!fresh && version !== undefined && version === state.dataVersion && state.materialized && !state.incomplete) {
       state.storeMeta = db.readMeta() ?? state.storeMeta
@@ -484,124 +433,31 @@ export class CursorSource extends EventEmitter implements SessionSource {
       return
     }
     const root = decodeRoot(blob)
-    if (root.messageIds.length === 0) {
-      // Ciphertext, a truncated root, or a session whose field 1 is empty.
-      // Catalog facts still publish; a later root id retries.
-      state.materialized = true
-      state.incomplete = false
-      state.failStreak = 0
-      state.rootId = rootId
-      this.rememberRoot(state, root)
+    if (root === undefined) {
+      // A malformed root is not evidence that the conversation was cleared.
+      this.noteFailure(state)
       this.noteSidecar(state, this.factsFrom(state))
       return
     }
-    const plan = planTranscript(root.messageIds, state.emittedIds)
-    const rebuilding = plan.action === 'rebuild' && state.emittedIds.length > 0
-    if (rebuilding) this.resetStream(state)
-    if (this.search !== undefined && !state.entry.searchSkipped) {
-      state.entry.searchFrom = this.search.beginFile(searchKeyOf(state.entry), {
-        size: root.messageIds.length,
-        mtimeMs: state.entry.mtimeMs,
-      })
-    }
-    const start = state.emittedIds.length
     const created = state.catalog.createdAt ?? asNumber(meta?.['createdAt']) ?? root.createdAt ?? 0
     const updated = state.catalog.updatedAt ?? created
-    const clocks = this.clocksFor(db, root, created, updated)
-    const times: CursorLineClock[] = clocks === undefined
-      ? assignTimes(start, plan.ids.length, created, updated, state.lastTime).map(time => ({ time }))
-      : clocks.slice(start)
-    const accepted: string[] = []
-    const acceptedTimes: number[] = []
-    const acceptedSpans: (CursorStepSpan | undefined)[] = []
-    const lines: string[] = []
-    let blocked = false
-    for (let index = 0; index < plan.ids.length; index += 1) {
-      const id = plan.ids[index]
-      if (id === undefined) {
-        blocked = true
-        break
-      }
-      const data = db.readBlob(id)
-      const message = data === undefined ? undefined : parseMessage(data)
-      if (message === undefined) {
-        blocked = true
-        break
-      }
-      const model = cursorModelOf(message)
-      if (model !== undefined) state.seenModel = model
-      const clock = times[index]
-      const raw = clock?.time ?? updated
-      const time = state.lastTime !== null && raw < state.lastTime ? state.lastTime : raw
-      const span = clock?.span
-      const lineIndex = start + accepted.length
-      accepted.push(id)
-      acceptedTimes.push(time)
-      acceptedSpans.push(span)
-      lines.push(messageLine(lineIndex, id, time, message, span))
-    }
+    const change = reader.prepare(root, state.records, created, updated)
+    if (change.reset) this.resetStream(state)
+    const startLine = state.records.length
+    state.records.push(...change.records)
+    if (change.model !== undefined) state.seenModel = change.model
     state.materialized = true
     this.rememberRoot(state, root)
     this.noteSidecar(state, this.factsFrom(state))
-    if (lines.length > 0) this.emitLines(state, lines)
-    state.emittedIds.push(...accepted)
-    state.times.push(...acceptedTimes)
-    state.spans.push(...acceptedSpans)
-    const last = acceptedTimes[acceptedTimes.length - 1]
-    if (last !== undefined) state.lastTime = last
-    if (blocked) this.noteFailure(state)
+    if (change.lines.length > 0) this.emitLines(state, change.lines)
+    if (change.blocked) this.noteFailure(state)
     else {
       state.failStreak = 0
       state.incomplete = false
       state.rootId = rootId
     }
-    if (!blocked || state.failStreak >= FAIL_LIMIT) {
-      if (blocked) state.rootId = rootId
-    }
-    this.noteSearch(state)
-  }
-
-  /**
-   * Full-list clocks from the turn chain. `undefined` when the root has no
-   * field-8 refs; a chain with no timestamps falls through inside
-   * `assignCursorTimes` to the phase-1 stamps.
-   */
-  private clocksFor(
-    db: CursorDb,
-    root: CursorRoot,
-    createdAt: number,
-    updatedAt: number,
-  ): CursorLineClock[] | undefined {
-    if (root.turnIds.length === 0) return undefined
-    const turns: CursorClockTurn[] = []
-    for (const id of root.turnIds) {
-      const blob = db.readBlob(id)
-      if (blob === undefined) continue
-      const skeleton = decodeTurn(blob)
-      if (skeleton === undefined) continue
-      const promptBlob = skeleton.promptId === undefined ? undefined : db.readBlob(skeleton.promptId)
-      const prompt = promptBlob === undefined ? undefined : decodeUserPrompt(promptBlob)
-      const items: CursorTurnItem[] = []
-      for (const itemId of skeleton.itemIds) {
-        const data = db.readBlob(itemId)
-        if (data === undefined) continue
-        const item = decodeItem(data)
-        if (item !== undefined) items.push(item)
-      }
-      turns.push({
-        items,
-        ...(skeleton.requestId === undefined ? {} : { requestId: skeleton.requestId }),
-        ...(prompt?.time === undefined ? {} : { promptTime: prompt.time }),
-      })
-    }
-    const messages: ReturnType<typeof clockMessageOf>[] = []
-    for (const id of root.messageIds) {
-      const data = db.readBlob(id)
-      const message = data === undefined ? undefined : parseMessage(data)
-      if (message === undefined) break
-      messages.push(clockMessageOf(message))
-    }
-    return assignCursorTimes(messages, turns, createdAt, updatedAt, null)
+    if (change.blocked && state.failStreak >= FAIL_LIMIT) state.rootId = rootId
+    if (this.search !== undefined) this.indexMaterialized(state, this.search, startLine, change.lines)
   }
 
   private rememberRoot(state: CursorState, root: CursorRoot): void {
@@ -623,11 +479,8 @@ export class CursorSource extends EventEmitter implements SessionSource {
   private resetStream(state: CursorState): void {
     const entry = state.entry
     entry.lines = 0
-    entry.searchFrom = 0
-    state.emittedIds = []
-    state.times = []
-    state.spans = []
-    state.lastTime = null
+    state.records = []
+    state.searchCursor = undefined
     state.sidecar = null
     state.seenModel = undefined
     entry.meta = createMetaScanner(KIND, seedOf(state.catalog))
@@ -641,52 +494,63 @@ export class CursorSource extends EventEmitter implements SessionSource {
     for (const line of lines) entry.meta?.push(line)
     entry.lines += lines.length
     this.book.emitTo(state.session, { type: 'lines', file: entry.ref, lines, startLine })
-    const search = this.search
-    if (search === undefined || entry.searchSkipped) return
-    for (let index = 0; index < lines.length; index += 1) {
-      const lineIndex = startLine + index
-      if (lineIndex < entry.searchFrom) continue
-      const line = lines[index]
-      if (line !== undefined) search.queue(searchKeyOf(entry), lineIndex, line)
-    }
   }
 
-  private noteSearch(state: CursorState): void {
-    const search = this.search
-    if (search === undefined || state.entry.searchSkipped) return
-    search.noteProgress(searchKeyOf(state.entry), {
-      size: state.emittedIds.length,
-      mtimeMs: state.entry.mtimeMs,
-      indexedBytes: state.entry.lines,
-      indexedLines: state.entry.lines,
-    })
-  }
-
-  private indexMaterialized(state: CursorState, search: SearchIndexer): void {
-    const lines = this.reread(state)
-    state.entry.searchFrom = search.beginFile(searchKeyOf(state.entry), {
-      size: state.emittedIds.length,
-      mtimeMs: state.entry.mtimeMs,
-    })
-    for (let index = state.entry.searchFrom; index < lines.length; index += 1) {
-      const line = lines[index]
-      if (line !== undefined) search.queue(searchKeyOf(state.entry), index, line)
+  private indexMaterialized(
+    state: CursorState,
+    search: SearchIndexer,
+    preparedStart = 0,
+    preparedLines: readonly string[] = [],
+  ): void {
+    if (!state.materialized || state.entry.searchSkipped) return
+    const key = searchKeyOf(state.entry)
+    const ids = state.records.map(record => record.blobId)
+    let cursor = state.searchCursor
+    if (cursor?.indexer !== search) {
+      cursor = {
+        indexer: search,
+        nextLine: search.beginFile(key, {
+          size: ids.length,
+          mtimeMs: state.entry.mtimeMs,
+          versionAt: length => cursorPrefixVersion(ids, length),
+        }),
+      }
+      state.searchCursor = cursor
     }
-    this.noteSearch(state)
+    const opened = cursor.nextLine < preparedStart || preparedLines.length === 0
+      ? this.pool.acquire(state.storePath) : undefined
+    while (cursor.nextLine < state.records.length) {
+      const index = cursor.nextLine
+      const record = state.records[index]
+      if (record === undefined) break
+      let line = preparedLines[index - preparedStart]
+      if (line === undefined) {
+        const message = opened?.reader.readMessage(record.blobId)
+        if (message === undefined) break
+        line = messageLine(index, record.blobId, record.time, message, record.span)
+      }
+      search.queue(key, index, line)
+      cursor.nextLine += 1
+    }
+    const contentVersion = cursorPrefixVersion(ids, cursor.nextLine)
+    search.noteProgress(key, {
+      size: ids.length,
+      mtimeMs: state.entry.mtimeMs,
+      indexedBytes: cursor.nextLine,
+      indexedLines: cursor.nextLine,
+      ...(contentVersion === undefined ? {} : { contentVersion }),
+    })
   }
 
   private reread(state: CursorState): string[] {
     const opened = this.pool.acquire(state.storePath)
     if (opened === undefined) return []
     const lines: string[] = []
-    for (let index = 0; index < state.emittedIds.length; index += 1) {
-      const id = state.emittedIds[index]
-      const time = state.times[index]
-      if (id === undefined || time === undefined) continue
-      const data = opened.db.readBlob(id)
-      const message = data === undefined ? undefined : parseMessage(data)
-      if (message === undefined) continue
-      lines.push(messageLine(index, id, time, message, state.spans[index]))
+    for (const [index, record] of state.records.entries()) {
+      const message = opened.reader.readMessage(record.blobId)
+      // Never shift later records into a missing record's search/SSE line number.
+      if (message === undefined) break
+      lines.push(messageLine(index, record.blobId, record.time, message, record.span))
     }
     return lines
   }
@@ -754,10 +618,47 @@ export class CursorSource extends EventEmitter implements SessionSource {
     this.emit('change', KIND, state.id)
   }
 
+  /** A burst of WAL events for an existing session needs only that session. */
+  private async refreshPaths(paths: readonly string[]): Promise<void> {
+    await this.scanning
+    if (this.stopped) return
+    const sessions = new Set<CursorState>()
+    for (const path of paths) {
+      const parts = path.split(/[\\/]/)
+      const id = parts[1]
+      const state = id === undefined ? undefined : this.states.get(id)
+      if (state === undefined || parts.length < 3 || join(this.chatsDir, parts[0] ?? '', id ?? '') !== state.dir) {
+        await this.scan()
+        return
+      }
+      sessions.add(state)
+    }
+    for (const state of sessions) {
+      if (this.stopped) return
+      const catalog = readCatalog(state.metaPath)
+      if (catalog === undefined) this.drop(state)
+      else {
+        state.catalog = catalog
+        this.sync(state, false)
+      }
+      await yieldToLoop()
+    }
+  }
+
   private attachWatch(): void {
     if (this.watcher !== null || this.stopped) return
     try {
-      this.watcher = watch(this.chatsDir, { recursive: true, persistent: true }, () => { this.scan() })
+      this.watcher = watch(this.chatsDir, { recursive: true, persistent: true }, (_event, filename) => {
+        this.pendingPaths.add(filename ?? '')
+        if (this.watchTimer !== undefined) return
+        this.watchTimer = setTimeout(() => {
+          this.watchTimer = undefined
+          const paths = [...this.pendingPaths]
+          this.pendingPaths.clear()
+          void this.refreshPaths(paths).catch(error => { this.emit('error', error) })
+        }, 50)
+        this.watchTimer.unref()
+      })
       this.watcher.on('error', () => {
         this.watcher?.close()
         this.watcher = null

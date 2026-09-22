@@ -377,6 +377,43 @@ describe('SearchIndexer', () => {
     store.close()
   })
 
+  it('rebuilds a versioned source if a size flush overtakes its verified checkpoint', () => {
+    const key = { path: 'cursor://sessions/m', kind: 'cursor' as const, sessionId: 'm', fileId: 'm' }
+    const indexer = new SearchIndexer({
+      store, maxBatchDocs: 1, flushDelayMs: 60_000,
+      extract: (_kind, text) => [{ role: 'human', text }],
+    })
+    indexer.queue(key, 0, 'first prompt')
+    indexer.noteProgress(key, {
+      size: 1, mtimeMs: 1, indexedBytes: 1, indexedLines: 1, contentVersion: 'prefix-one',
+    })
+    indexer.flush()
+    expect(indexer.beginFile(key, { size: 2, mtimeMs: 2, versionAt: () => 'prefix-one' })).toBe(1)
+    // The new document commits before the source can checkpoint prefix-two.
+    indexer.queue(key, 1, 'second prompt')
+    expect(store.fileState(key.path)?.contentVersion).toBeUndefined()
+    indexer.stop()
+    const restarted = new SearchIndexer({
+      store, extract: (_kind, text) => [{ role: 'human', text }],
+    })
+    try {
+      expect(restarted.beginFile(key, {
+        size: 2, mtimeMs: 2, versionAt: length => length === 1 ? 'prefix-one' : 'prefix-two',
+      })).toBe(0)
+      restarted.queue(key, 0, 'first prompt')
+      restarted.queue(key, 1, 'second prompt')
+      restarted.noteProgress(key, {
+        size: 2, mtimeMs: 2, indexedBytes: 2, indexedLines: 2, contentVersion: 'prefix-two',
+      })
+      restarted.flush()
+      expect(store.docCount()).toBe(2)
+      expect(search(store, { q: 'first prompt' }).totalHits).toBe(1)
+      expect(store.fileState(key.path)?.contentVersion).toBe('prefix-two')
+    } finally {
+      restarted.stop()
+    }
+  })
+
   it('commits on its own once the batch outgrows the limit, without waiting for the timer', () => {
     // A very long debounce: only the size trigger can have written anything.
     const indexer = new SearchIndexer({ store, flushDelayMs: 60_000, maxBatchDocs: 5 })

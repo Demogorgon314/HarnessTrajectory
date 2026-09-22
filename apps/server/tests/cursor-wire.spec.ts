@@ -108,10 +108,11 @@ describe('decodeRoot', () => {
     })
   })
 
-  it('returns an empty root for truncated and empty buffers', () => {
+  it('distinguishes a valid empty root from malformed input', () => {
     expect(decodeRoot(new Uint8Array())).toEqual({ messageIds: [], ruleFiles: [], turnIds: [] })
-    expect(decodeRoot(Uint8Array.of(0x80))).toEqual({ messageIds: [], ruleFiles: [], turnIds: [] })
-    expect(decodeRoot(Uint8Array.of(0x0a, 0x05, 0x01))).toEqual({ messageIds: [], ruleFiles: [], turnIds: [] })
+    expect(decodeRoot(Uint8Array.of(0x80))).toBeUndefined()
+    expect(decodeRoot(Uint8Array.of(0x0a, 0x05, 0x01))).toBeUndefined()
+    expect(decodeRoot(bytesField(1, Uint8Array.of(1)))).toBeUndefined()
   })
 
   it('decodes every field-8 turn, including a 32-byte-nested tool id', () => {
@@ -134,7 +135,7 @@ describe('decodeRoot', () => {
     )
     const chain = bytesField(1, turn)
     const root = concat(bytesField(8, chainId), bytesField(8, idBytes(11)))
-    expect(decodeRoot(root).turnIds).toEqual([hex(chainId), hex(idBytes(11))])
+    expect(decodeRoot(root)?.turnIds).toEqual([hex(chainId), hex(idBytes(11))])
     expect(decodeTurn(chain)).toEqual({
       requestId: 'req-1',
       promptId: hex(promptId),

@@ -6,7 +6,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   createCursorParser, cursorHumanText, cursorModelOf, cursorUserClass, parseCursorLine,
-} from '../src/adapters/cursor.ts'
+} from '../src/adapters/index.ts'
 import type { SessionFileRef } from '../src/session.ts'
 
 const FILE: SessionFileRef = {

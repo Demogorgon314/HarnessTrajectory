@@ -92,7 +92,24 @@ export interface PluginSettings {
 /** The section fields the settings card edits, as the Host schema names them. */
 export type SettingsField = keyof PluginSettings
 
+/**
+ * A recorded snapshot of current occupancy, not a model request or billed usage.
+ * System/tools replace the estimated envelope sizes when present; inject/skill
+ * count additional envelope content not represented by transcript messages.
+ * Missing bucket figures leave the transcript estimates in place.
+ */
+export interface ContextUsage {
+  used: number
+  window?: number
+  system?: number
+  tools?: number
+  inject?: number
+  skill?: number
+}
+
 export interface Snapshot {
+  /** Port-owned current occupancy; never contributes to request or cost history. */
+  contextUsage?: ContextUsage
   /** Port-owned, whole-agent request input measurements (not billing totals). */
   requestInput?: import('./requestInput.ts').RequestInputSummary
   ok: boolean

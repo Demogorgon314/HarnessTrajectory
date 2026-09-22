@@ -22,6 +22,7 @@ import { createContextSettings } from '../../../src/client/settings'
 import { createContextTranslate, DICT_EN } from '../../../src/client/i18n'
 import type { AgentNodeInput } from '../../../src/client/agentTree'
 import type { ContentBlock } from '../../../src/fold/event'
+import { ContextSession } from '../../../src/fold/session'
 import type { ContextHeaders, ContextTimeline, RequestRecord } from '../../../src/shared/types'
 import { click, flush, hover, makeKit, mount, query, queryAll, silenceWindowErrors, text, unhover } from '../helpers/kit'
 
@@ -335,6 +336,46 @@ describe('ContextView — the browser join', () => {
 })
 
 describe('ContextView — honesty markers', () => {
+  test('Cursor occupancy updates independently of requests and preserves the browsable system text', async () => {
+    const session = new ContextSession('cursor')
+    const file = { id: 'main', role: 'main' as const, path: 'cursor://sessions/main' }
+    const snapshot = (used: number) => JSON.stringify({
+      type: 'cursor.session', model: 'test-model',
+      usage: { used, window: 100000, buckets: [
+        { key: 'system_prompt', tokens: 505 }, { key: 'tools', tokens: 800 },
+      ] },
+    })
+    session.push(snapshot(20000), file)
+    session.push(JSON.stringify({ type: 'cursor.message', message: { role: 'system', content: 'Actual Cursor system instructions' } }), file)
+    const View = viewOf()
+    const viewProps = () => props({
+      timeline: session.timelineOf(file.id), headers: session.headersOf(file.id),
+      contentOf: seq => session.contentOf(file.id, seq),
+      headerContentOf: seq => session.headerContentOf(file.id, seq),
+    })
+    const m = await mount(h(View, viewProps()))
+    try {
+      assert.ok(text(query(m.container, '.lc-overview-num')).includes(kit.fmt(20000)))
+      assert.ok(text(m.container).includes(DICT_EN['trend.empty']!))
+      const systemRow = queryAll(m.container, '.lc-br-cat-row').find(r => text(r).includes(DICT_EN['cat.system']!))
+      assert.ok(systemRow !== undefined)
+      await click(systemRow)
+      await flush()
+      assert.ok(text(m.container).includes('Actual Cursor system instructions'))
+      const toolsRow = queryAll(m.container, '.lc-br-cat-row').find(r => text(r).includes(DICT_EN['cat.tools']!))
+      assert.ok(toolsRow !== undefined)
+      await click(toolsRow)
+      assert.ok(text(m.container).includes(DICT_EN['tools.unrecordedBody']!))
+      session.push(snapshot(30000), file)
+      await m.update(h(View, viewProps()))
+      assert.ok(text(query(m.container, '.lc-overview-num')).includes(kit.fmt(30000)))
+      assert.ok(text(m.container).includes(DICT_EN['trend.empty']!))
+      assert.equal(usageOfRequests(session.timelineOf(file.id)?.requests ?? []), null)
+    } finally {
+      await m.unmount()
+    }
+  })
+
   test('a derived system remainder marks the legend and the browser row', async () => {
     const View = viewOf()
     const m = await mount(h(View, props({

@@ -55,7 +55,7 @@ export function headlineOf(
   const derived = anchor !== null && typeof anchor.prompt === 'number'
     ? anchor.prompt + (current.total - anchor.total)
     : undefined
-  const occupancyTokens = projected ?? derived ?? null
+  const occupancyTokens = projected ?? data.contextUsage?.used ?? derived ?? null
   const window = pressure !== null && typeof pressure.contextWindow === 'number'
     ? pressure.contextWindow
     : data.contextWindow

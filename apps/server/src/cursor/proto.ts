@@ -8,29 +8,18 @@
  * is `undefined`, and an empty buffer is `[]`.
  */
 
+import type { CursorUsage, CursorUsageBucket } from '@harness-trajectory/core'
+
 export interface ProtoField {
   field: number
   varint?: number
   bytes?: Uint8Array
 }
 
-export interface CursorUsageBucket {
-  key: string
-  label: string
-  tokens: number
-  chars: number
-}
-
-export interface CursorRootUsage {
-  used: number
-  window: number
-  buckets: CursorUsageBucket[]
-}
-
 export interface CursorRoot {
   /** Hex SHA-256 ids of model-message blobs, in root order. */
   messageIds: string[]
-  usage?: CursorRootUsage
+  usage?: CursorUsage
   workspaceUri?: string
   repo?: string
   branch?: string
@@ -186,7 +175,7 @@ function decodeBucket(bytes: Uint8Array): CursorUsageBucket | undefined {
   return { key, label: label ?? key, tokens, chars }
 }
 
-function decodeUsage(bytes: Uint8Array): CursorRootUsage | undefined {
+function decodeUsage(bytes: Uint8Array): CursorUsage | undefined {
   const fields = decodeFields(bytes)
   if (fields === undefined) return undefined
   let used: number | undefined
@@ -209,10 +198,6 @@ function decodeUsage(bytes: Uint8Array): CursorRootUsage | undefined {
   return { used: used ?? 0, window: window ?? 0, buckets }
 }
 
-function emptyRoot(): CursorRoot {
-  return { messageIds: [], ruleFiles: [], turnIds: [] }
-}
-
 function idOf(field: ProtoField): string | undefined {
   return field.bytes !== undefined && field.bytes.length === 32 ? hexOf(field.bytes) : undefined
 }
@@ -221,14 +206,14 @@ function varintOf(field: ProtoField): number | undefined {
   return field.varint
 }
 
-/** Decode a root blob. Malformed input yields an empty root and never throws. */
-export function decodeRoot(bytes: Uint8Array): CursorRoot {
+/** Decode a root blob; distinguish malformed input from a valid empty conversation. */
+export function decodeRoot(bytes: Uint8Array): CursorRoot | undefined {
   try {
     const fields = decodeFields(bytes)
-    if (fields === undefined) return emptyRoot()
+    if (fields === undefined) return undefined
     const messageIds: string[] = []
     const ruleFiles: string[] = []
-    let usage: CursorRootUsage | undefined
+    let usage: CursorUsage | undefined
     let workspaceUri: string | undefined
     let repo: string | undefined
     let branch: string | undefined
@@ -237,7 +222,8 @@ export function decodeRoot(bytes: Uint8Array): CursorRoot {
     let timezone: string | undefined
     const turnIds: string[] = []
     for (const field of fields) {
-      if (field.field === 1 && field.bytes !== undefined && field.bytes.length === 32) {
+      if (field.field === 1) {
+        if (field.bytes === undefined || field.bytes.length !== 32) return undefined
         messageIds.push(hexOf(field.bytes))
       } else if (field.field === 8) {
         const id = idOf(field)
@@ -277,7 +263,7 @@ export function decodeRoot(bytes: Uint8Array): CursorRoot {
       ...(timezone === undefined ? {} : { timezone }),
     }
   } catch {
-    return emptyRoot()
+    return undefined
   }
 }
 

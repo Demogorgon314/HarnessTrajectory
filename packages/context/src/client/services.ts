@@ -14,7 +14,7 @@
  */
 
 import type {
-  ContextBreakdown, ContextHeaders, ContextPressure, ContextTimeline, CostModelUsage,
+  ContextBreakdown, ContextHeaders, ContextPressure, ContextTimeline, ContextUsage, CostModelUsage,
   HeaderEpochContent, SystemPromptNode, TimingTotals, TokenUsage, ToolTimingTotals,
 } from '../shared/types'
 
@@ -181,6 +181,15 @@ function costFastOk(value: unknown): boolean {
   })
 }
 
+function validContextUsage(value: unknown): value is ContextUsage {
+  const usage = asRecord(value)
+  if (usage === null || typeof usage.used !== 'number' || !Number.isFinite(usage.used) || usage.used < 0) return false
+  return ['window', 'system', 'tools', 'inject', 'skill'].every(key => {
+    const count = usage[key]
+    return count === undefined || (typeof count === 'number' && Number.isFinite(count) && count >= 0)
+  })
+}
+
 /**
  * Narrow a timeline value to a RENDER-SAFE context timeline — the client's
  * no-white-screen guarantee against fold/parse failures.
@@ -204,6 +213,7 @@ export function timelineOf(value: unknown): ContextTimeline | null {
     && ['system', 'tools', 'user', 'inject', 'skill', 'assistant', 'tool', 'total']
       .every(k => typeof (current as Record<string, unknown>)[k] === 'number')
   if (numericBreakdown
+    && (data.contextUsage === undefined || validContextUsage(data.contextUsage))
     && recordsOnly(data.requests)
     && recordsOnly(data.events)
     && recordsOnly(data.nodes)
@@ -222,6 +232,7 @@ export function timelineOf(value: unknown): ContextTimeline | null {
   const last = lastOf(data.last)
   const safe: ContextTimeline = {
     ok: true,
+    ...(validContextUsage(data.contextUsage) ? { contextUsage: data.contextUsage } : {}),
     ...(unsupported !== null ? { unsupported } : {}),
     ...(typeof data.model === 'string' ? { model: data.model } : {}),
     ...(typeof data.provider === 'string' ? { provider: data.provider } : {}),

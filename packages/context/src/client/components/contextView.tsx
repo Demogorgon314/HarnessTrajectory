@@ -414,9 +414,8 @@ export function makeContextView(
       return i >= 0 ? markers[i] : undefined
     }
 
-    // The headline anchor is the fold's own derivation: this viewer has no
-    // foreign pressure/breakdown projections, so both arguments stay null and
-    // `headlineOf` falls back to the newest request's provider prompt.
+    // Prefer a recorded current-usage snapshot, otherwise derive occupancy
+    // from the newest request's provider prompt and subsequent surface growth.
     const head = headlineOf(data, null, null)
     let fileScope = t('files.scopeLatest')
     if (activeReq !== null && filesBefore !== null) {

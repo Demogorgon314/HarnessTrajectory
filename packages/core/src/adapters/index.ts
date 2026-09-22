@@ -40,9 +40,12 @@ export {
   type OpencodeRecord, type OpencodeUserClass,
 } from './opencode.ts'
 export {
-  createCursorParser, parseCursorLine, cursorUserClass, cursorHumanText, cursorModelOf,
+  parseCursorLine, cursorUserClass, cursorHumanText, cursorModelOf,
+  cursorProviderOptions, cursorMessageText, cursorToolResultText, cursorArgsText, cursorUsageOf,
+  type CursorCallSpan, type CursorBlockSpan, type CursorSessionFacts,
   type CursorRecord, type CursorStepSpan, type CursorUserClass, type CursorUsage, type CursorUsageBucket,
-} from './cursor.ts'
+} from './cursor-protocol.ts'
+export { createCursorParser } from './cursor.ts'
 export { createDshParser } from './dsh.ts'
 export {
   parseDshLine, expandDshStreamRun, dshReplaceRange, dshUserClass,

@@ -857,6 +857,17 @@ normally the previous list plus appended ids. It **shrinks or rewrites** when
 Cursor summarizes the conversation (`summarized_conversation` bucket > 0) or the
 user rewinds — any non-prefix change is a full rebuild (`file reset` plus a new
 meta scanner, so prompts are not double-counted, and `search.reset`).
+A valid root with no field-1 entries clears the transcript and search as well.
+Malformed roots are distinguished from empty conversations: keep the last
+readable prefix and retry instead of treating decode failure as a deletion.
+
+Search stores a SHA-256 fingerprint of the ordered message ids in the indexed
+prefix alongside its watermark. Discovery and search re-enablement verify that
+prefix against the current root: an unchanged prefix resumes at the watermark;
+a missing or mismatched fingerprint rebuilds the session. Counts and mtimes
+alone cannot establish continuity. The search cache schema is bumped to v9;
+the old cache is disposable and rebuilds once. An interrupted batch without a
+matching fingerprint also rebuilds rather than trusting an unverified watermark.
 
 Messages are content-addressed and written whole, so a message is **always
 settled** when it appears in a root — no streaming or partial states. A missing
@@ -892,6 +903,18 @@ and registers a session when `meta.json` has `hasConversation: true` and
 `store.db` + `store.db-wal` bytes. The transcript tier opens the store on first
 subscribe, replay, or search registration.
 
+The reader prepares a change before the source publishes it. Each published
+record owns its blob id, pinned clock/span and compact timing facts, so replay
+and append share one record order. Appends read only new message bodies;
+decoded immutable turn/prompt/item timing nodes are cached with a 2,048-entry
+limit per node type and evicted with their read-only connection (16 stores).
+Missing nodes are never cached. Message text is not retained in these caches.
+Watch events are coalesced for 50 ms and refresh known sessions directly;
+unknown paths and polling trigger catalog discovery. Discovery and search
+backfill yield between sessions; decoding a single session is still synchronous.
+The shared browser-safe Cursor protocol in core owns wire types, classification,
+message text and tool-result text for all consumers.
+
 Server-synthesized JSON lines, epoch-ms `time`:
 
 - `cursor.message` — stream line (0-based index = search `line`):
@@ -924,17 +947,21 @@ search: `role === 'user'` with `Array.isArray(content)` and a string
 `role === 'system'` is `system`. The trajectory adapter keeps the system prompt
 on `systemPrompts` and renders injections as context notices. The context
 synthesizer emits `system/message`, injected `user/message`, and a human
-`user/message`. There is no per-step token usage. The root's `used` / `window`
-is projected as a trailing usage-only `assistant/message` via `preview()` (empty
-content, `usage.inputTokens = used`) so the Context dashboard's fill is the
-official occupancy. The fold's own vocabulary then receives the buckets that
-have a home: `system_prompt` is the system-prompt figure, `tools` is the tool-schema
-figure (the store has the token count and not the schema list, so the header
-carries one stand-in definition priced to that count), `rules` / `mcp` /
-`subagents` are injected context, and `skills` is a skill-catalog message.
-`conversation` and `summarized_conversation` are the transcript messages and
-are not emitted a second time. The checkpoint is not committed, so it is not
-billed twice. The headline total is `usage.used`.
+`user/message`. There is no per-step token usage. The root's current `used` /
+`window` and envelope buckets travel through synthesizer metadata as
+`contextUsage`. `ContextSession` applies those figures only to the current
+view, outside the vendored fold. The headline uses `used`; system/tools replace
+the estimated envelope sizes, and rules/MCP/subagents and skills add their
+recorded sizes to the current inject/skill categories. Each sidecar replaces
+the snapshot, including zeroes and removed buckets. Historical requests,
+input measurements, timing calls and billed tokens are unaffected.
+
+System messages retain their actual text, available to the Context browser.
+The tools bucket records a size, not schemas: the browser still says schemas
+were not recorded. No placeholder messages or tool definitions are fabricated
+for bucket sizes. `conversation` and `summarized_conversation` are already in
+the transcript and are not counted again. Every assistant response, including
+a tool-only response, contributes one request with unknown input usage.
 
 ### Polling and phase-1 limits
 

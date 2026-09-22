@@ -20,19 +20,11 @@
 
 import { SETTINGS_DEFAULTS, type HarnessKind, type SearchIndexing } from '@harness-trajectory/core'
 import { extractSearchDocs, type SearchDocDraft } from './extract.ts'
-import type { SearchDoc, SearchFileKey, SearchStore } from './store.ts'
+import type { SearchDoc, SearchFileKey, SearchFileProgress, SearchStore } from './store.ts'
 
 const FLUSH_DELAY_MS = 250
 const MAX_BATCH_DOCS = 8_000
 const DAY_MS = 86_400_000
-
-/** Progress of one file, written with the documents it produced. */
-interface FileProgress {
-  size: number
-  mtimeMs: number
-  indexedBytes: number
-  indexedLines: number
-}
 
 interface PendingDoc extends SearchDoc {
   path: string
@@ -62,7 +54,7 @@ export class SearchIndexer {
   private readonly batch: PendingDoc[] = []
   /** Latest known identity per path; a rebind updates it before the flush uses it. */
   private readonly keys = new Map<string, SearchFileKey>()
-  private readonly progress = new Map<string, FileProgress>()
+  private readonly progress = new Map<string, SearchFileProgress>()
   /** Files whose existing documents must be dropped before this batch lands. */
   private readonly resets = new Set<string>()
   /** Files to remove ENTIRELY — documents and the `files` watermark row. */
@@ -124,7 +116,7 @@ export class SearchIndexer {
    * and the highest indexed line. Lets a lazy source ask whether the store
    * already covers a transcript without materializing it.
    */
-  coverage(path: string): { size: number; mtimeMs: number; indexedBytes: number; indexedLines: number } | undefined {
+  coverage(path: string): SearchFileProgress | undefined {
     const state = this.store.fileState(path)
     if (state === undefined) return undefined
     return {
@@ -132,6 +124,7 @@ export class SearchIndexer {
       mtimeMs: state.mtimeMs,
       indexedBytes: state.indexedBytes,
       indexedLines: state.indexedLines,
+      ...(state.contentVersion === undefined ? {} : { contentVersion: state.contentVersion }),
     }
   }
 
@@ -139,28 +132,42 @@ export class SearchIndexer {
    * Register a file about to be replayed and report the first line index that
    * still needs indexing.
    *
-   * A file is treated as having grown by appending — the only thing any of the
-   * four harnesses does to a live transcript — when it is at least as large and
+   * Without a source version, a file is treated as having grown by appending
+   * when it is at least as large and
    * at least as new as when it was last indexed. Anything else (a shrunken
    * file, a copy restored from an older backup) drops the file's documents and
    * re-indexes from line 0. A rewrite that lands on exactly the same size and a
    * newer mtime is indistinguishable from an append and is not detected here;
    * `SessionIndex` catches the common case, where the offset runs past the end.
+   * Mutable sources supply `versionAt`: only an exact match for the saved
+   * indexed prefix can reuse the watermark, regardless of size or mtime.
    */
-  beginFile(key: SearchFileKey, file: { size: number; mtimeMs: number }): number {
+  beginFile(key: SearchFileKey, file: {
+    size: number
+    mtimeMs: number
+    /** Version of the current source's first n records. Undefined means the prefix is unavailable. */
+    versionAt?: (indexedLines: number) => string | undefined
+  }): number {
     this.keys.set(key.path, key)
     // A queued reset/forget still has the old `files` row — the delete only
     // lands at flush. Resuming from its watermark would leave the prefix
     // unindexed once the pending delete and the new docs commit together.
-    if (this.resets.has(key.path) || this.drops.has(key.path)) return 0
-    const state = this.store.fileState(key.path)
+    const pending = this.progress.get(key.path)
+    if ((this.resets.has(key.path) || this.drops.has(key.path)) && pending === undefined) return 0
+    const saved = this.store.fileState(key.path)
+    // Reattaching before the timer flush must not enqueue an already consumed
+    // prefix twice. A pending checkpoint belongs to the same queued transaction.
+    const state = pending ?? saved
     if (state === undefined) return 0
-    if (state.sessionId !== key.sessionId || state.fileId !== key.fileId) {
+    if (saved !== undefined && (saved.sessionId !== key.sessionId || saved.fileId !== key.fileId)) {
       // Learned only now which session owns this transcript (a subagent that
       // registered before its parent claimed it).
       this.store.rebind(key.path, key.sessionId, key.fileId)
     }
-    if (file.size < state.size || file.mtimeMs < state.mtimeMs) {
+    const changed = file.versionAt === undefined
+      ? file.size < state.size || file.mtimeMs < state.mtimeMs
+      : state.contentVersion === undefined || file.versionAt(state.indexedLines) !== state.contentVersion
+    if (changed) {
       this.reset(key.path)
       return 0
     }
@@ -169,6 +176,7 @@ export class SearchIndexer {
       mtimeMs: Math.max(file.mtimeMs, state.mtimeMs),
       indexedBytes: state.indexedBytes,
       indexedLines: state.indexedLines,
+      ...(state.contentVersion === undefined ? {} : { contentVersion: state.contentVersion }),
     })
     return state.indexedLines
   }
@@ -226,7 +234,7 @@ export class SearchIndexer {
   }
 
   /** Record how far a file has been consumed; written with its documents. */
-  noteProgress(key: SearchFileKey, progress: FileProgress): void {
+  noteProgress(key: SearchFileKey, progress: SearchFileProgress): void {
     this.keys.set(key.path, key)
     this.progress.set(key.path, progress)
     this.schedule()
@@ -270,7 +278,13 @@ export class SearchIndexer {
           const key = this.keys.get(path)
           if (key === undefined) continue
           this.store.insertDocs(key, list)
-          if (progressMap.has(path)) continue
+          const pending = progressMap.get(path)
+          if (pending !== undefined) {
+            // A size-triggered flush can overtake the source's final prefix
+            // checkpoint. Never persist its old fingerprint beside newer docs.
+            if (list.some(doc => doc.line >= pending.indexedLines)) delete pending.contentVersion
+            continue
+          }
           const prev = this.store.fileState(path)
           let maxLine = -1
           for (const doc of list) if (doc.line > maxLine) maxLine = doc.line

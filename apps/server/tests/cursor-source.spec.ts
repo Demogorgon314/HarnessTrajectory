@@ -6,7 +6,7 @@
 import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SessionLiveEvent } from '@harness-trajectory/core'
 import { CursorDb } from '../src/cursor/db.ts'
 import { CursorSource } from '../src/cursor/source.ts'
@@ -31,6 +31,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.restoreAllMocks()
   source?.stop()
   rmSync(dir, { recursive: true, force: true })
 })
@@ -199,6 +200,20 @@ async function replay(id = AGENT): Promise<SessionLiveEvent[]> {
   return events
 }
 
+/** Switch roots without deleting the append-only store's previous blobs. */
+function publishRoot(data: Uint8Array, n: number): void {
+  const dbPath = join(sessionDir(), 'store.db')
+  const db = new CursorDb(dbPath, { readOnly: false })
+  try {
+    const rootId = hex(idBytes(n))
+    db.db.prepare('INSERT INTO blobs (id, data) VALUES (?, ?)').run(rootId, data)
+    db.db.prepare("UPDATE meta SET value = ? WHERE key = '0'").run(JSON.stringify({ latestRootBlobId: rootId }))
+  } finally {
+    db.close()
+  }
+  touch(dbPath)
+}
+
 function streamLines(events: readonly SessionLiveEvent[]): string[] {
   return events.flatMap(event => event.type === 'lines' && event.startLine >= 0 ? [...event.lines] : [])
 }
@@ -215,6 +230,192 @@ async function start(): Promise<CursorSource> {
 }
 
 describe('CursorSource', () => {
+  it('resumes a verified prefix across restarts and extracts only an appended suffix', async () => {
+    const initial = seed()
+    const cachePath = join(dir, 'search.sqlite')
+    let store = new SearchStore({ path: cachePath })
+    const extract = vi.fn(extractSearchDocs)
+    let indexer = new SearchIndexer({ store, maxAgeDays: 0, extract })
+    let src = await start()
+    try {
+      await src.enableSearch(indexer)
+      indexer.finishBackfill(src.livePaths())
+      expect(extract).toHaveBeenCalledTimes(2)
+      for (const append of [false, true]) {
+        src.stop()
+        indexer.stop()
+        store.close()
+        if (append) {
+          const db = new CursorDb(join(sessionDir(), 'store.db'), { readOnly: false })
+          db.db.prepare('INSERT INTO blobs (id, data) VALUES (?, ?)').run(hex(idBytes(3)), jsonBlob({
+            role: 'assistant', content: [{ type: 'text', text: 'Appended answer' }],
+          }))
+          db.close()
+          publishRoot(rootBlob([idBytes(1), idBytes(2), idBytes(3)]), 10)
+        }
+        extract.mockClear()
+        store = new SearchStore({ path: cachePath })
+        indexer = new SearchIndexer({ store, maxAgeDays: 0, extract })
+        src = new CursorSource({ chatsDir: chats, watch: false, search: indexer })
+        source = src
+        await src.start()
+        indexer.finishBackfill(src.livePaths())
+        expect(extract).toHaveBeenCalledTimes(append ? 1 : 0)
+        expect(search(store, { q: 'Fix the parser' }).totalHits).toBe(1)
+        expect(search(store, { q: 'Appended answer' }).totalHits).toBe(append ? 1 : 0)
+        expect(store.fileState('cursor://sessions/' + AGENT)?.indexedLines).toBe(initial.ids.length + Number(append))
+      }
+    } finally {
+      src.disableSearch()
+      indexer.stop()
+      store.close()
+    }
+  })
+
+  it('reads only new message bodies on append and retries an unavailable tail', async () => {
+    seed()
+    const src = await start()
+    const live: SessionLiveEvent[] = []
+    src.subscribe('cursor', AGENT, event => { live.push(event) })
+    const reads = vi.spyOn(CursorDb.prototype, 'readBlob')
+    publishRoot(rootBlob([idBytes(1), idBytes(2), idBytes(3)]), 10)
+    await src.refresh()
+    expect(reads.mock.calls.flat()).not.toContain(hex(idBytes(1)))
+    expect(reads.mock.calls.flat()).not.toContain(hex(idBytes(2)))
+    expect(streamLines(live)).toHaveLength(0)
+    const db = new CursorDb(join(sessionDir(), 'store.db'), { readOnly: false })
+    db.db.prepare('INSERT INTO blobs (id, data) VALUES (?, ?)').run(hex(idBytes(3)), jsonBlob({
+      role: 'assistant', content: [{ type: 'text', text: 'Recovered answer' }],
+    }))
+    db.close()
+    reads.mockClear()
+    await src.refresh()
+    expect(reads.mock.calls.flat()).not.toContain(hex(idBytes(1)))
+    expect(reads.mock.calls.flat()).not.toContain(hex(idBytes(2)))
+    expect(streamLines(live)).toHaveLength(1)
+    expect(streamLines(await replay())).toHaveLength(3)
+  })
+
+  it('detaches search between sessions during backfill and resumes without duplicate hits', async () => {
+    seed()
+    seed({}, 'second-agent')
+    const src = await start()
+    const store = new SearchStore({ path: ':memory:' })
+    const extract = vi.fn(extractSearchDocs)
+    const indexer = new SearchIndexer({ store, maxAgeDays: 0, extract })
+    try {
+      const backfill = src.enableSearch(indexer)
+      src.disableSearch()
+      await backfill
+      expect(extract).toHaveBeenCalledTimes(2)
+      await src.enableSearch(indexer)
+      indexer.finishBackfill(src.livePaths())
+      expect(extract).toHaveBeenCalledTimes(4)
+      expect(search(store, { q: 'Fix the parser' }).totalHits).toBe(2)
+    } finally {
+      src.disableSearch()
+      indexer.stop()
+      store.close()
+    }
+  })
+
+  for (const mode of ['restart', 'toggle'] as const) {
+    it.each([1, 2])(`reindexes a rewritten prefix after ${mode} (new length %i)`, async length => {
+      const store = new SearchStore({ path: join(dir, 'search.sqlite') })
+      let indexer = new SearchIndexer({ store, maxAgeDays: 0 })
+      const human = (text: string) => ({
+        role: 'user', content: [{ type: 'text', text }],
+        providerOptions: { cursor: { requestId: 'req' } },
+      })
+      seed({ ids: [idBytes(1)], messages: [human('old needle')] })
+      let src = await start()
+      try {
+        await src.enableSearch(indexer)
+        indexer.finishBackfill(src.livePaths())
+        expect(search(store, { q: 'old needle' }).totalHits).toBe(1)
+        src.disableSearch()
+        indexer.stop()
+        if (mode === 'restart') src.stop()
+        const ids = [idBytes(3), idBytes(4)].slice(0, length)
+        rewrite(AGENT, hex(idBytes(15)), ids, [human('new needle'), human('another prompt')])
+        indexer = new SearchIndexer({ store, maxAgeDays: 0 })
+        if (mode === 'restart') {
+          src = new CursorSource({ chatsDir: chats, watch: false, search: indexer })
+          source = src
+          await src.start()
+        } else {
+          await src.refresh()
+          await src.enableSearch(indexer)
+        }
+        indexer.finishBackfill(src.livePaths())
+        expect(search(store, { q: 'old needle' }).totalHits).toBe(0)
+        expect(search(store, { q: 'new needle' }).totalHits).toBe(1)
+        expect(streamLines(await replay())).toHaveLength(length)
+        // A normal append after the rebuild must neither duplicate the prefix
+        // nor skip the newly emitted line under the old watermark.
+        rewrite(AGENT, hex(idBytes(16)), [...ids, idBytes(5)], [
+          ...[human('new needle'), human('another prompt')].slice(0, length), human('appended needle'),
+        ])
+        await src.refresh()
+        indexer.flush()
+        expect(search(store, { q: 'new needle' }).totalHits).toBe(1)
+        expect(search(store, { q: 'appended needle' }).totalHits).toBe(1)
+      } finally {
+        src.disableSearch()
+        indexer.stop()
+        store.close()
+      }
+    })
+  }
+
+  it('clears replay, live state, prompt counts and search when a valid root becomes empty', async () => {
+    seed()
+    const store = new SearchStore({ path: ':memory:' })
+    const indexer = new SearchIndexer({ store, maxAgeDays: 0 })
+    const src = await start()
+    try {
+      await src.enableSearch(indexer)
+      indexer.finishBackfill(src.livePaths())
+      expect(search(store, { q: 'Fix the parser' }).totalHits).toBe(1)
+      const seen: SessionLiveEvent[] = []
+      src.subscribe('cursor', AGENT, event => { seen.push(event) })
+      publishRoot(rootBlob([], usageBlob()), 90)
+      await src.refresh()
+      indexer.flush()
+      expect(seen.some(event => event.type === 'file' && event.reset)).toBe(true)
+      expect(streamLines(await replay())).toEqual([])
+      expect(src.list()[0]?.promptCount).toBe(0)
+      expect(search(store, { q: 'Fix the parser' }).totalHits).toBe(0)
+      // Old blobs still exist, but only the current root defines the stream.
+      publishRoot(rootBlob([idBytes(2)], usageBlob()), 91)
+      await src.refresh()
+      indexer.flush()
+      expect(streamLines(await replay())).toHaveLength(1)
+      expect(src.list()[0]?.promptCount).toBe(1)
+      expect(search(store, { q: 'Fix the parser' }).totalHits).toBe(1)
+    } finally {
+      src.disableSearch()
+      indexer.stop()
+      store.close()
+    }
+  })
+
+  it('retains a readable prefix through malformed roots and recovers on the next valid root', async () => {
+    seed()
+    const src = await start()
+    const original = streamLines(await replay())
+    const seen: SessionLiveEvent[] = []
+    src.subscribe('cursor', AGENT, event => { seen.push(event) })
+    publishRoot(Uint8Array.of(0x80), 90)
+    await src.refresh()
+    expect(streamLines(await replay())).toEqual(original)
+    expect(seen.some(event => event.type === 'file' && event.reset)).toBe(false)
+    publishRoot(rootBlob([], usageBlob()), 91)
+    await src.refresh()
+    expect(streamLines(await replay())).toEqual([])
+    expect(seen.some(event => event.type === 'file' && event.reset)).toBe(true)
+  })
+
   it('lists a conversation from meta.json without opening the transcript', async () => {
     seed({ title: 'API Extraction Script' })
     seed({ hasConversation: false, withStore: false }, '22222222-2222-4222-8222-222222222222')
@@ -297,7 +498,7 @@ describe('CursorSource', () => {
         content: [{ type: 'text', text: 'done' }],
       },
     ])
-    src.refresh()
+    await src.refresh()
     expect(seen.some(event => event.type === 'file' && event.reset === true)).toBe(false)
     const appended = seen.flatMap(event => event.type === 'lines' && event.startLine >= 0 ? [...event.lines] : [])
     expect(appended).toHaveLength(1)
@@ -312,7 +513,7 @@ describe('CursorSource', () => {
         providerOptions: { cursor: { requestId: 'req-2' } },
       },
     ])
-    src.refresh()
+    await src.refresh()
     expect(seen.some(event => event.type === 'file' && event.reset === true)).toBe(true)
     const rebuilt = await replay()
     const texts = streamLines(rebuilt).map(line => JSON.parse(line) as { message?: { content?: unknown } })
@@ -324,7 +525,7 @@ describe('CursorSource', () => {
     const src = await start()
     expect(src.list()).toEqual([])
     seed({ title: 'Later' })
-    src.refresh()
+    await src.refresh()
     expect(src.list().map(session => session.id)).toEqual([AGENT])
   })
 
@@ -351,8 +552,8 @@ describe('CursorSource', () => {
     await source.start()
     await expect(replay()).resolves.toEqual(expect.any(Array))
     expect(streamLines(await replay())).toEqual([])
-    source.refresh()
-    source.refresh()
+    await source.refresh()
+    await source.refresh()
     expect(source.list()[0]?.title).toBe('Junk blob')
   })
 
@@ -421,7 +622,7 @@ describe('CursorSource', () => {
     }), 'utf8').toString('hex'))
     db2.close()
     touch(join(sessionDir(), 'store.db'))
-    src.refresh()
+    await src.refresh()
     expect(seen.some(event => event.type === 'file' && event.reset === true)).toBe(false)
     const appended = seen.flatMap(event => event.type === 'lines' && event.startLine >= 0 ? [...event.lines] : [])
     expect(JSON.parse(appended[0] ?? '{}') as { time?: number }).toMatchObject({ time: toolEnd })
@@ -448,7 +649,7 @@ describe('CursorSource', () => {
     )
     db3.close()
     touch(join(sessionDir(), 'store.db'))
-    src.refresh()
+    await src.refresh()
     expect(seen.some(event => event.type === 'file' && event.reset === true)).toBe(true)
     const rebuilt = streamLines(await replay())
     expect(JSON.parse(rebuilt[0] ?? '{}') as { time?: number }).toMatchObject({ time: later })
