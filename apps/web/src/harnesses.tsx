@@ -47,12 +47,10 @@ function inWorkingDirectory(session: ResumeTarget, command: string): string {
 /**
  * Brand marks. The Claude sunburst and Cursor cube paths are from Simple Icons
  * (CC0 1.0; the cube is the mark published at cursor.com/brand). The Codex,
- * Kimi and Grok paths are from lobe-icons (`@lobehub/icons-static-svg`, MIT,
+ * Kimi, Grok, Devin, pi and OpenCode paths are from lobe-icons (`@lobehub/icons-static-svg`, MIT,
  * (c) LobeHub). The marks themselves belong to Anthropic, Anysphere, OpenAI,
- * Moonshot AI, and xAI and identify their harnesses here. The Devin and pi
- * marks are in-house monograms (neither icon set ships them). The OpenCode
- * mark is an in-house monogram too — a terminal-prompt chevron over an
- * underscore, not the project's own logo. The dsh mark is DeepSeek's fish
+ * Moonshot AI, xAI, Cognition, the pi project, and Anomaly and identify their harnesses here.
+ * The dsh mark is DeepSeek's fish
  * logo (`FISH_LOGO_PATH`, deepseek-harness's ui-primitives FishLogo).
  */
 const CLAUDE_PATH ='m4.7144 15.9555 4.7174-2.6471.079-.2307-.079-.1275h-.2307l-.7893-.0486-2.6956-.0729-2.3375-.0971-2.2646-.1214-.5707-.1215-.5343-.7042.0546-.3522.4797-.3218.686.0608 1.5179.1032 2.2767.1578 1.6514.0972 2.4468.255h.3886l.0546-.1579-.1336-.0971-.1032-.0972L6.973 9.8356l-2.55-1.6879-1.3356-.9714-.7225-.4918-.3643-.4614-.1578-1.0078.6557-.7225.8803.0607.2246.0607.8925.686 1.9064 1.4754 2.4893 1.8336.3643.3035.1457-.1032.0182-.0728-.164-.2733-1.3539-2.4467-1.445-2.4893-.6435-1.032-.17-.6194c-.0607-.255-.1032-.4674-.1032-.7285L6.287.1335 6.6997 0l.9957.1336.419.3642.6192 1.4147 1.0018 2.2282 1.5543 3.0296.4553.8985.2429.8318.091.255h.1579v-.1457l.1275-1.706.2368-2.0947.2307-2.6957.0789-.7589.3764-.9107.7468-.4918.5828.2793.4797.686-.0668.4433-.2853 1.8517-.5586 2.9021-.3643 1.9429h.2125l.2429-.2429.9835-1.3053 1.6514-2.0643.7286-.8196.85-.9046.5464-.4311h1.0321l.759 1.1293-.34 1.1657-1.0625 1.3478-.8804 1.1414-1.2628 1.7-.7893 1.36.0729.1093.1882-.0183 2.8535-.607 1.5421-.2794 1.8396-.3157.8318.3886.091.3946-.3278.8075-1.967.4857-2.3072.4614-3.4364.8136-.0425.0304.0486.0607 1.5482.1457.6618.0364h1.621l3.0175.2247.7892.522.4736.6376-.079.4857-1.2142.6193-1.6393-.3886-3.825-.9107-1.3113-.3279h-.1822v.1093l1.0929 1.0686 2.0035 1.8092 2.5075 2.3314.1275.5768-.3218.4554-.34-.0486-2.2039-1.6575-.85-.7468-1.9246-1.621h-.1275v.17l.4432.6496 2.3436 3.5214.1214 1.0807-.17.3521-.6071.2125-.6679-.1214-1.3721-1.9246L14.38 17.959l-1.1414-1.9428-.1397.079-.674 7.2552-.3156.3703-.7286.2793-.6071-.4614-.3218-.7468.3218-1.4753.3886-1.9246.3157-1.53.2853-1.9004.17-.6314-.0121-.0425-.1397.0182-1.4328 1.9672-2.1796 2.9446-1.7243 1.8456-.4128.164-.7164-.3704.0667-.6618.4008-.5889 2.386-3.0357 1.4389-1.882.929-1.0868-.0062-.1579h-.0546l-6.3385 4.1164-1.1293.1457-.4857-.4554.0608-.7467.2307-.2429 1.9064-1.3114Z'
@@ -118,23 +116,23 @@ export function GrokLogo({ size = 16, className, style }: HarnessLogoProps) {
   )
 }
 
-/** Devin mark: an in-house monogram — a "D" of nested chevrons, drawn in `currentColor`. */
+/** Devin mark from lobe-icons (`icons/devin.svg`), drawn in `currentColor`. */
 export function DevinLogo({ size = 16, className, style }: HarnessLogoProps) {
   return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" className={className} style={style} aria-hidden="true">
-      <path d="M6 4h5.5a8 8 0 010 16H6V4zm4.2 3.6H9.4v8.8h.8a4.4 4.4 0 000-8.8z" fill="currentColor" />
-      <path d="M16.6 8.4 21 12l-4.4 3.6v-2.2l2-1.4-2-1.4V8.4z" fill="currentColor" opacity=".55" />
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" fillRule="evenodd" className={className} style={style} aria-hidden="true">
+      <path d="M2.033 9.867l2.554 1.483a.589.589 0 00.592 0l2.554-1.483.01-.008a.608.608 0 00.11-.084l.013-.015a.631.631 0 00.076-.1c.003-.005.008-.01.01-.016a.558.558 0 00.052-.125l.007-.028a.611.611 0 00.019-.14V7.868c0-.572.307-1.105.8-1.392a1.595 1.595 0 011.598 0l1.277.742a.54.54 0 00.129.053l.028.01c.044.01.088.015.133.016h.006l.013-.002a.587.587 0 00.27-.074l.011-.004 2.554-1.483a.596.596 0 00.297-.516V2.253a.595.595 0 00-.297-.516L12.293.257a.587.587 0 00-.591 0L9.148 1.737l-.01.01a.609.609 0 00-.109.083l-.014.015a.632.632 0 00-.076.1c-.003.005-.008.01-.01.016a.57.57 0 00-.052.124l-.007.028a.612.612 0 00-.018.14v1.483c0 .572-.307 1.105-.8 1.393a1.597 1.597 0 01-1.599 0l-1.276-.742a.603.603 0 00-.13-.053l-.028-.008a.658.658 0 00-.133-.018h-.02a.57.57 0 00-.269.074c-.003.002-.008.002-.012.005L2.033 5.872a.596.596 0 00-.297.515v2.966c0 .213.113.41.297.515z" />
+      <path d="M15.943 10.607a1.596 1.596 0 011.599 0l1.276.74c.041.025.085.04.13.055l.028.008c.043.01.088.016.133.018h.005c.005 0 .01-.002.014-.003a.474.474 0 00.122-.016l.021-.005a.616.616 0 00.126-.052c.004-.002.009-.002.013-.005l2.554-1.482a.597.597 0 00.297-.516V6.383a.596.596 0 00-.297-.515l-2.552-1.483a.587.587 0 00-.592 0l-2.553 1.482-.011.008a.61.61 0 00-.108.084l-.014.016a.637.637 0 00-.076.1c-.003.005-.008.01-.01.016a.57.57 0 00-.052.124l-.007.029a.612.612 0 00-.018.14v1.482c0 .572-.307 1.105-.8 1.393a1.597 1.597 0 01-1.599 0l-1.276-.742a.584.584 0 00-.13-.053l-.028-.008a.62.62 0 00-.133-.018h-.02a.587.587 0 00-.269.074l-.012.004L9.15 10a.596.596 0 00-.296.516v2.966c0 .212.112.409.296.515l2.554 1.483s.008.002.012.005c.04.022.082.04.126.052l.02.004a.57.57 0 00.123.017l.014.002h.006c.054 0 .108-.01.16-.025a.587.587 0 00.13-.054l1.277-.741a1.597 1.597 0 012.398 1.392v1.482c0 .049.007.095.019.14l.007.028a.619.619 0 00.051.125c.004.006.008.01.01.016a.6.6 0 00.076.1l.014.015c.033.032.069.06.108.084.004.002.006.006.011.008l2.554 1.483a.59.59 0 00.593 0l2.554-1.483a.597.597 0 00.296-.516v-2.965a.595.595 0 00-.296-.516l-2.554-1.483s-.008-.002-.012-.005a.54.54 0 00-.126-.051c-.007-.003-.013-.003-.02-.005a.635.635 0 00-.125-.017h-.018a.557.557 0 00-.16.026.588.588 0 00-.13.053l-1.276.742a1.595 1.595 0 01-1.598 0 1.615 1.615 0 010-2.785l-.005-.001z" />
+      <path d="M14.848 18.265l-2.554-1.482-.012-.005a.526.526 0 00-.126-.052c-.007-.002-.014-.002-.02-.005a.64.64 0 00-.124-.017h-.02a.56.56 0 00-.16.026.588.588 0 00-.13.053l-1.276.742a1.594 1.594 0 01-1.598 0c-.493-.286-.8-.82-.8-1.393V14.65a.563.563 0 00-.018-.14l-.008-.028a.604.604 0 00-.051-.124l-.01-.017a.603.603 0 00-.076-.1l-.014-.015a.596.596 0 00-.109-.084c-.003-.002-.005-.006-.01-.008L5.178 12.65a.587.587 0 00-.591 0l-2.554 1.483a.596.596 0 00-.297.516v2.965c0 .213.113.41.297.516l2.554 1.483.012.004a.618.618 0 00.267.074l.016.002h.007a.55.55 0 00.16-.026.584.584 0 00.129-.053l1.277-.742a1.597 1.597 0 012.398 1.393v1.482c0 .05.007.095.019.14l.007.028c.013.044.03.085.051.125l.01.016c.022.036.047.07.076.1l.014.015c.032.032.069.06.109.084l.01.008 2.554 1.483a.587.587 0 00.593 0l2.554-1.483a.596.596 0 00.296-.515v-2.966a.596.596 0 00-.296-.516h-.002z" />
     </svg>
   )
 }
 
-/** pi mark: an in-house monogram — a "π" glyph, drawn in `currentColor`. */
+/** pi mark from lobe-icons (`icons/pi.svg`), drawn in `currentColor`. */
 export function PiLogo({ size = 16, className, style }: HarnessLogoProps) {
   return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" className={className} style={style} aria-hidden="true">
-      <path d="M4 6h16v2.6H4z" fill="currentColor" />
-      <path d="M8.6 8.6v9c0 1-.8 1.9-1.9 1.9H4.5v-2.6h1.7V8.6h2.4z" fill="currentColor" />
-      <path d="M15.4 8.6c0 3.6-1.1 7.2-2.7 10.9h3c1.2-2.9 1.9-6.5 1.9-10.9h-2.2z" fill="currentColor" />
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" fillRule="evenodd" className={className} style={style} aria-hidden="true">
+      <path clipRule="evenodd" d="M1 1h16.5v11H12v5.5H6.5V23H1V1zm5.5 5.5V12H12V6.5H6.5z" />
+      <path d="M17.5 12H23v11h-5.5V12z" />
     </svg>
   )
 }
@@ -154,12 +152,11 @@ export function CursorLogo({ size = 16, className, style }: HarnessLogoProps) {
   )
 }
 
-/** OpenCode mark: an in-house monogram — a prompt chevron over an underscore, drawn in `currentColor`. */
+/** OpenCode mark from lobe-icons (`icons/opencode.svg`), drawn in `currentColor`. */
 export function OpencodeLogo({ size = 16, className, style }: HarnessLogoProps) {
   return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" className={className} style={style} aria-hidden="true">
-      <path d="M4 5.5 11.5 12 4 18.5v-3.3L8 12 4 8.8V5.5z" fill="currentColor" />
-      <path d="M13 16.5h7V19h-7v-2.5z" fill="currentColor" opacity=".7" />
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" fillRule="evenodd" className={className} style={style} aria-hidden="true">
+      <path d="M16 6H8v12h8V6zm4 16H4V2h16v20z" />
     </svg>
   )
 }
