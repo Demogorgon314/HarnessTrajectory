@@ -29,6 +29,35 @@ function feed(lines: readonly string[]): InputEvent[] {
 }
 
 describe('cursor synthesizer', () => {
+  it('archives compressed context and restores kept copies without recounting requests or system prompts', () => {
+    const session = new ContextSession('cursor')
+    const human = (text: string, requestId: string) => ({
+      role: 'user', content: [{ type: 'text', text }], providerOptions: { cursor: { requestId } },
+    })
+    const answer = { role: 'assistant', content: [{ type: 'text', text: 'Kept answer' }] }
+    const messages = [
+      { role: 'system', content: 'Old system' }, human('Removed prompt', 'r1'),
+      human('Kept prompt', 'r2'), answer,
+      { role: 'user', content: 'Short summary', providerOptions: { cursor: { isSummary: true } } },
+      { role: 'system', content: 'New system' }, human('Kept prompt', 'r2'), answer,
+    ]
+    for (const [index, message] of messages.entries()) {
+      session.push(line({ type: 'cursor.message', blobId: String(index), index, time: T0 + index, message, ...(index >= 6 ? { replay: true } : {}) }), FILE)
+    }
+    const state = session.timelineOf(FILE.id)
+    expect(state?.requests).toHaveLength(1)
+    expect(state?.requestInput).toMatchObject({ calls: 1 })
+    expect(state?.cost).toBeUndefined()
+    expect(state?.nodes.map(node => node.text)).toEqual(['Short summary', 'Kept prompt', 'Kept answer'])
+    expect(state?.archive.map(node => node.text)).toContain('Removed prompt')
+    expect(state?.systems).toHaveLength(1)
+    const system = state?.systems?.[0]
+    expect(system).toBeDefined()
+    if (system !== undefined) {
+      expect(session.contentOf(FILE.id, system.seq)).toEqual([{ type: 'text', text: 'New system' }])
+    }
+  })
+
   const callId = 'call-1\nfc_1'
 
   function transcript(): string[] {

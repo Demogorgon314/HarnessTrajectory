@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SessionLiveEvent } from '@harness-trajectory/core'
 import { CursorDb } from '../src/cursor/db.ts'
 import { CursorSource } from '../src/cursor/source.ts'
+import { createMetaScanner } from '../src/meta.ts'
 import { extractSearchDocs } from '../src/search/extract.ts'
 import { SearchIndexer } from '../src/search/indexer.ts'
 import { search } from '../src/search/query.ts'
@@ -218,6 +219,60 @@ function streamLines(events: readonly SessionLiveEvent[]): string[] {
   return events.flatMap(event => event.type === 'lines' && event.startLine >= 0 ? [...event.lines] : [])
 }
 
+/** Two historical turns and two compactions, all on a verifiable item lineage. */
+function seedCompactionHistory(): void {
+  const human = (text: string, requestId: string) => ({
+    role: 'user', content: [{ type: 'text', text }], providerOptions: { cursor: { requestId } },
+  })
+  const assistant = (text: string) => ({ role: 'assistant', content: [{ type: 'text', text }] })
+  const summary = (text: string) => ({
+    role: 'user', content: text, providerOptions: { cursor: { isSummary: true } },
+  })
+  const refs = (ids: number[]) => concat(...ids.map(id => bytesField(8, idBytes(id))))
+  seed({
+    ids: [1, 2, 3, 4, 5].map(idBytes),
+    messages: [
+      { role: 'system', content: 'Original system' }, human('Historic needle', 'r1'),
+      assistant('Old answer'), human('Kept needle', 'r2'), assistant('Kept answer'),
+    ],
+    rootExtra: refs([60, 61]),
+  })
+  const db = new CursorDb(join(sessionDir(), 'store.db'), { readOnly: false })
+  try {
+    const put = (id: number, data: Uint8Array) => db.db.prepare('INSERT INTO blobs (id, data) VALUES (?, ?)').run(hex(idBytes(id)), data)
+    const messages = new Map<number, Record<string, unknown>>([
+      [6, { role: 'system', content: 'New system' }], [7, summary('First summary')],
+      [8, human('Next needle', 'r3')], [10, assistant('Next answer')],
+      [11, { role: 'system', content: 'Latest system' }], [12, summary('Second summary')],
+      [13, human('Final needle', 'r4')], [14, assistant('Final answer')],
+      [15, assistant('Abandoned branch needle')],
+    ])
+    for (const [id, value] of messages) put(id, jsonBlob(value))
+    for (let i = 0; i < 4; i += 1) {
+      put(50 + i, concat(strField(1, 'Synthetic prompt'), varField(25, T + i * 1000)))
+      put(55 + i, bytesField(1, concat(strField(1, 'Synthetic answer'), varField(2, T + i * 1000 + 100), varField(3, T + i * 1000 + 200))))
+      put(60 + i, bytesField(1, concat(bytesField(1, idBytes(50 + i)), bytesField(2, idBytes(55 + i)), strField(3, 'r' + (i + 1)))))
+    }
+    put(59, bytesField(1, concat(strField(1, 'Abandoned answer'), varField(2, T + 1100))))
+    put(64, bytesField(1, concat(bytesField(1, idBytes(51)), bytesField(2, idBytes(59)), strField(3, 'r2'))))
+    put(68, rootBlob([1, 2, 3, 4, 15].map(idBytes), refs([60, 64])))
+    put(69, rootBlob([6, 7, 4, 5].map(idBytes), refs([60, 61])))
+    put(70, rootBlob([6, 7, 4, 5, 8, 10].map(idBytes), refs([60, 61, 62])))
+    put(71, rootBlob([11, 12, 8, 10].map(idBytes), refs([60, 61, 62])))
+    put(72, rootBlob([11, 12, 8, 10, 13, 14].map(idBytes), refs([60, 61, 62, 63])))
+  } finally {
+    db.close()
+  }
+}
+
+function selectRoot(id: number): void {
+  const path = join(sessionDir(), 'store.db')
+  const db = new CursorDb(path, { readOnly: false })
+  db.db.prepare("UPDATE meta SET value = ? WHERE key = '0'").run(JSON.stringify({ latestRootBlobId: hex(idBytes(id)) }))
+  db.close()
+  touch(path)
+}
+
 function sidecarLines(events: readonly SessionLiveEvent[]): string[] {
   return events.flatMap(event => event.type === 'lines' && event.startLine === -1 ? [...event.lines] : [])
 }
@@ -230,6 +285,82 @@ async function start(): Promise<CursorSource> {
 }
 
 describe('CursorSource', () => {
+  it('does not guess a predecessor when roots at the same turn frontier disagree', async () => {
+    seedCompactionHistory()
+    const db = new CursorDb(join(sessionDir(), 'store.db'), { readOnly: false })
+    db.db.prepare('INSERT INTO blobs (id, data) VALUES (?, ?)').run(hex(idBytes(67)),
+      rootBlob([1, 2, 3, 4, 15].map(idBytes), concat(bytesField(8, idBytes(60)), bytesField(8, idBytes(61)))))
+    db.close()
+    selectRoot(70)
+    await start()
+    const records = streamLines(await replay()).map(line => JSON.parse(line) as { blobId: string })
+    expect(records).toHaveLength(6)
+    expect(records.map(record => record.blobId)).not.toContain(hex(idBytes(15)))
+    expect(records.map(record => record.blobId)).not.toContain(hex(idBytes(2)))
+  })
+
+  it('lists the last recorded model and ignores an older kept copy', () => {
+    const scanner = createMetaScanner('cursor', { model: 'catalog-model' })
+    const assistant = (model: string, replay = false) => JSON.stringify({
+      type: 'cursor.message', index: 0, blobId: model, replay,
+      message: { role: 'assistant', content: [
+        { type: 'reasoning', text: '', providerOptions: { cursor: { modelName: model } } },
+      ] },
+    })
+    scanner.push(assistant('first-model'))
+    scanner.push(assistant('latest-model'))
+    scanner.push(assistant('first-model', true))
+    expect(scanner.state.model).toBe('latest-model')
+  })
+
+  it('retains history through repeated compaction, cold restart and rewind without indexing kept copies twice', async () => {
+    seedCompactionHistory()
+    const store = new SearchStore({ path: ':memory:' })
+    const indexer = new SearchIndexer({ store, maxAgeDays: 0 })
+    let src = await start()
+    const live: SessionLiveEvent[] = []
+    try {
+      await src.enableSearch(indexer)
+      src.subscribe('cursor', AGENT, event => { live.push(event) })
+      const original = streamLines(await replay())
+      expect(original).toHaveLength(5)
+      for (const rootId of [70, 72]) {
+        selectRoot(rootId)
+        await src.refresh()
+        indexer.flush()
+        expect(live.some(event => event.type === 'file' && event.reset)).toBe(false)
+        expect(search(store, { q: 'Historic needle' }).totalHits).toBe(1)
+        expect(search(store, { q: 'Kept needle' }).totalHits).toBe(1)
+        expect(search(store, { q: 'Abandoned branch needle' }).totalHits).toBe(0)
+      }
+      const warm = streamLines(await replay()).map(line => JSON.parse(line) as { blobId: string; replay?: boolean })
+      expect(warm).toHaveLength(17)
+      expect(warm.filter(record => record.replay)).toHaveLength(4)
+      expect(src.list()[0]?.promptCount).toBe(4)
+      src.disableSearch()
+      src.stop()
+      src = await start()
+      await src.enableSearch(indexer)
+      indexer.flush()
+      const cold = streamLines(await replay()).map(line => JSON.parse(line) as { blobId: string; replay?: boolean })
+      expect(cold.map(record => [record.blobId, record.replay])).toEqual(warm.map(record => [record.blobId, record.replay]))
+      expect(src.list()[0]?.promptCount).toBe(4)
+      expect(search(store, { q: 'Historic needle' }).totalHits).toBe(1)
+      // Rewind to the original branch: later summaries and abandoned branches
+      // must not leak in merely because their blobs still exist.
+      selectRoot(9)
+      await src.refresh()
+      indexer.flush()
+      expect(streamLines(await replay())).toHaveLength(5)
+      expect(src.list()[0]?.promptCount).toBe(2)
+      expect(search(store, { q: 'Final needle' }).totalHits).toBe(0)
+    } finally {
+      src.disableSearch()
+      indexer.stop()
+      store.close()
+    }
+  })
+
   it('resumes a verified prefix across restarts and extracts only an appended suffix', async () => {
     const initial = seed()
     const cachePath = join(dir, 'search.sqlite')

@@ -814,6 +814,10 @@ throws. Two blob families:
      (a steer sent mid-turn).
    - `{"role":"user","content":"…","providerOptions":null}` (string content, no
      requestId) — other injected text (interrupt notices, reminders).
+   - `{"role":"user","content":"…","providerOptions":{"cursor":{"isSummary":true}}}`
+     — a compaction summary. Classify by this flag, never by the observed
+     `[Previous conversation summary]:` text prefix. Cursor provider metadata
+     may also carry `systemPromptFingerprint`; it is not a history-order key.
    - `{"role":"assistant","id":"msg_…","content":[parts…],"providerOptions":{"cursor":{"modelProviderMessageId":…}}}`
      with parts `{"type":"reasoning","text":"…"|"","signature":…,"providerOptions":{"cursor":{"modelName":"grok-4.7-high"}}}`,
      `{"type":"text","text":"…"}`, `{"type":"tool-call","toolCallId":"call-…\nfc_…","toolName":"Shell","args":{…}}`.
@@ -840,7 +844,7 @@ throws. Two blob families:
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| 1 (repeated) | bytes(32) | Ordered list of **model-message blob ids** — the whole conversation as sent to the model. This is the transcript. |
+| 1 (repeated) | bytes(32) | Ordered list of **model-message blob ids** — the current context sent to the model, not necessarily the complete historical trajectory. |
 | 5 | message | Context usage snapshot: `1` = used tokens, `2` = context window, `3` = breakdown message whose repeated field `3` is `{1: key, 2: label, 3: tokens, 4: chars}` for `system_prompt`, `tools`, `rules`, `skills`, `mcp`, `subagents`, `summarized_conversation`, `conversation`. A token count may be absent (treat as 0). A bucket message can itself be 32 bytes; it is still a message, not a blob id. |
 | 8 (repeated) | bytes(32) | One chain node per UI turn, in turn order. A chain node is `{1: turn}`. |
 | 9 | string | Workspace URI `file:///…`. |
@@ -855,15 +859,25 @@ Every write produces a **new root** (old roots stay in `blobs`);
 `meta.latestRootBlobId` is the only pointer to "now". Field 1 of a newer root is
 normally the previous list plus appended ids. It **shrinks or rewrites** when
 Cursor summarizes the conversation (`summarized_conversation` bucket > 0) or the
-user rewinds — any non-prefix change is a full rebuild (`file reset` plus a new
-meta scanner, so prompts are not double-counted, and `search.reset`).
+user rewinds. A structural `isSummary` message opens a context epoch. The reader
+recovers predecessor epochs from binary root candidates whose prompt ids match
+the current turn lineage and whose item references are ordered prefixes.
+The earliest turn/item frontier carrying a summary bounds its predecessor;
+at that frontier, a candidate must contain every alternative message sequence
+in order. SQLite row order, blob hashes and message counts are not chronology.
+Incomparable candidates, missing lineage or multiple summary markers are
+ambiguous: replay the recoverable suffix rather than inventing ancestry.
+The same reconstruction is used on cold start and live updates. A normal
+compaction extends the historical stream while replacing the live context.
+Rewind and other non-prefix changes to the reconstructed stream still reset
+SSE, listing and search; abandoned branches are not merged into the current one.
 A valid root with no field-1 entries clears the transcript and search as well.
 Malformed roots are distinguished from empty conversations: keep the last
 readable prefix and retry instead of treating decode failure as a deletion.
 
 Search stores a SHA-256 fingerprint of the ordered message ids in the indexed
 prefix alongside its watermark. Discovery and search re-enablement verify that
-prefix against the current root: an unchanged prefix resumes at the watermark;
+prefix against the reconstructed stream: an unchanged prefix resumes at the watermark;
 a missing or mismatched fingerprint rebuilds the session. Counts and mtimes
 alone cannot establish continuity. The search cache schema is bumped to v9;
 the old cache is disposable and rebuilds once. An interrupted batch without a
@@ -875,7 +889,7 @@ or non-JSON blob stops the emission at that id so the emitted list stays a
 prefix and the next tick retries the tail. After three failures the session
 stays catalog-only until the store stamp changes.
 
-**Turn chain** (timestamps only; content still comes from the model messages).
+**Turn chain** (timestamps and history lineage; content comes from model messages).
 Each field-8 ref is a chain node `{1: turn}`. `turn` is `{1: ref(userPrompt),
 2: repeated ref(item) in UI order, 3: requestId (the human message's
 providerOptions.cursor.requestId), 5: int, 9: repeated tool-name strings, 10: string}`.
@@ -905,10 +919,13 @@ subscribe, replay, or search registration.
 
 The reader prepares a change before the source publishes it. Each published
 record owns its blob id, pinned clock/span and compact timing facts, so replay
-and append share one record order. Appends read only new message bodies;
+and append share one record order. Normal appends reuse published timing facts;
 decoded immutable turn/prompt/item timing nodes are cached with a 2,048-entry
 limit per node type and evicted with their read-only connection (16 stores).
 Missing nodes are never cached. Message text is not retained in these caches.
+History discovery scans binary blobs when encountering a new summary epoch;
+the chosen ancestors are reused while the summary and turn lineage remain
+compatible. Classification and lineage caches retain compact facts only.
 Watch events are coalesced for 50 ms and refresh known sessions directly;
 unknown paths and polling trigger catalog discovery. Discovery and search
 backfill yield between sessions; decoding a single session is still synchronous.
@@ -918,9 +935,14 @@ message text and tool-result text for all consumers.
 Server-synthesized JSON lines, epoch-ms `time`:
 
 - `cursor.message` — stream line (0-based index = search `line`):
-  `{"type":"cursor.message","index":n,"blobId":"…","time":ms,"message":<ModelMessage verbatim>,"span"?}`.
-  One per root field-1 entry, in root order, including `system` and injected
-  `user` messages. When the turn chain has any timestamp, `time` is: system and
+  `{"type":"cursor.message","index":n,"blobId":"…","time":ms,"message":<ModelMessage verbatim>,"span"?,"replay"?}`.
+  Each recovered epoch starts with its summary boundary, followed by its other
+  field-1 entries in root order, including system and injected user messages.
+  A blob already present in an older epoch carries `replay:true`: Context
+  restores that kept copy onto the live surface without booking another request;
+  Trajectory, listing counts and search skip it. Equal blobs within the same
+  epoch remain distinct occurrences. When the turn chain has any timestamp,
+  `time` is: system and
   injected user → session `createdAt`; human → that turn's prompt field 25
   (a second consecutive human with the same `requestId` takes the next item's
   start when that start is at least the prompt time); assistant → the minimum
@@ -942,12 +964,15 @@ Server-synthesized JSON lines, epoch-ms `time`:
   else the store's `name`.
 
 `cursorUserClass` is structural and shared by the adapter, the meta scanner, and
-search: `role === 'user'` with `Array.isArray(content)` and a string
+search: `role === 'user'` with `providerOptions.cursor.isSummary === true`
+is `summary`; otherwise `Array.isArray(content)` and a string
 `providerOptions.cursor.requestId` is `human`; any other `user` is `injection`;
 `role === 'system'` is `system`. The trajectory adapter keeps the system prompt
 on `systemPrompts` and renders injections as context notices. The context
 synthesizer emits `system/message`, injected `user/message`, and a human
-`user/message`. There is no per-step token usage. The root's current `used` /
+`user/message`. A summary emits a compaction boundary that archives the old
+Context surface; a new system prompt replaces the old system envelope.
+There is no per-step token usage. The root's current `used` /
 `window` and envelope buckets travel through synthesizer metadata as
 `contextUsage`. `ContextSession` applies those figures only to the current
 view, outside the vendored fold. The headline uses `used`; system/tools replace

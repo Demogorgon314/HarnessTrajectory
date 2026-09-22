@@ -2,7 +2,7 @@
 
 import { asArray, asNumber, asString, isRecord, parseJsonLine } from '../jsonl.ts'
 
-export type CursorUserClass = 'human' | 'injection' | 'system'
+export type CursorUserClass = 'human' | 'injection' | 'system' | 'summary'
 
 export interface CursorUsageBucket {
   key: string
@@ -46,6 +46,8 @@ export type CursorRecord =
     blobId: string
     message: Record<string, unknown>
     span?: CursorStepSpan
+    /** A kept copy in a later context epoch; not a new historical occurrence. */
+    replay?: boolean
   }
 
 function spanOf(value: unknown): CursorStepSpan | undefined {
@@ -96,6 +98,7 @@ export function cursorUserClass(message: unknown): CursorUserClass | null {
   const role = asString(message['role'])
   if (role === 'system') return 'system'
   if (role !== 'user') return null
+  if (cursorProviderOptions(message)?.['isSummary'] === true) return 'summary'
   const requestId = asString(cursorProviderOptions(message)?.['requestId'])
   if (Array.isArray(message['content']) && requestId !== undefined) return 'human'
   return 'injection'
@@ -185,6 +188,7 @@ export function parseCursorLine(line: string): CursorRecord | null {
         blobId: asString(value['blobId']) ?? '',
         message,
         ...(span === undefined ? {} : { span }),
+        ...(value['replay'] === true ? { replay: true } : {}),
       }
     }
     return null

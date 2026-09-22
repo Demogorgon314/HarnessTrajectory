@@ -103,6 +103,17 @@ export class CursorDb {
     }
   }
 
+  /** Binary candidates only. Callers must validate the root and its turn lineage. */
+  *binaryBlobs(): Generator<Uint8Array> {
+    try {
+      for (const row of this.db.prepare("SELECT data FROM blobs WHERE substr(data, 1, 1) != x'7b'").iterate()) {
+        if (row['data'] instanceof Uint8Array) yield row['data']
+      }
+    } catch {
+      // A partial/corrupt store must not prevent replay of the current root.
+    }
+  }
+
   close(): void {
     this.db.close()
   }

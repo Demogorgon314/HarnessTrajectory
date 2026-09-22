@@ -19,8 +19,9 @@
  *   `cursorHumanText` strips it for display only.
  * - Human vs injected is structural (`cursorUserClass`): `role === 'user'`
  *   with array `content` and a string `providerOptions.cursor.requestId` is
- *   a human turn. Any other user message is injected (environment, interrupt,
- *   reminder). `role === 'system'` is the system prompt. Never match on text.
+ *   a human turn, unless `providerOptions.cursor.isSummary` marks a compaction.
+ *   Other user messages are injected (environment, interrupt, reminder).
+ *   `role === 'system'` is the system prompt. Never match on text.
  * - `toolCallId` contains a raw newline (`call-…\nfc_…`). It is an opaque id;
  *   never split it.
  * - `reasoning.text` is empty for Grok (signature only) and populated for
@@ -30,8 +31,9 @@
  * - A tool result prefers the `result` string, then `experimental_content`
  *   text, then JSON. `isError` is
  *   `providerOptions.cursor.highLevelToolCallResult.isError`.
- * - Root field 1 can shrink or rewrite (summary, rewind). The server emits
- *   `file reset` and this parser is recreated; it does not rewind itself.
+ * - Summaries become compaction rows. Kept `replay:true` copies belong only
+ *   to Context, not another historical occurrence. A rewind can still reset
+ *   the stream and recreate this parser.
  */
 
 import type {
@@ -73,7 +75,7 @@ class CursorParser implements SessionParser {
       const time = record.time ?? this.lastTime
       if (record.time !== null) this.lastTime = record.time
       if (record.tag === 'session') this.onSession(record.session, time)
-      else this.onMessage(record.message, time, record.span)
+      else if (!record.replay) this.onMessage(record.message, time, record.span)
     } catch {
       // A malformed record is skipped; the fold stays intact.
     }
@@ -120,6 +122,7 @@ class CursorParser implements SessionParser {
     if (role === 'system' || role === 'user') {
       const classified = cursorUserClass(message)
       if (classified === 'system') this.onSystem(message, time)
+      else if (classified === 'summary') this.onSummary(message, time)
       else if (classified === 'human') this.onHuman(message, time)
       else this.onInjection(message, time)
       return
@@ -158,6 +161,22 @@ class CursorParser implements SessionParser {
     }
     this.assembler.pushNode(node)
     if (this.turn > 0) this.locate(seq, this.turn)
+  }
+
+  private onSummary(message: Record<string, unknown>, time: number): void {
+    const text = cursorMessageText(message)
+    const summary = text.trim() === '' ? null : text
+    const seq = this.assembler.seq.next()
+    this.assembler.pushNode({
+      kind: 'compaction', seq, time, summary,
+      summaryEventSeq: summary === null ? null : seq,
+      shadowedItemCount: null, shadowedTokenCount: null,
+    })
+    this.assembler.upsertRequest({
+      purpose: 'compaction', turn: this.turn > 0 ? this.turn : null, step: 0,
+      startSeq: seq, startedAt: time, completedAt: time, status: 'complete', resultSeq: seq,
+      ...(summary === null ? {} : { summary: [{ type: 'text', text: summary }] }),
+    })
   }
 
   private onHuman(message: Record<string, unknown>, time: number): void {

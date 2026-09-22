@@ -55,6 +55,9 @@ class CursorSynthesizer implements EventSynthesizer {
   private model: string | undefined
   private contextWindow: number | undefined
   private usage: ContextUsage | undefined
+  private liveSeqs: number[] = []
+  private replay = false
+  private systemSeq: number | undefined
   private label: string | undefined
   private headerModel: string | undefined
   private readonly children = new Map<string, AgentSpawn>()
@@ -68,7 +71,10 @@ class CursorSynthesizer implements EventSynthesizer {
       if (record === null) return out
       const time = this.timeOf(record.time)
       if (record.tag === 'session') this.onSession(record.session, time, out)
-      else this.onMessage(record.message, time, record.span, out)
+      else {
+        this.replay = record.replay === true
+        this.onMessage(record.message, time, record.span, out)
+      }
     } catch {
       return []
     }
@@ -99,6 +105,10 @@ class CursorSynthesizer implements EventSynthesizer {
     this.seq += 1
     const event: InputEvent = { type, seq: this.seq, time, ...(data === undefined ? {} : { data }) }
     out.push(event)
+    if (type === 'user/message' || type === 'assistant/message' || type === 'tool/result') {
+      this.liveSeqs.push(event.seq)
+      if (this.replay) event.data = { ...event.data, replay: true }
+    }
     return event
   }
 
@@ -136,13 +146,18 @@ class CursorSynthesizer implements EventSynthesizer {
     if (role === 'system') {
       const text = cursorMessageText(message)
       if (text !== '') {
-        this.emit(out, 'system/message', time, { message: { content: [{ type: 'text', text }] } })
+        const event = this.emit(out, 'system/message', time, { message: { content: [{ type: 'text', text }] } })
+        if (this.systemSeq !== undefined) {
+          event.surfaceOp = { op: 'replace', startSeq: this.systemSeq, endSeq: this.systemSeq }
+        }
+        this.systemSeq = event.seq
       }
       return
     }
     if (role === 'user') {
       const classified = cursorUserClass(message)
-      if (classified === 'human') this.onHuman(message, time, out)
+      if (classified === 'summary') this.onSummary(message, time, out)
+      else if (classified === 'human') this.onHuman(message, time, out)
       else this.onInjection(message, time, out)
       return
     }
@@ -151,13 +166,32 @@ class CursorSynthesizer implements EventSynthesizer {
   }
 
   private onHuman(message: Record<string, unknown>, time: number, out: InputEvent[]): void {
-    this.turn += 1
-    this.step = 0
+    if (!this.replay) {
+      this.turn += 1
+      this.step = 0
+    }
     const stripped = cursorHumanText(message)
     const text = stripped !== '' ? stripped : cursorMessageText(message)
     if (this.label === undefined && text.trim() !== '') this.label = text.trim().slice(0, 80)
     const content: ContentBlock[] = text === '' ? [] : [{ type: 'text', text }]
     this.emit(out, 'user/message', time, { content, source: { kind: 'user' } })
+  }
+
+  private onSummary(message: Record<string, unknown>, time: number, out: InputEvent[]): void {
+    const shadowed = this.liveSeqs
+    this.liveSeqs = []
+    this.pending.clear()
+    this.emit(out, 'compaction/summary', time, { shadowedSeqs: shadowed })
+    const text = cursorMessageText(message)
+    const event = this.emit(out, 'user/message', time, {
+      content: text === '' ? [] : [{ type: 'text', text }],
+      source: { kind: 'plugin', form: 'compaction', plugin: 'compaction' },
+    })
+    const startSeq = shadowed[0]
+    const endSeq = shadowed.at(-1)
+    if (startSeq !== undefined && endSeq !== undefined) {
+      event.surfaceOp = { op: 'replace', startSeq, endSeq }
+    }
   }
 
   private onInjection(message: Record<string, unknown>, time: number, out: InputEvent[]): void {
@@ -177,8 +211,10 @@ class CursorSynthesizer implements EventSynthesizer {
   ): void {
     const parts = asArray(message['content'])
     if (parts === undefined) return
-    if (this.turn === 0) this.turn = 1
-    this.step += 1
+    if (!this.replay) {
+      if (this.turn === 0) this.turn = 1
+      this.step += 1
+    }
     const model = cursorModelOf(message)
     if (model !== undefined) this.model = model
     const blocks: ContentBlock[] = []
@@ -196,6 +232,13 @@ class CursorSynthesizer implements EventSynthesizer {
         if (callId === undefined) continue
         calls.push({ callId, name: asString(part['toolName']) ?? 'tool', args: part['args'] })
       }
+    }
+    if (this.replay) {
+      for (const call of calls) {
+        blocks.push({ type: 'tool-call', callId: call.callId, name: call.name, arguments: cursorArgsText(call.args) })
+      }
+      this.emit(out, 'assistant/message', time, { message: { content: blocks } })
+      return
     }
     const start = span?.start ?? time
     const end = span === undefined ? time : Math.max(span.end, start)

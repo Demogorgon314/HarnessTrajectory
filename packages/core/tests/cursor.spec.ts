@@ -123,6 +123,29 @@ describe('parseCursorLine', () => {
 })
 
 describe('createCursorParser', () => {
+  it('renders structural summaries as compaction and retains historical turns without duplicating kept copies', () => {
+    const parser = createCursorParser()
+    const messages = [
+      { role: 'system', content: 'Old system' },
+      { role: 'user', content: [{ type: 'text', text: 'Original prompt' }], providerOptions: { cursor: { requestId: 'r1' } } },
+      { role: 'assistant', content: [{ type: 'text', text: 'Original answer' }] },
+      { role: 'user', content: 'Summary without a magic text prefix', providerOptions: { cursor: { isSummary: true } } },
+      { role: 'system', content: 'New system' },
+    ]
+    messages.forEach((message, index) => parser.push(line({ type: 'cursor.message', index, blobId: String(index), time: T0 + index, message }), FILE, index))
+    for (const index of [1, 2]) {
+      parser.push(line({ type: 'cursor.message', blobId: String(index), time: T0 + 6, replay: true, message: messages[index] }), FILE, index + 4)
+    }
+    const snapshot = parser.snapshot()
+    expect(snapshot.eventNodes.map(node => node.kind)).toEqual(['user', 'assistant', 'compaction'])
+    expect(snapshot.eventNodes.find(node => node.kind === 'compaction')).toMatchObject({
+      summary: 'Summary without a magic text prefix',
+    })
+    expect(snapshot.requests.map(request => request.purpose)).toEqual(['assistant', 'compaction'])
+    expect(parser.meta().promptCount).toBe(1)
+    expect(snapshot.systemPrompts?.map(node => [node.text, node.update])).toEqual([['Old system', false], ['New system', true]])
+  })
+
   it('folds a human prompt, empty reasoning, a tool call, and its result', () => {
     const parser = createCursorParser()
     const callId = 'call-1\nfc_1'

@@ -680,7 +680,7 @@ function opencodeDocs(line: string): SearchDocDraft[] {
  */
 function cursorDocs(line: string): SearchDocDraft[] {
   const record = parseCursorLine(line)
-  if (record === null || record.tag !== 'message') return []
+  if (record === null || record.tag !== 'message' || record.replay) return []
   const builder = new DocBuilder(record.time)
   const message = record.message
   const role = asString(message['role'])

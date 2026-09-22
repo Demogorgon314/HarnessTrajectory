@@ -16,6 +16,9 @@
  * still needs indexing. The meta scanner keeps re-reading from byte 0 (its
  * state lives only in memory), but already-indexed lines are not re-extracted
  * and not re-inserted.
+ * Mutable virtual streams may supply a version of their indexed prefix.
+ * Cursor needs this even with recovered compaction history: rewind can replace
+ * that history. Ordinary JSONL sources continue to use byte/mtime watermarks.
  */
 
 import { SETTINGS_DEFAULTS, type HarnessKind, type SearchIndexing } from '@harness-trajectory/core'

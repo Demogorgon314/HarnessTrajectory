@@ -1,8 +1,9 @@
 /** Reads immutable Cursor blobs and prepares a stream change before publication. */
 
 import { createHash } from 'node:crypto'
-import { cursorModelOf, isRecord, type CursorStepSpan } from '@harness-trajectory/core'
+import { cursorModelOf, cursorUserClass, isRecord, type CursorStepSpan } from '@harness-trajectory/core'
 import { CursorDb } from './db.ts'
+import { CursorHistory } from './history.ts'
 import {
   decodeItem, decodeTurn, decodeUserPrompt,
   type CursorRoot, type CursorTurnItem, type CursorTurnSkeleton,
@@ -18,6 +19,7 @@ export interface CursorPublishedRecord {
   time: number
   span?: CursorStepSpan
   clock: CursorClockMessage
+  replay?: boolean
 }
 
 export interface CursorStreamChange {
@@ -33,7 +35,7 @@ export function cursorPrefixVersion(ids: readonly string[], length: number): str
   if (!Number.isInteger(length) || length < 0 || length > ids.length) return undefined
   const hash = createHash('sha256')
   for (const id of ids.slice(0, length)) hash.update(id).update('\n')
-  return `cursor-v1:${hash.digest('hex')}`
+  return `cursor-v2:${hash.digest('hex')}`
 }
 
 function parseMessage(data: Uint8Array): Record<string, unknown> | undefined {
@@ -54,7 +56,11 @@ export class CursorReader {
   private readonly prompts = new Map<string, { time?: number }>()
   private readonly items = new Map<string, CursorTurnItem>()
 
-  constructor(readonly db: CursorDb) {}
+  private readonly history: CursorHistory
+
+  constructor(readonly db: CursorDb) {
+    this.history = new CursorHistory(db, id => this.readMessage(id))
+  }
 
   readMessage(id: string): Record<string, unknown> | undefined {
     const data = this.db.readBlob(id)
@@ -115,36 +121,82 @@ export class CursorReader {
   }
 
   prepare(root: CursorRoot, published: readonly CursorPublishedRecord[], createdAt: number, updatedAt: number): CursorStreamChange {
-    const plan = planTranscript(root.messageIds, published.map(record => record.blobId))
+    const roots = this.history.roots(root)
+    const previousClocks = new Map(published.map(record => [record.blobId, record.clock]))
+    const messages = new Map<string, Record<string, unknown>>()
+    const read = (id: string) => {
+      const cached = messages.get(id)
+      if (cached !== undefined) return cached
+      const message = this.readMessage(id)
+      if (message !== undefined) messages.set(id, message)
+      return message
+    }
+    const epochs = roots.map(epoch => {
+      // Put the structural boundary before the new context's system/injections.
+      // The remaining model messages keep their root order.
+      const summary = epoch.messageIds.find(id => {
+        const clock = previousClocks.get(id)
+        if (clock !== undefined) return clock.summary === true
+        return cursorUserClass(read(id)) === 'summary'
+      })
+      return { root: epoch, ids: summary === undefined ? epoch.messageIds
+        : [summary, ...epoch.messageIds.filter(id => id !== summary)] }
+    })
+    const ids = epochs.flatMap(epoch => epoch.ids)
+    const plan = planTranscript(ids, published.map(record => record.blobId))
     const reset = plan.action === 'rebuild'
     const previous = reset ? [] : published
-    const pending: Array<{ blobId: string; message: Record<string, unknown>; clock: CursorClockMessage }> = []
-    let model: string | undefined
-    for (const blobId of plan.ids) {
-      const message = this.readMessage(blobId)
-      if (message === undefined) break
-      pending.push({ blobId, message, clock: clockMessageOf(message) })
-      model = cursorModelOf(message) ?? model
-    }
-    const clocks = pending.length === 0 ? [] : assignCursorTimes(
-      [...previous.map(record => record.clock), ...pending.map(record => record.clock)],
-      this.clockTurns(root), createdAt, updatedAt, null,
-    )
     const records: CursorPublishedRecord[] = []
     const lines: string[] = []
+    const seen = new Set<string>()
+    let offset = 0
+    let model: string | undefined
     let floor = previous.at(-1)?.time ?? -Infinity
-    for (const [offset, record] of pending.entries()) {
-      const index = previous.length + offset
-      const clock = clocks[index]
-      const time = Math.max(floor, clock?.time ?? updatedAt)
-      floor = time
-      const span = clock?.span
-      records.push({ blobId: record.blobId, clock: record.clock, time, ...(span === undefined ? {} : { span }) })
-      lines.push(messageLine(index, record.blobId, time, record.message, span))
+    for (const epoch of epochs) {
+      if (offset + epoch.ids.length <= previous.length) {
+        for (const id of epoch.ids) seen.add(id)
+        offset += epoch.ids.length
+        continue
+      }
+      const facts: CursorClockMessage[] = []
+      const pending: Array<{ id: string; message: Record<string, unknown> }> = []
+      for (const [local, id] of epoch.ids.entries()) {
+        const known = previousClocks.get(id)
+        if (offset + local < previous.length && known !== undefined) {
+          facts.push(known)
+          continue
+        }
+        const message = read(id)
+        if (message === undefined) break
+        pending.push({ id, message })
+        facts.push(known ?? clockMessageOf(message))
+      }
+      const clocks = assignCursorTimes(facts, this.clockTurns(epoch.root), createdAt, updatedAt, null)
+      const start = Math.max(0, previous.length - offset)
+      for (const [index, item] of pending.entries()) {
+        const local = start + index
+        const clock = clocks[local]
+        const fact = facts[local]
+        if (fact === undefined) break
+        const time = Math.max(floor, clock?.time ?? updatedAt)
+        floor = time
+        const span = clock?.span
+        const replay = seen.has(item.id)
+        const record = {
+          blobId: item.id, clock: fact, time,
+          ...(span === undefined ? {} : { span }), ...(replay ? { replay: true } : {}),
+        }
+        records.push(record)
+        lines.push(messageLine(previous.length + records.length - 1, item.id, time, item.message, span, replay))
+        if (!replay) model = cursorModelOf(item.message) ?? model
+      }
+      if (facts.length < epoch.ids.length) break
+      for (const id of epoch.ids) seen.add(id)
+      offset += epoch.ids.length
     }
     return {
       reset, records, lines,
-      blocked: previous.length + records.length < root.messageIds.length,
+      blocked: previous.length + records.length < ids.length,
       ...(model === undefined ? {} : { model }),
     }
   }

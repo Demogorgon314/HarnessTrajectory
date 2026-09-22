@@ -20,7 +20,7 @@ export function clockMessageOf(message: Record<string, unknown>): CursorClockMes
   const role = asString(message['role'])
   const classified = cursorUserClass(message)
   const kind: CursorClockMessage['kind'] = classified === 'system' ? 'system'
-    : classified === 'injection' ? 'injection'
+    : classified === 'injection' || classified === 'summary' ? 'injection'
       : classified === 'human' ? 'human'
         : role === 'assistant' ? 'assistant'
           : role === 'tool' ? 'tool'
@@ -44,6 +44,7 @@ export function clockMessageOf(message: Record<string, unknown>): CursorClockMes
   const requestId = kind === 'human' ? asString(cursorProviderOptions(message)?.['requestId']) : undefined
   return {
     kind,
+    ...(classified === 'summary' ? { summary: true } : {}),
     toolCallIds,
     toolResultIds,
     ...(requestId === undefined || requestId === '' ? {} : { requestId }),
@@ -81,6 +82,8 @@ export function planTranscript(messageIds: readonly string[], emittedIds: readon
 export interface CursorClockMessage {
   /** `system` and injected `user` share the session's createdAt. */
   kind: 'system' | 'injection' | 'human' | 'assistant' | 'tool' | 'other'
+  /** Structural summary fact retained without retaining its text. */
+  summary?: boolean
   requestId?: string
   /** Assistant `tool-call` ids, opaque (a newline is significant). */
   toolCallIds: readonly string[]
@@ -318,6 +321,7 @@ export function messageLine(
   time: number,
   message: unknown,
   span?: CursorStepSpan,
+  replay = false,
 ): string {
   return JSON.stringify({
     type: 'cursor.message',
@@ -326,5 +330,6 @@ export function messageLine(
     time,
     message,
     ...(span === undefined ? {} : { span }),
+    ...(replay ? { replay: true } : {}),
   })
 }

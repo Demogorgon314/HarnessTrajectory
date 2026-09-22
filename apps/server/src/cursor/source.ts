@@ -3,11 +3,11 @@
  * `~/.cursor/chats/<md5>/<agentId>/meta.json` and registers every directory
  * that has a conversation and a `store.db` — no SQLite in that pass. The
  * transcript tier opens the store on first subscribe, replay, or search
- * registration, decodes the protobuf root, and emits `cursor.session` plus
- * one `cursor.message` per field-1 blob id.
+ * registration, recovers compaction epochs, and emits `cursor.session` plus
+ * `cursor.message` records in the reconstructed historical stream.
  *
- * A newer root that extends the emitted id list appends. Any other change
- * (shrink, rewrite, summary) emits `file reset` and rebuilds. A missing
+ * Compaction preserves provable history and marks kept copies for Context.
+ * A non-prefix change to that history (rewind/rewrite) resets the stream. A missing
  * chats directory, a corrupt meta row, or blobs that are not JSON degrade
  * to a catalog entry and never throw. Handles are read-only and LRU-capped:
  * one database per session must not stay open for the whole tree.
@@ -527,7 +527,7 @@ export class CursorSource extends EventEmitter implements SessionSource {
       if (line === undefined) {
         const message = opened?.reader.readMessage(record.blobId)
         if (message === undefined) break
-        line = messageLine(index, record.blobId, record.time, message, record.span)
+        line = messageLine(index, record.blobId, record.time, message, record.span, record.replay)
       }
       search.queue(key, index, line)
       cursor.nextLine += 1
@@ -550,7 +550,7 @@ export class CursorSource extends EventEmitter implements SessionSource {
       const message = opened.reader.readMessage(record.blobId)
       // Never shift later records into a missing record's search/SSE line number.
       if (message === undefined) break
-      lines.push(messageLine(index, record.blobId, record.time, message, record.span))
+      lines.push(messageLine(index, record.blobId, record.time, message, record.span, record.replay))
     }
     return lines
   }
