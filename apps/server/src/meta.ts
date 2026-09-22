@@ -10,6 +10,7 @@ import {
   kimiMessageClass, kimiTitleText,
   parseDevinLine, parseDshLine, parseGrokLine,
   opencodeTextOf, opencodeUserClass, parseJsonLine, parseOpencodeLine, parsePiLine, parseTime, piContentText,
+  cursorHumanText, cursorModelOf, cursorUserClass, parseCursorLine,
   titleFrom, type AgentFileMeta, type HarnessKind,
 } from '@harness-trajectory/core'
 
@@ -78,7 +79,7 @@ export interface MetaScanner {
  * Bump when any scanner's logic changes: cached listing states from an older
  * version are discarded and the transcripts they covered are re-read.
  */
-export const META_SCANNER_VERSION = 9
+export const META_SCANNER_VERSION = 11
 
 /**
  * Serialized scanner payload for the listing cache: the public `state` plus
@@ -170,6 +171,7 @@ export function createMetaScanner(
     case 'pi': return piMetaScanner()
     case 'opencode': return opencodeMetaScanner(summary ?? null)
     case 'dsh': return dshMetaScanner()
+    case 'cursor': return cursorMetaScanner(summary ?? null)
   }
 }
 
@@ -719,6 +721,51 @@ function opencodeMetaScanner(session: Record<string, unknown> | null): MetaScann
         default:
           break
       }
+    },
+  }
+}
+
+/**
+ * Cursor listing scanner. Title, cwd, and model arrive on the `cursor.session`
+ * sidecar (and, before the store is opened, on the catalog seed). Human prompts
+ * are `cursorUserClass === 'human'`; the display title strips Cursor's
+ * `<timestamp>` / `<user_query>` wrapper. Each recorded assistant updates the
+ * latest model; kept copies change neither model nor prompt counts.
+ */
+function cursorMetaScanner(session: Record<string, unknown> | null): MetaScanner {
+  const state = emptyMeta()
+  const seed = (record: Record<string, unknown>): void => {
+    const title = asString(record['title'])?.trim()
+    if (title !== undefined && title !== '') state.aiTitle = title
+    const cwd = asString(record['cwd'])
+    if (cwd !== undefined && cwd !== '') state.cwd = cwd
+    const model = asString(record['model'])
+    if (model !== undefined && model !== '' && model !== 'default') state.model = model
+    noteTime(state, record['createdAt'])
+    noteTime(state, record['updatedAt'])
+  }
+  if (session !== null) seed(session)
+  return {
+    state,
+    push(line) {
+      const record = parseCursorLine(line)
+      if (record === null) return
+      if (record.time !== null) noteTime(state, record.time)
+      if (record.tag === 'session') {
+        seed(record.session)
+        return
+      }
+      const message = record.message
+      if (record.replay) return
+      const role = asString(message['role'])
+      if (role === 'assistant') {
+        state.model = cursorModelOf(message) ?? state.model
+        return
+      }
+      if (cursorUserClass(message) !== 'human') return
+      state.promptCount += 1
+      const text = cursorHumanText(message)
+      if (state.title === null && text !== '') state.title = titleFrom(text)
     },
   }
 }

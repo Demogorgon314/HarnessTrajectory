@@ -23,7 +23,7 @@
  */
 
 import type { HarnessKind, SessionFileRef } from '@harness-trajectory/core'
-import type { ContextHeaders, ContextTimeline, HeaderEpochContent } from '../shared/types.ts'
+import type { ContextHeaders, ContextTimeline, ContextUsage, HeaderEpochContent } from '../shared/types.ts'
 import type { ContentBlock, TimelineEvent } from './event.ts'
 import type { EventSynthesizer, SynthesizerFactory, SynthMeta } from '../synth/types.ts'
 import { createSynthesizer } from '../synth/index.ts'
@@ -66,7 +66,7 @@ interface FileFold {
   headerContent: Map<number, HeaderEpochContent>
   /** Bumps whenever this file's fold state changes (drives the view memos). */
   rev: number
-  timelineView?: { rev: number; value: ContextTimeline }
+  timelineView?: { rev: number; contextUsage: ContextUsage | undefined; value: ContextTimeline }
   headersView?: { rev: number; value: ContextHeaders }
 }
 
@@ -87,12 +87,18 @@ function contentOfEvent(event: TimelineEvent): ContentBlock[] | null {
 }
 
 /**
- * The full text + tool schemas one `request/header` carried — what the
- * browser's System and Tool Schemas sections render. `parameters` is the
- * schema field of the event contract; `schema` / `input_schema` are accepted
+ * The full text of a `system/message`, or text + tool schemas from a
+ * `request/header`, for the browser's System and Tool Schemas sections.
+ * `parameters` is the schema field; `schema` / `input_schema` are accepted
  * as the spellings a foreign producer may use.
  */
 function headerContentOfEvent(event: TimelineEvent): HeaderEpochContent | null {
+  if (event.type === 'system/message') {
+    const system = (contentOfEvent(event) ?? [])
+      .flatMap(block => block?.type === 'text' && typeof block.text === 'string' ? [block.text] : [])
+      .join('\n')
+    return { tools: [], system }
+  }
   if (event.type !== 'request/header') return null
   const rawHeader = event.data?.header
   if (rawHeader === null || rawHeader === undefined || typeof rawHeader !== 'object') return null
@@ -244,11 +250,28 @@ export class ContextSession {
   timelineOf(fileId: string): ContextTimeline | null {
     const fold = this.visibleFold(fileId)
     if (fold === undefined) return null
+    const contextUsage = this.metaOf(fileId)?.contextUsage
     const cached = fold.timelineView
-    if (cached !== undefined && cached.rev === fold.rev) return cached.value
+    if (cached !== undefined && cached.rev === fold.rev && cached.contextUsage === contextUsage) return cached.value
     const value = buildTimelineView(fold.timeline, this.bounds)
     value.requestInput = fold.requestInput
-    fold.timelineView = { rev: fold.rev, value }
+    if (contextUsage !== undefined) {
+      // Apply current-only envelope measurements after folding. Updating a
+      // root must not rewrite historical requests, bill tokens, or invent
+      // message/schema nodes just to carry their sizes.
+      value.contextUsage = contextUsage
+      if (contextUsage.window !== undefined) value.contextWindow = contextUsage.window
+      const current = value.current
+      const system = contextUsage.system ?? current.system
+      const tools = contextUsage.tools ?? current.tools
+      const inject = current.inject + (contextUsage.inject ?? 0)
+      const skill = current.skill + (contextUsage.skill ?? 0)
+      value.current = {
+        ...current, system, tools, inject, skill,
+        total: system + tools + current.user + inject + skill + current.assistant + current.tool,
+      }
+    }
+    fold.timelineView = { rev: fold.rev, contextUsage, value }
     return value
   }
 

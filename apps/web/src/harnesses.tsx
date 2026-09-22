@@ -45,9 +45,10 @@ function inWorkingDirectory(session: ResumeTarget, command: string): string {
 }
 
 /**
- * Brand marks. The Claude sunburst path is from Simple Icons (CC0 1.0); the
- * Codex, Kimi and Grok paths are from lobe-icons (`@lobehub/icons-static-svg`,
- * MIT, (c) LobeHub). The marks themselves belong to Anthropic, OpenAI,
+ * Brand marks. The Claude sunburst and Cursor cube paths are from Simple Icons
+ * (CC0 1.0; the cube is the mark published at cursor.com/brand). The Codex,
+ * Kimi and Grok paths are from lobe-icons (`@lobehub/icons-static-svg`, MIT,
+ * (c) LobeHub). The marks themselves belong to Anthropic, Anysphere, OpenAI,
  * Moonshot AI, and xAI and identify their harnesses here. The Devin and pi
  * marks are in-house monograms (neither icon set ships them). The OpenCode
  * mark is an in-house monogram too — a terminal-prompt chevron over an
@@ -134,6 +135,21 @@ export function PiLogo({ size = 16, className, style }: HarnessLogoProps) {
       <path d="M4 6h16v2.6H4z" fill="currentColor" />
       <path d="M8.6 8.6v9c0 1-.8 1.9-1.9 1.9H4.5v-2.6h1.7V8.6h2.4z" fill="currentColor" />
       <path d="M15.4 8.6c0 3.6-1.1 7.2-2.7 10.9h3c1.2-2.9 1.9-6.5 1.9-10.9h-2.2z" fill="currentColor" />
+    </svg>
+  )
+}
+
+/**
+ * Cursor mark (the cube), 24x24 viewBox, evenodd fill, straight from Simple
+ * Icons. Drawn in `currentColor`.
+ */
+const CURSOR_PATH =
+  'M11.503.131 1.891 5.678a.84.84 0 0 0-.42.726v11.188c0 .3.162.575.42.724l9.609 5.55a1 1 0 0 0 .998 0l9.61-5.55a.84.84 0 0 0 .42-.724V6.404a.84.84 0 0 0-.42-.726L12.497.131a1.01 1.01 0 0 0-.996 0M2.657 6.338h18.55c.263 0 .43.287.297.515L12.23 22.918c-.062.107-.229.064-.229-.06V12.335a.59.59 0 0 0-.295-.51l-9.11-5.257c-.109-.063-.064-.23.061-.23'
+
+export function CursorLogo({ size = 16, className, style }: HarnessLogoProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" fillRule="evenodd" className={className} style={style} aria-hidden="true">
+      <path d={CURSOR_PATH} />
     </svg>
   )
 }
@@ -236,6 +252,16 @@ export const HARNESSES: readonly HarnessMeta[] = [
     accent: 'var(--dsw-alias-label-primary)',
     Logo: OpencodeLogo,
     resumeCommand: session => inWorkingDirectory(session, `opencode --session ${shellQuote(session.id)}`),
+  },
+  {
+    kind: 'cursor',
+    label: 'Cursor',
+    short: 'CU',
+    // The mark is monochrome; use the theme-aware label color so it stays
+    // visible in dark mode, exactly as the Kimi/Grok/OpenCode entries do.
+    accent: 'var(--dsw-alias-label-primary)',
+    Logo: CursorLogo,
+    resumeCommand: session => inWorkingDirectory(session, `agent --resume ${shellQuote(session.id)}`),
   },
   {
     kind: 'dsh',

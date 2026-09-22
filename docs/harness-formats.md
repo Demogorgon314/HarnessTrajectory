@@ -771,6 +771,237 @@ chars resolves to nothing.
 
 Resume command: `dsh tui --resume <id>`.
 
+## Cursor
+
+Verified against Cursor CLI 2026.09 stores on this machine. Two on-disk artifacts
+exist for a session `<agentId>` (UUID). **We read only (A).**
+
+### A. `~/.cursor/chats/<md5(cwd)>/<agentId>/` — the authoritative store
+
+| File | Content |
+| --- | --- |
+| `meta.json` | `{schemaVersion:1, createdAtMs, updatedAtMs, hasConversation, title?, cwd}` — cheap catalog facts. `hasConversation:false` dirs have no `store.db` yet: skip them. |
+| `prompt_history.json` | JSON array of the human prompt strings. Not needed (the messages are in the store). |
+| `store.db` (+ `-wal`, `-shm`) | SQLite, WAL, written live. Two tables: `meta(key TEXT PK, value TEXT)` and `blobs(id TEXT PK, data BLOB)`. |
+
+`<md5(cwd)>` is the lowercase MD5 hex of the absolute workspace path
+(`md5('/Users/me/proj')`). The scanner never inverts it: `meta.json.cwd` and the
+root blob carry the path. `HARNESS_TRAJECTORY_CURSOR_CHATS` replaces the chats
+directory; otherwise `$CURSOR_CONFIG_DIR/chats` or `~/.cursor/chats`.
+
+`meta` has a single row, key `'0'`, whose value is **hex-encoded JSON** (a value
+that already starts with `{` is accepted as plain JSON; garbage degrades the
+session to catalog-only):
+
+```json
+{"agentId":"…","latestRootBlobId":"<64 hex>","name":"API Extraction Script",
+ "mode":"default","isRunEverything":true,"approvalMode":"unrestricted",
+ "createdAt":1788019740265,"lastUsedModel":"grok-4.7","blobEncryptionKey":"<64 hex>"}
+```
+
+`blobs` is a content-addressed, append-only store (id = SHA-256 hex of `data`).
+Blobs are **plain, not encrypted** on every store observed despite
+`blobEncryptionKey`. If a future build encrypts them, the JSON sniff fails and
+the session degrades to catalog-only (title/cwd/time from `meta.json`) and never
+throws. Two blob families:
+
+1. **Model messages** — `data` starts with `{`; Vercel AI SDK `ModelMessage` JSON:
+   - `{"role":"system","content":"<system prompt string>"}` — first message.
+   - `{"role":"user","content":"<user_info>…","providerOptions":{"cursor":{"requestContextCompleteness":{…},…}}}`
+     — the injected environment message (string content, no `requestId`).
+   - `{"role":"user","content":[{"type":"text","text":"<timestamp>…</timestamp>\n<user_query>\n…\n</user_query>"}],"providerOptions":{"cursor":{"requestId":"<uuid>"}}}`
+     — a human turn. Two consecutive human messages may share one `requestId`
+     (a steer sent mid-turn).
+   - `{"role":"user","content":"…","providerOptions":null}` (string content, no
+     requestId) — other injected text (interrupt notices, reminders).
+   - `{"role":"user","content":"…","providerOptions":{"cursor":{"isSummary":true}}}`
+     — a compaction summary. Classify by this flag, never by the observed
+     `[Previous conversation summary]:` text prefix. Cursor provider metadata
+     may also carry `systemPromptFingerprint`; it is not a history-order key.
+   - `{"role":"assistant","id":"msg_…","content":[parts…],"providerOptions":{"cursor":{"modelProviderMessageId":…}}}`
+     with parts `{"type":"reasoning","text":"…"|"","signature":…,"providerOptions":{"cursor":{"modelName":"grok-4.7-high"}}}`,
+     `{"type":"text","text":"…"}`, `{"type":"tool-call","toolCallId":"call-…\nfc_…","toolName":"Shell","args":{…}}`.
+     `reasoning.text` is empty for Grok (signature only) and populated for Claude
+     models. `reasoning.providerOptions.cursor.modelName` is the **per-step
+     model** — the only reliable model source; `meta.lastUsedModel` may be
+     `"default"`.
+   - `{"role":"tool","id":"<toolCallId>","content":[{"type":"tool-result","toolCallId":…,"toolName":…,"result":<string|json>,"experimental_content":[{"type":"text","text":…}]}],"providerOptions":{"cursor":{"highLevelToolCallResult":{"output":{"success":{…}}|{"error":…},"isError":false}}}}`
+     — one tool message per tool call, immediately following the assistant message.
+   Messages carry **no timestamps**. The human turn's `<timestamp>` tag is display
+   text, not a field — do not parse it structurally. `cursorHumanText` strips the
+   tag and the `<user_query>` wrapper for display, search, and the listing title
+   only. `toolCallId` often contains a literal newline (`call-…\nfc_…`); keep it
+   opaque and never split it. Tool args observed: `Read` `path`; `Shell`
+   `command`+`description`; `Grep` `path`+`pattern`+`glob`; `Glob`
+   `glob_pattern`+`target_directory`; `StrReplace` `path`+`old_string`+`new_string`;
+   `Write` `path`+`contents`; `TodoWrite` `todos`.
+2. **Protobuf nodes** — everything else. Wire format is standard protobuf; 32-byte
+   `bytes` fields are references to other blobs. The root and the turn chain are
+   decoded. Non-message JSON blobs also exist in the store; only root field-1 ids
+   and the field-8 chain (prompt and item refs) are followed.
+
+**Root node** (`latestRootBlobId`) — the fields that matter:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| 1 (repeated) | bytes(32) | Ordered list of **model-message blob ids** — the current context sent to the model, not necessarily the complete historical trajectory. |
+| 5 | message | Context usage snapshot: `1` = used tokens, `2` = context window, `3` = breakdown message whose repeated field `3` is `{1: key, 2: label, 3: tokens, 4: chars}` for `system_prompt`, `tools`, `rules`, `skills`, `mcp`, `subagents`, `summarized_conversation`, `conversation`. A token count may be absent (treat as 0). A bucket message can itself be 32 bytes; it is still a message, not a blob id. |
+| 8 (repeated) | bytes(32) | One chain node per UI turn, in turn order. A chain node is `{1: turn}`. |
+| 9 | string | Workspace URI `file:///…`. |
+| 10 | varint | Observed; ignored. |
+| 18 (repeated) | string | Attached rule/skill file paths. |
+| 21 | message | `{1: repoPath, 2: branch}`. |
+| 22 | string | Client: `"cli"` (IDE sessions are expected to differ; they are still read when the store matches). |
+| 26 | int | Session created, epoch **milliseconds**. |
+| 27 | string | IANA timezone. |
+
+Every write produces a **new root** (old roots stay in `blobs`);
+`meta.latestRootBlobId` is the only pointer to "now". Field 1 of a newer root is
+normally the previous list plus appended ids. It **shrinks or rewrites** when
+Cursor summarizes the conversation (`summarized_conversation` bucket > 0) or the
+user rewinds. A structural `isSummary` message opens a context epoch. The reader
+recovers predecessor epochs from binary root candidates whose prompt ids match
+the current turn lineage and whose item references are ordered prefixes.
+The earliest turn/item frontier carrying a summary bounds its predecessor;
+at that frontier, a candidate must contain every alternative message sequence
+in order. SQLite row order, blob hashes and message counts are not chronology.
+Incomparable candidates, missing lineage or multiple summary markers are
+ambiguous: replay the recoverable suffix rather than inventing ancestry.
+The same reconstruction is used on cold start and live updates. A normal
+compaction extends the historical stream while replacing the live context.
+Rewind and other non-prefix changes to the reconstructed stream still reset
+SSE, listing and search; abandoned branches are not merged into the current one.
+A valid root with no field-1 entries clears the transcript and search as well.
+Malformed roots are distinguished from empty conversations: keep the last
+readable prefix and retry instead of treating decode failure as a deletion.
+
+Search stores a SHA-256 fingerprint of the ordered message ids in the indexed
+prefix alongside its watermark. Discovery and search re-enablement verify that
+prefix against the reconstructed stream: an unchanged prefix resumes at the watermark;
+a missing or mismatched fingerprint rebuilds the session. Counts and mtimes
+alone cannot establish continuity. The search cache schema is bumped to v9;
+the old cache is disposable and rebuilds once. An interrupted batch without a
+matching fingerprint also rebuilds rather than trusting an unverified watermark.
+
+Messages are content-addressed and written whole, so a message is **always
+settled** when it appears in a root — no streaming or partial states. A missing
+or non-JSON blob stops the emission at that id so the emitted list stays a
+prefix and the next tick retries the tail. After three failures the session
+stays catalog-only until the store stamp changes.
+
+**Turn chain** (timestamps and history lineage; content comes from model messages).
+Each field-8 ref is a chain node `{1: turn}`. `turn` is `{1: ref(userPrompt),
+2: repeated ref(item) in UI order, 3: requestId (the human message's
+providerOptions.cursor.requestId), 5: int, 9: repeated tool-name strings, 10: string}`.
+The user-prompt node is `{1: text, 2 and 17: prompt uuid, 25: epoch ms, 26: epoch ms}`.
+An item is a oneof: field 3 thinking `{1: text?, 2: tokens?, 3: startMs, 4: endMs}`,
+field 1 assistant text `{1: text, 2: startMs, 3: endMs}`, or field 2 tool call
+`{57: toolCallId (same opaque id as the model message, newline included), 59: startMs, 60: endMs}`.
+Unknown item kinds are ignored. The first field-8 ref is only the first turn;
+a 9-prompt session can carry more refs than prompts.
+
+### B. `~/.cursor/projects/<encoded cwd>/agent-transcripts/<agentId>/<agentId>.jsonl` — NOT used
+
+Anthropic-shaped `{"role","message":{"content":[text|tool_use]}}` lines plus
+`{"type":"turn_ended","status":"success|aborted","error"?}`. It has **no tool
+results, no timestamps, no model**, and reasoning is inlined into `text`. It
+exists only for CLI runs. Do not parse it. Subagent JSONL under
+`agent-transcripts/<id>/subagents/` is not read. No observed store contains a
+`Task` tool call, so subagent discovery stays unverified.
+
+### Wire vocabulary
+
+Virtual URI `cursor://sessions/<agentId>`. The catalog walks two directory levels
+and registers a session when `meta.json` has `hasConversation: true` and
+`store.db` exists — SQLite is not opened in that pass. Listing size is
+`store.db` + `store.db-wal` bytes. The transcript tier opens the store on first
+subscribe, replay, or search registration.
+
+The reader prepares a change before the source publishes it. Each published
+record owns its blob id, pinned clock/span and compact timing facts, so replay
+and append share one record order. Normal appends reuse published timing facts;
+decoded immutable turn/prompt/item timing nodes are cached with a 2,048-entry
+limit per node type and evicted with their read-only connection (16 stores).
+Missing nodes are never cached. Message text is not retained in these caches.
+History discovery scans binary blobs when encountering a new summary epoch;
+the chosen ancestors are reused while the summary and turn lineage remain
+compatible. Classification and lineage caches retain compact facts only.
+Watch events are coalesced for 50 ms and refresh known sessions directly;
+unknown paths and polling trigger catalog discovery. Discovery and search
+backfill yield between sessions; decoding a single session is still synchronous.
+The shared browser-safe Cursor protocol in core owns wire types, classification,
+message text and tool-result text for all consumers.
+
+Server-synthesized JSON lines, epoch-ms `time`:
+
+- `cursor.message` — stream line (0-based index = search `line`):
+  `{"type":"cursor.message","index":n,"blobId":"…","time":ms,"message":<ModelMessage verbatim>,"span"?,"replay"?}`.
+  Each recovered epoch starts with its summary boundary, followed by its other
+  field-1 entries in root order, including system and injected user messages.
+  A blob already present in an older epoch carries `replay:true`: Context
+  restores that kept copy onto the live surface without booking another request;
+  Trajectory, listing counts and search skip it. Equal blobs within the same
+  epoch remain distinct occurrences. When the turn chain has any timestamp,
+  `time` is: system and
+  injected user → session `createdAt`; human → that turn's prompt field 25
+  (a second consecutive human with the same `requestId` takes the next item's
+  start when that start is at least the prompt time); assistant → the minimum
+  `startMs` of its tool-call ids, else the next thinking/text item start after
+  the previous line; tool → field 60 `endMs` of that `toolCallId`. Anything
+  unresolved keeps the previous line's time, and a time never moves backwards.
+  An assistant line may also carry `span: {start, end, calls:[{id,start,end}],
+  blocks:[{kind,start,end}]}` so the trajectory duration lane and the context
+  timing card can use each call's own window. With no usable chain, `time`
+  falls back to phase 1: index 0 is `meta.json.createdAtMs` and every later
+  line is the latest `updatedAtMs`. Stamps are stored on the stream so a
+  reconnect replays the same times.
+- `cursor.session` — sidecar (`startLine: -1`, never indexed, re-sent when facts
+  change): `{"type":"cursor.session","agentId","title","cwd","workspaceUri",
+  "repoPath","branch","client","mode","approvalMode","model","createdAt",
+  "updatedAt","usage":{"used","window","buckets":[{key,label,tokens,chars}]}}`.
+  `model` is the last `reasoning.providerOptions.cursor.modelName`, else
+  `meta.lastUsedModel` unless it is `"default"`. `title` is `meta.json.title`,
+  else the store's `name`.
+
+`cursorUserClass` is structural and shared by the adapter, the meta scanner, and
+search: `role === 'user'` with `providerOptions.cursor.isSummary === true`
+is `summary`; otherwise `Array.isArray(content)` and a string
+`providerOptions.cursor.requestId` is `human`; any other `user` is `injection`;
+`role === 'system'` is `system`. The trajectory adapter keeps the system prompt
+on `systemPrompts` and renders injections as context notices. The context
+synthesizer emits `system/message`, injected `user/message`, and a human
+`user/message`. A summary emits a compaction boundary that archives the old
+Context surface; a new system prompt replaces the old system envelope.
+There is no per-step token usage. The root's current `used` /
+`window` and envelope buckets travel through synthesizer metadata as
+`contextUsage`. `ContextSession` applies those figures only to the current
+view, outside the vendored fold. The headline uses `used`; system/tools replace
+the estimated envelope sizes, and rules/MCP/subagents and skills add their
+recorded sizes to the current inject/skill categories. Each sidecar replaces
+the snapshot, including zeroes and removed buckets. Historical requests,
+input measurements, timing calls and billed tokens are unaffected.
+
+System messages retain their actual text, available to the Context browser.
+The tools bucket records a size, not schemas: the browser still says schemas
+were not recorded. No placeholder messages or tool definitions are fabricated
+for bucket sizes. `conversation` and `summarized_conversation` are already in
+the transcript and are not counted again. Every assistant response, including
+a tool-only response, contributes one request with unknown input usage.
+
+### Polling and phase-1 limits
+
+`fs.watch` on the chats directory (recursive) plus a poll every ~1.5s. The tick
+gate is `meta.json` mtime and `store.db` / `-wal` mtime+size. The same
+`latestRootBlobId` refreshes sidecar facts only. `PRAGMA data_version` is
+connection-local, so it only short-circuits a handle that stayed open. An LRU of
+about 16 read-only connections is kept; a missing chats directory is an empty
+catalog and later polls recover it. Open handles are read-only. Nothing is
+written under the chats root.
+
+Subagent discovery is unverified: no store on this machine contains a `Task`
+tool call, so child sessions are not bound. Sessions without `store.db` are
+skipped. Resume command: `agent --resume <id>`.
+
 ## Source lifecycle and replay (shared)
 
 `SearchLifecycle` owns the search service across discovery and runtime toggles.

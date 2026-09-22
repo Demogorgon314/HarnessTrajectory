@@ -712,3 +712,53 @@ describe('extractSearchDocs — DeepSeek Harness', () => {
     expect(extractSearchDocs('dsh', '{ not json')).toEqual([])
   })
 })
+
+describe('cursor', () => {
+  const at = T0
+
+  function message(message: Record<string, unknown>): SearchDocDraft[] {
+    return extractSearchDocs('cursor', JSON.stringify({
+      type: 'cursor.message', index: 1, blobId: 'b', time: at, message,
+    }))
+  }
+
+  it('indexes human prompts, assistant text, reasoning, and tool-call args', () => {
+    expect(pairs(message({
+      role: 'user',
+      content: [{ type: 'text', text: '<timestamp>t</timestamp>\n<user_query>\nFix the parser\n</user_query>' }],
+      providerOptions: { cursor: { requestId: 'req-1' } },
+    }))).toEqual(['human: Fix the parser'])
+
+    expect(pairs(message({
+      role: 'assistant',
+      content: [
+        { type: 'reasoning', text: 'thinking', providerOptions: { cursor: { modelName: 'grok-4.7-high' } } },
+        { type: 'text', text: 'Reading it.' },
+        { type: 'tool-call', toolCallId: 'call-1\nfc_1', toolName: 'Shell', args: { command: 'pnpm test', description: 'run tests' } },
+        { type: 'tool-call', toolCallId: 'call-2', toolName: 'Write', args: { path: 'a.ts', contents: 'export const n = 1\n' } },
+        { type: 'tool-call', toolCallId: 'call-3', toolName: 'Glob', args: { glob_pattern: '**/*.ts', target_directory: 'src' } },
+      ],
+    }))).toEqual([
+      'other: thinking',
+      'assistant: Reading it.',
+      'tool: Shell\ncommand: pnpm test\ndescription: run tests',
+      'tool: Write\npath: a.ts\ncontents: export const n = 1',
+      'tool: Glob\nglob_pattern: **/*.ts\ntarget_directory: src',
+    ])
+  })
+
+  it('skips injections, tool results, the sidecar, and malformed lines', () => {
+    expect(message({
+      role: 'user', content: '<user_info>secret environment</user_info>',
+      providerOptions: { cursor: {} },
+    })).toEqual([])
+    expect(message({
+      role: 'tool',
+      content: [{ type: 'tool-result', toolCallId: 'call-1', toolName: 'Shell', result: 'stdout from the command' }],
+    })).toEqual([])
+    expect(extractSearchDocs('cursor', JSON.stringify({
+      type: 'cursor.session', time: at, agentId: 'a', title: 'not indexed',
+    }))).toEqual([])
+    expect(extractSearchDocs('cursor', '{')).toEqual([])
+  })
+})

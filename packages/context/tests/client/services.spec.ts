@@ -45,6 +45,15 @@ describe('numOf', () => {
 describe('timelineOf', () => {
   const current = { system: 1, tools: 2, user: 3, inject: 4, skill: 0, assistant: 5, tool: 6, total: 7 }
 
+  test('keeps current usage through sanitization and rejects malformed occupancy', () => {
+    const contextUsage = { used: 20000, window: 100000, tools: 800 }
+    assert.deepEqual(timelineOf({ contextUsage })?.contextUsage, contextUsage)
+    for (const bad of [{ used: -1 }, { used: Infinity }, { used: 1, tools: 'bad' }]) {
+      const wire = { current, requests: [], events: [], nodes: [], archive: [], contextUsage: bad }
+      assert.equal(timelineOf(wire)?.contextUsage, undefined)
+    }
+  })
+
   test('non-records stay null', () => {
     assert.equal(timelineOf(null), null)
     assert.equal(timelineOf(undefined), null)

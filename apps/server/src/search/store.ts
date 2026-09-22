@@ -51,10 +51,10 @@ import type { HarnessKind, SearchRole } from '@harness-trajectory/core'
 
 /**
  * Bumped whenever the schema below — or the indexing policy that decides what
- * lands in it — changes; a mismatch drops and rebuilds. v7 combines Codex
- * logical-history indexing with deduplicated text and excludes tool outputs.
+ * lands in it — changes; a mismatch drops and rebuilds. v9 adds a source
+ * fingerprint for safely resuming mutable virtual streams.
  */
-export const SEARCH_SCHEMA_VERSION = 8
+export const SEARCH_SCHEMA_VERSION = 9
 
 /** Identity of one indexed transcript, as the SSE route addresses it. */
 export interface SearchFileKey {
@@ -67,13 +67,18 @@ export interface SearchFileKey {
 }
 
 /** What the index already knows about a file on disk. */
-export interface SearchFileState extends SearchFileKey {
+export interface SearchFileState extends SearchFileKey, SearchFileProgress {
   /** `files` rowid; the `docs.file` foreign key. */
   id: number
+}
+
+/** Watermark and optional source-proved identity of exactly the indexed prefix. */
+export interface SearchFileProgress {
   size: number
   mtimeMs: number
   indexedBytes: number
   indexedLines: number
+  contentVersion?: string
 }
 
 /** One indexable record extracted from a JSONL line. */
@@ -100,7 +105,8 @@ create table files (
   size          integer not null,
   mtime_ms      real not null,
   indexed_bytes integer not null,
-  indexed_lines integer not null
+  indexed_lines integer not null,
+  content_version text
 );
 create table texts (
   id   integer primary key,
@@ -262,6 +268,7 @@ export class SearchStore {
       mtimeMs: asInt(row['mtime_ms']),
       indexedBytes: asInt(row['indexed_bytes']),
       indexedLines: asInt(row['indexed_lines']),
+      ...(typeof row['content_version'] === 'string' ? { contentVersion: row['content_version'] } : {}),
     }
   }
 
@@ -292,15 +299,10 @@ export class SearchStore {
     return asInt(row?.['id'])
   }
 
-  setFileState(key: SearchFileKey, progress: {
-    size: number
-    mtimeMs: number
-    indexedBytes: number
-    indexedLines: number
-  }): void {
+  setFileState(key: SearchFileKey, progress: SearchFileProgress): void {
     this.db.prepare(`
-      insert into files (path, kind, session_id, file_id, size, mtime_ms, indexed_bytes, indexed_lines)
-      values (?, ?, ?, ?, ?, ?, ?, ?)
+      insert into files (path, kind, session_id, file_id, size, mtime_ms, indexed_bytes, indexed_lines, content_version)
+      values (?, ?, ?, ?, ?, ?, ?, ?, ?)
       on conflict(path) do update set
         kind = excluded.kind,
         session_id = excluded.session_id,
@@ -308,10 +310,12 @@ export class SearchStore {
         size = excluded.size,
         mtime_ms = excluded.mtime_ms,
         indexed_bytes = excluded.indexed_bytes,
-        indexed_lines = excluded.indexed_lines
+        indexed_lines = excluded.indexed_lines,
+        content_version = excluded.content_version
     `).run(
       key.path, key.kind, key.sessionId, key.fileId,
       progress.size, progress.mtimeMs, progress.indexedBytes, progress.indexedLines,
+      progress.contentVersion ?? null,
     )
     this.filesVersion += 1
   }
@@ -387,6 +391,7 @@ export class SearchStore {
    */
   clearDocs(path: string): void {
     this.db.prepare('delete from docs where file in (select id from files where path = ?)').run(path)
+    this.db.prepare('update files set content_version = null where path = ?').run(path)
   }
 
   /** Forget a file entirely: it disappeared from disk or fell out of the retention window. */

@@ -8,6 +8,7 @@
 
 import type { HarnessKind, SessionFileRef } from '@harness-trajectory/core'
 import type { InputEvent } from './requestInput.ts'
+import type { ContextUsage } from '../shared/types.ts'
 
 /** A child agent spawned from this file, keyed by the harness-native child key. */
 export interface AgentSpawn {
@@ -30,6 +31,8 @@ export interface AgentSpawn {
 }
 
 export interface SynthMeta {
+  /** Recorded current occupancy and envelope sizes, independent of request events. */
+  contextUsage?: ContextUsage
   model?: string
   provider?: string
   /** Context window in tokens when the harness recorded or implied it. */

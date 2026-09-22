@@ -5,6 +5,7 @@ import { createDevinParser } from './devin.ts'
 import { createDshParser } from './dsh.ts'
 import { createGrokParser } from './grok.ts'
 import { createKimiParser } from './kimi.ts'
+import { createCursorParser } from './cursor.ts'
 import { createOpencodeParser } from './opencode.ts'
 import { createPiParser } from './pi.ts'
 
@@ -38,6 +39,13 @@ export {
   opencodeTextOf, opencodeChildTitle,
   type OpencodeRecord, type OpencodeUserClass,
 } from './opencode.ts'
+export {
+  parseCursorLine, cursorUserClass, cursorHumanText, cursorModelOf,
+  cursorProviderOptions, cursorMessageText, cursorToolResultText, cursorArgsText, cursorUsageOf,
+  type CursorCallSpan, type CursorBlockSpan, type CursorSessionFacts,
+  type CursorRecord, type CursorStepSpan, type CursorUserClass, type CursorUsage, type CursorUsageBucket,
+} from './cursor-protocol.ts'
+export { createCursorParser } from './cursor.ts'
 export { createDshParser } from './dsh.ts'
 export {
   parseDshLine, expandDshStreamRun, dshReplaceRange, dshUserClass,
@@ -57,5 +65,6 @@ export function createSessionParser(kind: HarnessKind): SessionParser {
     case 'pi': return createPiParser()
     case 'opencode': return createOpencodeParser()
     case 'dsh': return createDshParser()
+    case 'cursor': return createCursorParser()
   }
 }

@@ -65,6 +65,14 @@
  *   `assistant/message` indexes committed text/reasoning blocks; `tool/call`
  *   and `command/run` index the calls. `tool/result` outputs, stream deltas,
  *   and surface bookkeeping are never indexed.
+ * - **Cursor**: server-synthesized `cursor.message` / `cursor.session` lines
+ *   (epoch ms `time`). The sidecar is never indexed. A `role: 'user'` message
+ *   indexes only when `cursorUserClass` says `human` — the same structural
+ *   classifier the adapter and meta scanner share — using `cursorHumanText`
+ *   (the `<timestamp>` / `<user_query>` wrapper is display chrome). Assistant
+ *   `text` indexes as assistant, `reasoning.text` as other, and `tool-call`
+ *   args as a call (`Shell` command, `Read`/`Write`/`StrReplace` paths and
+ *   contents, `Grep`/`Glob` patterns). `role: 'tool'` results are never indexed.
  *
  * The rules that are the same everywhere: the human/injected split reuses the
  * classifier the meta scanner and the adapters use, image blocks are skipped,
@@ -85,6 +93,7 @@ import {
   kimiMessageClass, kimiTitleText,
   parseDevinLine, parseDshLine, parseGrokLine, parsePiLine, piContentText,
   opencodeTextOf, opencodeUserClass, parseJsonLine, parseOpencodeLine, parseTime,
+  cursorHumanText, cursorUserClass, parseCursorLine,
   GROK_SIDECAR_METHOD, type HarnessKind, type SearchRole,
 } from '@harness-trajectory/core'
 
@@ -152,7 +161,9 @@ const TOOL_ARG_KEYS: readonly string[] = [
   // Grok reads use `target_file`, `list_dir` uses `target_directory`.
   'file_path', 'filePath', 'path', 'target_file', 'target_directory', 'notebook_path',
   'pattern', 'glob', 'query', 'search', 'output_mode', 'url',
-  'old_string', 'new_string', 'oldString', 'newString', 'oldText', 'newText', 'content', 'body', 'message', 'title', 'plan', 'todos', 'edits',
+  'old_string', 'new_string', 'oldString', 'newString', 'oldText', 'newText', 'content', 'contents', 'body', 'message', 'title', 'plan', 'todos', 'edits',
+  // Cursor `Glob` names its pattern `glob_pattern` (Claude/Grok use `glob`).
+  'glob_pattern',
   // MCP passthrough (Grok `use_tool`, Kimi `mcp__*`) and background-task handles.
   'tool_name', 'tool_input', 'task_id', 'task_ids',
 ]
@@ -236,6 +247,7 @@ export function extractSearchDocs(kind: HarnessKind, line: string): SearchDocDra
       case 'pi': return piDocs(line)
       case 'opencode': return opencodeDocs(line)
       case 'dsh': return dshDocs(line)
+      case 'cursor': return cursorDocs(line)
     }
   } catch {
     return []
@@ -655,6 +667,44 @@ function opencodeDocs(line: string): SearchDocDraft[] {
     }
     default:
       break
+  }
+  return builder.docs
+}
+
+// -- Cursor Agent --------------------------------------------------------------
+
+/**
+ * `cursor.session` is a sidecar and is never indexed. `cursor.message` indexes
+ * human prompts, assistant text, reasoning, and tool-call arguments. Tool
+ * results (`role: 'tool'`) are skipped — the call is the searchable record.
+ */
+function cursorDocs(line: string): SearchDocDraft[] {
+  const record = parseCursorLine(line)
+  if (record === null || record.tag !== 'message' || record.replay) return []
+  const builder = new DocBuilder(record.time)
+  const message = record.message
+  const role = asString(message['role'])
+  if (role === 'user') {
+    if (cursorUserClass(message) !== 'human') return builder.docs
+    builder.add('human', cursorHumanText(message))
+    return builder.docs
+  }
+  if (role !== 'assistant') return builder.docs
+  for (const part of asArray(message['content']) ?? []) {
+    if (!isRecord(part)) continue
+    switch (asString(part['type'])) {
+      case 'text':
+        builder.add('assistant', asString(part['text']) ?? '')
+        break
+      case 'reasoning':
+        builder.add('other', asString(part['text']) ?? '')
+        break
+      case 'tool-call':
+        builder.add('tool', renderToolCall(asString(part['toolName']) ?? 'tool', part['args']))
+        break
+      default:
+        break
+    }
   }
   return builder.docs
 }
