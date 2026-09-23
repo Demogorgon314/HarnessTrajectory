@@ -95,6 +95,50 @@ it('does not deduplicate identical usage across unrelated Codex sessions', async
   expect(report.buckets.reduce((sum, row) => sum + row.total, 0)).toBe(200)
 })
 
+it.each(['pi', 'dsh'] as const)('excludes copied %s history but preserves routing inherited by new work', async kind => {
+  source.stop()
+  const root = join(dir, kind)
+  const pathFor = (id: string) => kind === 'pi'
+    ? join(root, '--project--', `2026-09-20T12-00-00_${id}.jsonl`)
+    : join(root, '--project--', id, 'session.v3.jsonl')
+  const header = (id: string, parent?: string) => ({ type: 'session', version: 3, id, timestamp: time,
+    createdAt: Date.parse(time), ...(parent === undefined ? {} : { parentSession: parent, isSeeded: true }) })
+  const piTurn = (id: string, parentId: string | null) => ({ type: 'message', id, parentId, timestamp: time,
+    message: { role: 'assistant', model: 'test-model', provider: 'test-provider', content: [{ type: 'text', text: 'Done' }],
+      stopReason: 'stop', usage: { input: 100, output: 0, totalTokens: 100 } } })
+  const dshTurn = (offset: number) => [
+    { type: 'step/start', seq: offset + 1, time: Date.parse(time), data: { turn: 1, step: offset + 1 } },
+    { type: 'assistant/message', seq: offset + 2, time: Date.parse(time), data: {
+      turn: 1, step: offset + 1, message: { role: 'assistant', content: [{ type: 'text', text: 'Done' }] },
+      usage: { inputTokens: 100, outputTokens: 0 } } },
+    { type: 'step/end', seq: offset + 3, time: Date.parse(time), data: { turn: 1, step: offset + 1 } },
+  ]
+  const copied = kind === 'pi' ? [piTurn('aaaa1111', null)] : [
+    { type: 'request/header', seq: 1, time: Date.parse(time), data: {
+      header: { config: { provider: 'test-provider', model: 'test-model' } }, reason: 'initial' } },
+    ...dshTurn(1),
+  ]
+  for (const id of ['parent', 'fork', 'empty']) {
+    const path = pathFor(id)
+    await mkdir(kind === 'pi' ? join(root, '--project--') : join(root, '--project--', id), { recursive: true })
+    await writeFile(path, jsonl([
+      header(id, id === 'parent' ? undefined : kind === 'pi' ? pathFor('parent') : 'parent'), ...copied,
+      ...(id !== 'fork' ? [] : kind === 'pi' ? [piTurn('bbbb2222', 'aaaa1111')] : dshTurn(4)),
+    ]))
+  }
+  source = new SessionIndex({ roots: [{ kind, dir: root }], watch: false })
+  await source.start()
+  const service = new UsageService(source)
+  for (let scan = 0; scan < 2; scan++) {
+    const report = await service.read()
+    expect(report.sessions).toHaveLength(3)
+    expect(report.failedSessions).toBe(0)
+    expect(report.buckets.reduce((sum, row) => sum + row.total, 0)).toBe(200)
+    expect(report.buckets.reduce((sum, row) => sum + row.requests, 0)).toBe(2)
+    expect(report.buckets.every(row => row.model === 'test-model')).toBe(true)
+  }
+})
+
 it('filters authoritative response usage and shares parent reads between forks', async () => {
   const records = turn('parent', 1, 100)
   const parent = [meta(parentId), ...records.slice(0, -1), {
@@ -162,6 +206,29 @@ it('reports main and child usage once, preserves missing coverage, and sends no 
   expect(report.buckets.reduce((sum, row) => sum + row.requests, 0)).toBe(3)
   expect(report.buckets.reduce((sum, row) => sum + row.measured, 0)).toBe(2)
   expect(JSON.stringify(report)).not.toContain('PRIVATE_PAYLOAD')
+})
+
+it('excludes the Claude fork-point request while counting work after the synthetic launch prompt', async () => {
+  const assistant = (id: string, tokens: number) => ({ type: 'assistant', uuid: id, requestId: id, timestamp: time,
+    message: { id, role: 'assistant', model: 'claude-test', content: [{ type: 'text', text: 'Done' }],
+      stop_reason: 'end_turn', usage: { input_tokens: tokens, output_tokens: 0 } } })
+  const path = join(dir, 'project', 'main', 'subagents', 'agent-child.jsonl')
+  await writeFile(path, jsonl([
+    { type: 'fork-context-ref', agentId: 'child', parentSessionId: 'main', parentLastUuid: 'a' },
+    assistant('copied', 1000),
+    { type: 'user', uuid: 'launch', timestamp: time, message: { role: 'user', content: [
+      { type: 'tool_result', tool_use_id: 'launch', content: 'Fork started' },
+      { type: 'text', text: 'Do the work' },
+    ] } },
+    assistant('own', 20),
+  ]))
+  source.stop()
+  source = new SessionIndex({ roots: [{ kind: 'claude', dir }], watch: false })
+  await source.start()
+  const report = await new UsageService(source).read()
+  expect(report.failedSessions).toBe(0)
+  expect(report.buckets.reduce((sum, row) => sum + row.total, 0)).toBe(200)
+  expect(report.buckets.reduce((sum, row) => sum + row.requests, 0)).toBe(3)
 })
 
 it('coalesces concurrent scans, reuses summaries, and invalidates on source changes', async () => {

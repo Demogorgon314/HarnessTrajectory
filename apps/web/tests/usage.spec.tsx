@@ -19,6 +19,23 @@ const response = () => new Response(`${JSON.stringify(update())}\n`)
 
 afterEach(() => { cleanup(); vi.unstubAllGlobals() })
 
+it('separates Cursor context from consumption totals and filters the snapshots', async () => {
+  const value: UsageReport = { ...report, sessions: [...report.sessions, { id: 'cursor', kind: 'cursor', title: 'Cursor work',
+    context: { used: 1500, window: 256000, time: bucket.time, model: 'cursor-model' } }] }
+  vi.stubGlobal('fetch', vi.fn(async () => new Response(`${JSON.stringify(update(value))}\n`)))
+  render(<TokenUsage />)
+  await screen.findByText(/local sessions scanned/)
+  fireEvent.click(screen.getByRole('button', { name: /^All$/ }))
+  expect(screen.getByTestId('usage-total').textContent).toBe('300')
+  expect(screen.getByRole('progressbar', { name: 'Cursor work context tokens' }).getAttribute('value')).toBe('1500')
+  fireEvent.click(screen.getByRole('button', { name: 'Usage tool' }))
+  fireEvent.click(screen.getByRole('menuitem', { name: 'Cursor' }))
+  expect(screen.getByTestId('usage-total').textContent).toBe('Not recorded')
+  expect(screen.queryByRole('img', { name: 'Daily token trend' })).toBeNull()
+  fireEvent.change(screen.getByLabelText('Filter token usage'), { target: { value: 'no-match' } })
+  expect(screen.queryByRole('region', { name: 'Cursor context snapshots' })).toBeNull()
+})
+
 it('filters by local calendar date and keeps undated samples only in all time', () => {
   const filters = { start: '2026-09-20', end: '2026-09-20', kind: '', model: '', provider: '', query: '' }
   expect(filterUsage(report.buckets, filters)).toEqual([bucket])

@@ -20,7 +20,7 @@ export interface UsageFilters {
   query: string
 }
 
-export function filterUsage(buckets: readonly UsageBucket[], filters: UsageFilters): UsageBucket[] {
+export function filterUsage<T extends Pick<UsageBucket, 'time' | 'kind' | 'model' | 'provider' | 'sessionId'>>(buckets: readonly T[], filters: UsageFilters): T[] {
   const query = filters.query.trim().toLowerCase()
   return buckets.filter(bucket => {
     const day = bucket.time === null ? null : dateKey(bucket.time)

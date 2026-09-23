@@ -30,7 +30,9 @@ both ported to run on top of plain transcript files instead of a runtime.
   Streams local histories on first open, with session progress and record counts;
   charts update as sessions finish. Refresh reuses unchanged session summaries.
   Missing usage is shown as incomplete coverage, never estimated. Input includes cache;
-  reasoning is part of output. Codex forks exclude verified inherited history.
+  reasoning is part of output. Codex, Claude, Pi and DeepSeek Harness exclude
+  verified fork history. Cursor shows recorded context snapshots separately;
+  its local stores do not record cumulative request token usage.
 - **Execution diagnostics** from the Trajectory toolbar: tool-call loops (the same tool and
   arguments failing three or more times within one turn, even with other calls in between),
   model request trouble (repeated retries, request errors, output limits), and the slowest tool

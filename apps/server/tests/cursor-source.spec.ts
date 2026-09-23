@@ -15,9 +15,27 @@ import { extractSearchDocs } from '../src/search/extract.ts'
 import { SearchIndexer } from '../src/search/indexer.ts'
 import { search } from '../src/search/query.ts'
 import { SearchStore } from '../src/search/store.ts'
+import { UsageService } from '../src/usage.ts'
 
 const T = 1_700_000_000_000
 const AGENT = '11111111-1111-4111-8111-111111111111'
+
+it('reports Cursor context snapshots without turning occupancy into billed tokens, including cached reads', async () => {
+  seed({ lastUsedModel: 'test-model', messages: [
+    { role: 'user', content: [{ type: 'text', text: 'Task' }], providerOptions: { cursor: { requestId: 'request' } } },
+    { role: 'assistant', content: [{ type: 'text', text: 'Done' }] },
+  ] })
+  const src = await start()
+  const service = new UsageService(src)
+  for (let scan = 0; scan < 2; scan++) {
+    const report = await service.read()
+    expect(report.failedSessions).toBe(0)
+    expect(report.sessions[0]?.context).toMatchObject({ used: 1500, window: 256000, model: 'test-model', time: T + 5000 })
+    expect(report.buckets.reduce((sum, row) => sum + row.total, 0)).toBe(0)
+    expect(report.buckets.reduce((sum, row) => sum + row.measured, 0)).toBe(0)
+    expect(report.buckets.reduce((sum, row) => sum + row.requests, 0)).toBe(1)
+  }
+})
 
 let dir: string
 let chats: string

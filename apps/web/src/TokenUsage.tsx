@@ -64,11 +64,18 @@ export function TokenUsage() {
   }, [refresh])
 
   const buckets = report?.buckets ?? []
+  const contexts = report?.sessions.flatMap(session => session.context === undefined ? [] : [{
+    ...session.context, sessionId: session.id, kind: session.kind, title: session.title, provider: 'cursor',
+  }]) ?? []
+  const filterItems = [...buckets, ...contexts]
   const start = period === 'all' ? '' : period === 'custom' ? customStart : dayOffset(today, 1 - Number(period))
   const end = period === 'all' ? '' : period === 'custom' ? customEnd : today
   const invalidRange = period === 'custom' && (!start || !end || start > end)
   const filters = { start, end, kind, model, provider, query }
   const selected = invalidRange ? [] : filterUsage(buckets, filters)
+  const selectedContexts = invalidRange ? [] : filterUsage(contexts, filters)
+  const measured = sumUsage(selected, 'measured')
+  const unknownOnly = measured === 0 && (sumUsage(selected, 'requests') > 0 || selectedContexts.length > 0)
   const total = sumUsage(selected, 'total')
   const allFiltered = filterUsage(buckets, { ...filters, start: '', end: '' })
   const daily = rankUsage(selected.filter(bucket => bucket.time !== null), bucket => dateKey(bucket.time ?? 0))
@@ -77,7 +84,7 @@ export function TokenUsage() {
   const streak = activityStreak(activeDays, today)
   const best = daily[0]
   const sessionLabels = new Map(report?.sessions.map(session => [`${session.kind}/${session.id}`, session.title]) ?? [])
-  const toolLabels = new Map(buckets.map(bucket => [bucket.kind, harnessMeta(bucket.kind).label]))
+  const toolLabels = new Map(filterItems.map(bucket => [bucket.kind, harnessMeta(bucket.kind).label]))
   const rangeDays = start && end ? Math.round((Date.parse(`${end}T12:00:00Z`) - Date.parse(`${start}T12:00:00Z`)) / 86_400_000) + 1 : 0
   const previous = rangeDays > 0 ? sumUsage(filterUsage(buckets, { ...filters,
     start: dayOffset(start, -rangeDays), end: dayOffset(start, -1) }), 'total') : 0
@@ -127,9 +134,9 @@ export function TokenUsage() {
           id, label, icon: <HarnessMark kind={id} size={16} />,
         }))]} />
       <UsageFilter label="Usage model" value={model} onChange={setModel}
-        options={[{ id: '', label: 'All models' }, ...[...new Set(buckets.map(bucket => bucket.model))].sort().map(id => ({ id, label: id }))]} />
+        options={[{ id: '', label: 'All models' }, ...[...new Set(filterItems.map(bucket => bucket.model))].sort().map(id => ({ id, label: id }))]} />
       <UsageFilter label="Usage provider" value={provider} onChange={setProvider}
-        options={[{ id: '', label: 'All providers' }, ...[...new Set(buckets.map(bucket => bucket.provider))].sort().map(id => ({ id, label: id }))]} />
+        options={[{ id: '', label: 'All providers' }, ...[...new Set(filterItems.map(bucket => bucket.provider))].sort().map(id => ({ id, label: id }))]} />
       <input aria-label="Filter token usage" placeholder="Filter model, provider, tool or session ID" value={query} onChange={event => { setQuery(event.target.value) }} />
       {period === 'custom' && <><input type="date" aria-label="Usage start date" value={customStart} onChange={event => { setCustomStart(event.target.value) }} /><input type="date" aria-label="Usage end date" value={customEnd} onChange={event => { setCustomEnd(event.target.value) }} /></>}
     </div>
@@ -138,17 +145,25 @@ export function TokenUsage() {
     {report !== null && <>
       <section className={`${css.card} ${css.hero}`}>
         <div className={css.caption}><span>Your work, in tokens</span><span>{streak.current} day streak · Longest {streak.longest}</span></div>
-        <div className={css.headline} data-testid="usage-total">{total.toLocaleString('en')}</div>
-        <p>{sumUsage(selected, 'requests').toLocaleString('en')} requests · {new Set(selected.map(sessionKey)).size} sessions · {activeDays.size} active days
+        <div className={css.headline} data-testid="usage-total">{unknownOnly ? 'Not recorded' : total.toLocaleString('en')}</div>
+        <p>{sumUsage(selected, 'requests').toLocaleString('en')} requests · {new Set([...selected, ...selectedContexts].map(sessionKey)).size} sessions · {activeDays.size} active days
           {previous > 0 && <> · {((total / previous - 1) * 100).toFixed(1)}% vs previous period</>}</p>
-        <p className={css.muted}>{best ? `Peak day: ${best[0]} · ${compact(best[1])} tokens` : total > 0 ? 'Recorded usage has no request dates.' : 'No recorded token usage for these filters.'}</p>
-        <div className={css.bars} role="img" aria-label="Daily token trend">{trend.map(bar =>
+        <p className={css.muted}>{unknownOnly ? 'Cumulative request token usage was not recorded.' : best ? `Peak day: ${best[0]} · ${compact(best[1])} tokens` : total > 0 ? 'Recorded usage has no request dates.' : 'No recorded token usage for these filters.'}</p>
+        {!unknownOnly && <div className={css.bars} role="img" aria-label="Daily token trend">{trend.map(bar =>
           <Tooltip key={bar.day} side="top" delayMs={80} label={`${bar.day}${stride > 1 ? ` · ${stride} days` : ''}\n${bar.value.toLocaleString()} tokens`}>
             <span className={css.bar} style={{ height: `${Math.max(2, bar.value / trendMax * 100)}%` }} />
-          </Tooltip>)}</div>
-        {milestone !== undefined && <div className={css.milestone}><div><span>Next milestone {compact(milestone)} · all time, current filters</span><span>{compact(milestone - lifetime)} to go</span></div><progress aria-label="Token milestone" value={lifetime} max={milestone} /></div>}
+          </Tooltip>)}</div>}
+        {!unknownOnly && milestone !== undefined && <div className={css.milestone}><div><span>Next milestone {compact(milestone)} · all time, current filters</span><span>{compact(milestone - lifetime)} to go</span></div><progress aria-label="Token milestone" value={lifetime} max={milestone} /></div>}
       </section>
-      <div className={css.metrics}>{([['input', 'Input'], ['output', 'Output'], ['cacheRead', 'Cache read'], ['reasoning', 'Reasoning']] as const).map(([field, label]) => <section className={css.card} key={field}><span className={css.muted}>{label}</span><strong>{compact(sumUsage(selected, field))}</strong><span className={css.muted}>{total > 0 ? (sumUsage(selected, field) / total * 100).toFixed(1) : '0'}% of total</span></section>)}</div>
+      <div className={css.metrics}>{([['input', 'Input'], ['output', 'Output'], ['cacheRead', 'Cache read'], ['reasoning', 'Reasoning']] as const).map(([field, label]) => <section className={css.card} key={field}><span className={css.muted}>{label}</span><strong>{unknownOnly ? '—' : compact(sumUsage(selected, field))}</strong><span className={css.muted}>{unknownOnly ? 'Not recorded' : `${total > 0 ? (sumUsage(selected, field) / total * 100).toFixed(1) : '0'}% of total`}</span></section>)}</div>
+      {(selectedContexts.length > 0 || kind === 'cursor' && !query) && <section className={css.card} aria-label="Cursor context snapshots">
+        <h3>Cursor · Recorded context tokens</h3>
+        <p className={css.muted}>Cursor stores current context size, but does not record cumulative request usage locally. These snapshots are excluded from usage totals and charts. Dates filter the snapshot update time.</p>
+        {selectedContexts.map(context => <div className={css.rank} key={sessionKey(context)}>
+          <div><span>{context.title}</span><span>{context.used.toLocaleString('en')} tokens{context.window > 0 && ` / ${compact(context.window)} context window`}</span></div>
+          <progress aria-label={`${context.title} context tokens`} value={context.used} max={Math.max(1, context.used, context.window)} />
+        </div>)}
+      </section>}
       <section className={css.card}><div className={css.caption}><h3>Activity</h3><span>Last 53 weeks · current tool/model filters</span></div>
         <div className={css.heatScroll}><div className={css.heat} role="img" aria-label="Daily token activity over the last 53 weeks">{Array.from({ length: 371 }, (_, i) => {
           const day = dayOffset(heatStart, i)
@@ -188,7 +203,7 @@ export function TokenUsage() {
       </div>
       <p className={css.footnote}>{report.sessions.length} local sessions scanned · Updated {new Date(report.updatedAt).toLocaleString()}. {report.failedSessions > 0 && `${report.failedSessions} sessions could not be read; refresh to retry.`}<br />
         Usage recorded on {sumUsage(selected, 'measured')} of {sumUsage(selected, 'requests')} requests; {sumUsage(selected, 'turnTotals')} figures are turn totals. Missing usage is not estimated. Input includes cache read and cache write ({compact(sumUsage(selected, 'cacheWrite'))}); reasoning is included in output. Cards overlap.<br />
-        Dates use your local timezone. Undated usage appears only under All. Counts reflect available session histories, including children and compaction. Codex forks exclude verified inherited history; other harness forks may share history. Transcripts are read locally to extract usage; only numeric summaries and session labels reach this panel. Nothing is uploaded.</p>
+        Dates use your local timezone. Undated usage appears only under All. Counts reflect available session histories, including children and compaction. Codex, Claude, Pi and DeepSeek Harness exclude verified fork history; unrecognized copies may share usage. Transcripts are read locally to extract usage; only numeric summaries and session labels reach this panel. Nothing is uploaded.</p>
     </>}
   </div>
 }

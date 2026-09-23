@@ -1,15 +1,26 @@
 import { setImmediate } from 'node:timers/promises'
-import { createSessionParser, type SessionParser, type SessionSummary, type UsageBucket, type UsageReport, type UsageProgress, type UsageStreamEvent } from '@harness-trajectory/core'
+import { asNumber, asString, createSessionParser, cursorUsageOf, parseCursorLine, type SessionParser, type SessionSummary, type UsageBucket, type UsageReport, type UsageProgress, type UsageStreamEvent } from '@harness-trajectory/core'
 import { sessionKey, type SessionSource } from './source.ts'
 import { CodexUsageHistory } from './usage-codex.ts'
+import { claudeUsageFilter } from './usage-claude.ts'
+import { CopiedUsageHistory } from './usage-copied.ts'
+
+const hasCopiedHistory = (kind: SessionSummary['kind']) => kind === 'codex' || kind === 'pi' || kind === 'dsh'
 
 const count = (value: number | undefined): number =>
   value !== undefined && Number.isFinite(value) && value >= 0 ? value : 0
 
 /** Reuse the trajectory's request identity, replay suppression and usage corrections. */
-async function collectSession(source: SessionSource, session: SessionSummary, codex: CodexUsageHistory, onRecords: (count: number) => void): Promise<UsageBucket[]> {
+interface SessionUsage {
+  buckets: UsageBucket[]
+  context?: NonNullable<UsageReport['sessions'][number]['context']>
+}
+
+async function collectSession(source: SessionSource, session: SessionSummary, codex: CodexUsageHistory, copied: CopiedUsageHistory, onRecords: (count: number) => void): Promise<SessionUsage> {
   const parsers = new Map<string, SessionParser>()
-  const filters = new Map<string, (line: string) => Promise<boolean>>()
+  let context: SessionUsage['context']
+  const filters = new Map<string, (line: string) => boolean | Promise<boolean>>()
+  const ownership = new Map<string, { inherited: (line: string) => Promise<boolean>; lastInherited: boolean; excluded: Set<number> }>()
   await source.readAll(session.kind, session.id, async event => {
     if (event.type !== 'lines') return
     let parser = parsers.get(event.file.id)
@@ -17,19 +28,42 @@ async function collectSession(source: SessionSource, session: SessionSummary, co
       parser = createSessionParser(session.kind)
       parsers.set(event.file.id, parser)
       if (session.kind === 'codex') filters.set(event.file.id, codex.filter(event.file))
+      if (session.kind === 'claude') filters.set(event.file.id, claudeUsageFilter(event.file))
+      if (session.kind === 'pi' || session.kind === 'dsh') ownership.set(event.file.id, {
+        inherited: copied.filter(session.kind, event.file.id), lastInherited: false, excluded: new Set(),
+      })
     }
     // Each child owns its own requests. Preserve inherited-history boundaries.
     const file = { ...event.file, role: 'main' as const }
     const filter = filters.get(event.file.id)
     for (const line of event.lines) {
+      const owner = ownership.get(event.file.id)
+      if (owner !== undefined) {
+        const inherited = await owner.inherited(line)
+        if (owner.lastInherited && !inherited) {
+          owner.excluded = new Set(parser.snapshot().requests.map(request => request.startSeq))
+        }
+        owner.lastInherited = inherited
+      }
+      if (session.kind === 'cursor') {
+        const record = parseCursorLine(line)
+        if (record?.tag === 'session') {
+          const usage = cursorUsageOf(record.session['usage'])
+          context = usage === undefined ? undefined : { used: count(usage.used), window: count(usage.window),
+            time: asNumber(record.session['updatedAt']) ?? record.time, model: asString(record.session['model']) || 'Unknown model' }
+        }
+      }
       if (filter === undefined || await filter(line)) parser.push(line, file)
     }
     onRecords(event.lines.length)
     await setImmediate()
   })
   const buckets = new Map<string, UsageBucket>()
-  for (const parser of parsers.values()) {
+  for (const [id, parser] of parsers) {
+    const owner = ownership.get(id)
+    if (owner?.lastInherited) continue // Empty fork: every request is inherited.
     for (const request of parser.snapshot().requests) {
+      if (owner?.excluded.has(request.startSeq)) continue
       const route = request.provenance ?? request.requestConfig
       const model = route?.model || 'Unknown model'
       const provider = route?.provider.trim().toLowerCase() || 'Unknown provider'
@@ -62,7 +96,7 @@ async function collectSession(source: SessionSource, session: SessionSummary, co
       bucket.total += usage.totalTokens === undefined ? input + read + write + output : count(usage.totalTokens)
     }
   }
-  return [...buckets.values()]
+  return { buckets: [...buckets.values()], ...(context === undefined ? {} : { context }) }
 }
 
 interface UsageScan {
@@ -94,18 +128,18 @@ function waitForUpdate(scan: UsageScan, revision: number, signal: AbortSignal): 
 
 /** Lazy, serialized scans; retain numeric summaries only, never parsers or transcript text. */
 export class UsageService {
-  private readonly cache = new Map<string, { stamp: string; buckets: UsageBucket[] }>()
+  private readonly cache = new Map<string, SessionUsage & { stamp: string }>()
   private pending: { scan: UsageScan; promise: Promise<UsageReport> } | undefined
-  private codexRevision = 0
+  private historyRevision = 0
 
   constructor(private readonly source: SessionSource) {
     source.on('change', (kind: SessionSummary['kind'], id: string) => {
       this.cache.delete(sessionKey(kind, id))
       // A changed/recovered parent can change which prefix a fork inherits.
-      if (kind === 'codex') {
-        this.codexRevision += 1
+      if (hasCopiedHistory(kind)) {
+        this.historyRevision += 1
         for (const key of this.cache.keys()) {
-          if (key.startsWith('codex ')) this.cache.delete(key)
+          if (key.startsWith(`${kind} `)) this.cache.delete(key)
         }
       }
     })
@@ -167,7 +201,8 @@ export class UsageService {
     for (const key of this.cache.keys()) if (!live.has(key)) this.cache.delete(key)
     const { report, progress } = scan
     const codex = new CodexUsageHistory(this.source)
-    const codexRevision = this.codexRevision
+    const copied = new CopiedUsageHistory(this.source)
+    const historyRevision = this.historyRevision
     let lastProgressAt = 0
     for (const session of sessions) {
       progress.currentSession = session.title
@@ -178,18 +213,18 @@ export class UsageService {
       if (cached?.stamp !== stamp) {
         let changed = false
         const onChange = (kind: SessionSummary['kind'], id: string) => {
-          if (kind === session.kind && (id === session.id || kind === 'codex')) changed = true
+          if (kind === session.kind && (id === session.id || hasCopiedHistory(kind))) changed = true
         }
         this.source.on('change', onChange)
         try {
-          cached = { stamp, buckets: await collectSession(this.source, session, codex, count => {
+          cached = { stamp, ...await collectSession(this.source, session, codex, copied, count => {
             progress.records += count
             if (Date.now() - lastProgressAt >= 200) {
               lastProgressAt = Date.now()
               publish(scan)
             }
           }) }
-          if (!changed && (session.kind !== 'codex' || codexRevision === this.codexRevision)) this.cache.set(key, cached)
+          if (!changed && (!hasCopiedHistory(session.kind) || historyRevision === this.historyRevision)) this.cache.set(key, cached)
         } catch {
           report.failedSessions += 1
           cached = undefined
@@ -198,7 +233,8 @@ export class UsageService {
         }
       }
       if (cached !== undefined) for (const bucket of cached.buckets) report.buckets.push(bucket)
-      report.sessions.push({ id: session.id, kind: session.kind, title: session.title })
+      report.sessions.push({ id: session.id, kind: session.kind, title: session.title,
+        ...(cached?.context === undefined ? {} : { context: cached.context }) })
       progress.completed += 1
       publish(scan)
       await setImmediate()

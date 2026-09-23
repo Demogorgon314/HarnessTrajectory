@@ -21,7 +21,10 @@ export interface UsageBucket {
 
 export interface UsageReport {
   buckets: UsageBucket[]
-  sessions: { id: string; kind: HarnessKind; title: string }[]
+  sessions: { id: string; kind: HarnessKind; title: string;
+    /** Latest recorded context occupancy, never additive request/billing usage. */
+    context?: { used: number; window: number; time: number | null; model: string }
+  }[]
   updatedAt: number
   failedSessions: number
 }

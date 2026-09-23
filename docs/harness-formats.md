@@ -12,6 +12,11 @@ Request input is input + cache read + cache creation (output excluded); multi-it
 aggregate usage is not a single input measurement. A main session's cost includes its
 subagents. Subagent files bind through `.meta.json`.
 
+Settings usage excludes assistant records in a `fork-context-ref` prelude
+(also identified by `file.agent.isFork`). The first non-injected user record,
+including the synthetic launch receipt with its worker prompt, starts own work.
+This accounting filter does not remove context from Trajectory or Context.
+
 Assistant block timestamps mark block completion, so Trajectory leaves first-token
 time unknown. Group by request identity even when an early block carries a stop
 reason or a tool result separates sibling blocks. Trajectory updates the existing
@@ -470,7 +475,9 @@ Verified against pi 0.85.1 (`packages/coding-agent/src/core/session-manager.ts`,
   filename contains no `_`, so the id is everything after the FIRST `_` (custom ids
   may contain `_`). One file per session; no subagents. A fork/clone writes a NEW
   independent file whose header carries `parentSession` — treated as its own main
-  session, never a child.
+  session, never a child. Settings usage resolves that parent path through
+  discovered sessions and excludes requests in a verified copied prefix. It still
+  folds those records to retain inherited routing/configuration for new requests.
 - Line 1 is a `{type:'session'}` header (version, id, ISO `timestamp`, `cwd`,
   `parentSession?`) with no tree fields. Every other entry is
   `{type, id (8 hex), parentId: string|null, timestamp: ISO}`. TIMESTAMP TRAP: the
@@ -755,7 +762,9 @@ outputs, packed stream rows, and surface bookkeeping are never indexed.
 
 A child session is a SEPARATE log under the same `<encoded-cwd>` parent whose
 header carries `origin:'subagent'` plus `parentSession`; a fork records
-`parentSession` without the origin and stays an independent session. The only
+`parentSession` without the origin and stays an independent session. Settings
+usage compares explicit parent lineage and excludes requests from a verified
+copied prefix while retaining inherited configuration. The only
 binding a parent's transcript records is the exact result text
 `started subagent <childSessionId>` on a continuable background tool call —
 the meta scanner pairs it with the pending call's description. Parent and
@@ -972,7 +981,11 @@ on `systemPrompts` and renders injections as context notices. The context
 synthesizer emits `system/message`, injected `user/message`, and a human
 `user/message`. A summary emits a compaction boundary that archives the old
 Context surface; a new system prompt replaces the old system envelope.
-There is no per-step token usage. The root's current `used` /
+There is no per-step token usage. Settings usage exposes the latest recorded
+context snapshot separately (used tokens, window, model and update time), including
+cached/streamed reads. It never adds these values to request totals, activity or
+milestones. Missing consumption is shown as "Not recorded", rather than zero.
+The root's current `used` /
 `window` and envelope buckets travel through synthesizer metadata as
 `contextUsage`. `ContextSession` applies those figures only to the current
 view, outside the vendored fold. The headline uses `used`; system/tools replace
@@ -1045,7 +1058,11 @@ ordered copied prefix are excluded until the first divergence. This uses explici
 lineage, never token amounts alone. Nested forks compare against the parent's full
 logical history. Missing parents mark the session as failed and are retried; a
 scan-local hash timeline cache shares parent reads without retaining message text.
-Codex changes invalidate dependent usage summaries. This filtering only affects
+Claude fork preludes are excluded as described above. Pi and DSH use their explicit
+`parentSession` reference and ordered record hashes to exclude copied requests;
+the inherited records still fold for routing/configuration. Missing parents cause
+an incomplete session and a retry, not a guessed zero. Changes to any of these
+lineage-aware harnesses invalidate its dependent usage summaries. This filtering only affects
 the usage dashboard, not the history shown in Trajectory or Context. Rewritten
 copies without matching records or lineage, and other harness forks, may still
 share past usage; the dashboard is not a provider billing ledger.
