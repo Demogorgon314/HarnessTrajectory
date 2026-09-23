@@ -9,6 +9,7 @@ import { useEffect, useRef, useState } from 'react'
 import { SEARCH_MAX_AGE_DAYS_MAX, SEARCH_MAX_AGE_DAYS_MIN, type ModelPriceRules } from '@harness-trajectory/core'
 import { icons, useSnapshotSelector } from '@harness-trajectory/ui'
 import { ModelPricing } from './ModelPricing.tsx'
+import { TokenUsage } from './TokenUsage.tsx'
 import { loadSettings, saveSettings, settingsStore } from './settings-store.ts'
 import css from './settings.module.css'
 
@@ -16,6 +17,7 @@ const { IconDataOutline16, IconSettingsOutline16 } = icons
 
 const SECTIONS = [
   { id: 'general', label: 'General', Icon: IconSettingsOutline16 },
+  { id: 'usage', label: 'Token usage', Icon: IconDataOutline16 },
   { id: 'pricing', label: 'Model pricing', Icon: IconDataOutline16 },
 ] as const
 type SectionId = (typeof SECTIONS)[number]['id']
@@ -102,6 +104,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
             </button>
           </div>
           <div className={css.options}>
+            {section === 'usage' && <TokenUsage />}
             {section === 'general' && (
               <>
                 <div className={css.row}>

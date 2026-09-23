@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { extname, join, normalize } from 'node:path'
 import { Hono } from 'hono'
-import { streamSSE } from 'hono/streaming'
+import { stream, streamSSE } from 'hono/streaming'
 import {
   HARNESS_KINDS, SEARCH_DEFAULT_LIMIT, SEARCH_INDEXING_IDLE, SEARCH_MAX_LIMIT, SEARCH_MIN_QUERY_LENGTH,
   type HarnessKind, type SearchResponse, type SessionListPage, type SessionSummary,
@@ -13,6 +13,7 @@ import { summaryOrderKey, type SessionSource } from './source.ts'
 import { streamSession } from './session-stream.ts'
 import { search, type SearchService } from './search/index.ts'
 import type { SettingsController } from './settings.ts'
+import { UsageService } from './usage.ts'
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -98,6 +99,24 @@ function searchDisabled(query: string): SearchResponse {
 
 export function createApp({ index, staticDir, search: searchService, settings }: AppOptions): Hono {
   const app = new Hono()
+  const usage = new UsageService(index)
+  app.get('/api/usage', async (c) => c.json(await usage.read()))
+  app.get('/api/usage/stream', (c) => {
+    c.header('Content-Type', 'application/x-ndjson')
+    c.header('Cache-Control', 'no-cache, no-transform')
+    c.header('X-Accel-Buffering', 'no')
+    return stream(c, async writer => {
+      const abort = new AbortController()
+      writer.onAbort(() => { abort.abort() })
+      try {
+        for await (const event of usage.stream(abort.signal)) {
+          await writer.write(`${JSON.stringify(event)}\n`)
+        }
+      } finally {
+        abort.abort()
+      }
+    })
+  })
   const currentSearch = (): SearchService | undefined => searchService?.()
   /**
    * Bumped on every source `'change'`: `/api/sessions?rev=` answers 304 while

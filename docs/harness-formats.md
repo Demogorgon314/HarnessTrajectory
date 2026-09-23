@@ -1031,6 +1031,43 @@ sources retain their existing scratch reconstruction and materialized replay arr
 
 ## Request-input statistics (shared)
 
+### Settings usage dashboard
+
+`/api/usage` replays discovered sessions on demand through the core trajectory
+parsers, one parser per stream, preserving child inherited-history boundaries.
+It sums final request usage (including compaction), not both request and message
+copies. Input includes cache read/write; reasoning is already in output. Missing
+usage remains missing coverage, and turn-level fallbacks retain their scope.
+Codex usage excludes foreign-thread `history_base` prefixes while retaining
+same-thread revert history. For legacy copied forks, `forked_from_id` selects the
+parent timeline: identical records (including timestamps and identifiers) in an
+ordered copied prefix are excluded until the first divergence. This uses explicit
+lineage, never token amounts alone. Nested forks compare against the parent's full
+logical history. Missing parents mark the session as failed and are retried; a
+scan-local hash timeline cache shares parent reads without retaining message text.
+Codex changes invalidate dependent usage summaries. This filtering only affects
+the usage dashboard, not the history shown in Trajectory or Context. Rewritten
+copies without matching records or lineage, and other harness forks, may still
+share past usage; the dashboard is not a provider billing ledger.
+
+Only numeric summaries grouped by session, model, normalized provider and UTC
+quarter-hour are retained between reads. Concurrent scans share a promise;
+source changes invalidate the owning session, including changes during replay.
+Failures are reported and retried on refresh. The endpoint reads local transcripts
+but returns no message bodies, tool arguments or paths. Undated usage is included
+only in the all-time view; the browser applies local calendar boundaries.
+
+The settings panel reads `/api/usage/stream`, a finite NDJSON stream. Its first
+frame supplies the session total; later frames append completed session summaries
+and report scanned sessions, current session, and records read. Record progress is
+published at most every 200 ms during replay; token totals settle at session
+boundaries so late usage corrections cannot be counted twice. A final `done` frame
+is required; premature EOF is an incomplete report with an explicit retry action.
+Each viewer has its own cursor into the shared scan, so late joiners catch up and
+slow viewers coalesce progress without buffering a queue of snapshots. Closing a
+panel cancels its reader and unregisters its waiter; the shared scan may finish to
+warm the cache. Refresh starts a fresh client aggregate, including cached sessions.
+
 ### Incremental parser extension points
 
 `EventSynthesizer.push` emits committed events. A synthesizer that must buffer a

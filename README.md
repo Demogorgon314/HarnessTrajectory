@@ -25,6 +25,12 @@ both ported to run on top of plain transcript files instead of a runtime.
 - **Trajectory ledger**: turns, steps, user / assistant / tool records, token usage, durations,
   a record inspector (payload, result, schema, timing), fold controls, and live search.
 - **Timing overview**: drag to focus an interval, wheel to zoom, recorded or equal widths.
+- **Token usage** in Settings: date/tool/model/provider filters, usage trends, a 53-week
+  activity calendar, hourly rhythm, milestones, and model/provider/session rankings.
+  Streams local histories on first open, with session progress and record counts;
+  charts update as sessions finish. Refresh reuses unchanged session summaries.
+  Missing usage is shown as incomplete coverage, never estimated. Input includes cache;
+  reasoning is part of output. Codex forks exclude verified inherited history.
 - **Execution diagnostics** from the Trajectory toolbar: tool-call loops (the same tool and
   arguments failing three or more times within one turn, even with other calls in between),
   model request trouble (repeated retries, request errors, output limits), and the slowest tool

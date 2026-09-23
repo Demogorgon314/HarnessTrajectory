@@ -22,9 +22,9 @@
    in `.options`. */
 .panel {
   position: relative;
-  width: 920px;
+  width: 1240px;
   max-width: calc(100vw - 48px);
-  height: min(720px, calc(100vh - 48px));
+  height: min(900px, calc(100vh - 48px));
   display: flex;
   border-radius: 20px;
   overflow: hidden;
@@ -66,6 +66,13 @@
   line-height: 22px;
   font-weight: 600;
   color: var(--dsw-alias-label-primary);
+}
+
+@media (max-width: 640px) {
+  .panel { max-width: calc(100vw - 16px); height: calc(100dvh - 16px); flex-direction: column; }
+  .panel .nav { width: auto; padding: 12px; gap: 8px; border-right: 0; border-bottom: 0.5px solid var(--dsw-alias-border-l1); }
+  .panel .navList { flex-direction: row; flex-wrap: wrap; }
+  .panel .content { min-height: 0; }
 }
 
 .navList {

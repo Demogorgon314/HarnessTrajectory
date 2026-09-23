@@ -173,4 +173,20 @@ describe('SettingsDialog', () => {
     fireEvent.click(screen.getByLabelText('Close', { exact: true }))
     expect(onClose).toHaveBeenCalledTimes(3)
   })
+
+  it('dismisses a usage menu with Escape before closing settings', async () => {
+    const onClose = vi.fn()
+    render(<SettingsDialog open onClose={onClose} />)
+    await answerCurrent(90)
+    fireEvent.click(screen.getByRole('button', { name: 'Token usage' }))
+    const trigger = screen.getByRole('button', { name: 'Usage tool' })
+    fireEvent.click(trigger)
+    // Focus can leave a portaled menu; Escape still dismisses only that menu.
+    fireEvent.keyDown(document.body, { key: 'Escape' })
+    expect(screen.queryByRole('menu')).toBeNull()
+    expect(onClose).not.toHaveBeenCalled()
+    expect(document.activeElement).toBe(trigger)
+    fireEvent.keyDown(trigger, { key: 'Escape' })
+    expect(onClose).toHaveBeenCalledTimes(1)
+  })
 })

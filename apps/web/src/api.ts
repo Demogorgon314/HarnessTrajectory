@@ -4,6 +4,7 @@ import {
   SEARCH_INDEXING_IDLE, SEARCH_MIN_QUERY_LENGTH,
   type HarnessKind, type SearchIndexing, type SearchResponse, type ServerSettings, type SessionDetail,
   type SessionListPage, type SessionLiveEvent, type SettingsResponse, type SettingsUpdateResponse,
+  type UsageStreamEvent,
 } from '@harness-trajectory/core'
 
 /** A non-2xx answer, carrying the status so callers can act on it. */
@@ -103,6 +104,52 @@ export function fetchHealth(signal?: AbortSignal): Promise<HealthResponse> {
 /** Server settings, persisted server-side in `settings.json`. */
 export function fetchSettings(signal?: AbortSignal): Promise<SettingsResponse> {
   return getJson('/api/settings', signal)
+}
+
+/** Finite NDJSON scan. An interrupted response must never look like a complete report. */
+export async function streamUsage(
+  onUpdate: (event: Extract<UsageStreamEvent, { type: 'progress' }>) => void,
+  signal: AbortSignal,
+): Promise<void> {
+  const response = await fetch('/api/usage/stream', {
+    headers: { accept: 'application/x-ndjson' }, signal,
+  })
+  if (!response.ok) throw new HttpError(response.status, 'Could not load token usage')
+  if (response.body === null) throw new Error('Token usage stream is unavailable')
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let pending = ''
+  let done = false
+  const cancel = () => { void reader.cancel().catch(() => {}) }
+  signal.addEventListener('abort', cancel, { once: true })
+  const consume = (line: string) => {
+    if (!line.trim() || signal.aborted) return
+    const event = JSON.parse(line) as UsageStreamEvent
+    if (event.type === 'error') throw new Error(event.message)
+    if (event.type !== 'progress') throw new Error('Invalid token usage update')
+    onUpdate(event)
+    done = event.progress.done
+  }
+  try {
+    while (!done && !signal.aborted) {
+      const chunk = await reader.read()
+      pending += decoder.decode(chunk.value, { stream: !chunk.done })
+      let newline: number
+      while ((newline = pending.indexOf('\n')) >= 0) {
+        consume(pending.slice(0, newline))
+        pending = pending.slice(newline + 1)
+      }
+      if (chunk.done) {
+        consume(pending)
+        break
+      }
+    }
+    if (!done && !signal.aborted) throw new Error('Token usage stream ended before completion')
+  } finally {
+    signal.removeEventListener('abort', cancel)
+    await reader.cancel().catch(() => {})
+    reader.releaseLock()
+  }
 }
 
 /** Persist a settings change; the server merges it over the stored value and answers the value in effect. */
